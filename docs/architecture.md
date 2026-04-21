@@ -7,7 +7,8 @@ src/app/
   zaparoo-launcher (executable)
     ├── src/core/
     │     zaparoo_core (static lib)
-    │     Qt6::Core only — no Quick dependency, unit-testable
+    │     Qt6::Core, Qt6::Qml, Qt6::WebSockets
+    │     Exposes Zaparoo.Browse QML module (BrowseModel singleton)
     │
     └── src/ui/app/  [Zaparoo.App QML module]
           Main.qml
@@ -24,6 +25,7 @@ src/app/
 
 | Target | URI | Load path |
 |---|---|---|
+| zaparoo_core (plugin) | `Zaparoo.Browse` | `qrc:/qt/qml/Zaparoo/Browse/` |
 | zaparoo_ui_app | `Zaparoo.App` | `qrc:/qt/qml/Zaparoo/App/` |
 | zaparoo_ui_components | `Zaparoo.Ui` | `qrc:/qt/qml/Zaparoo/Ui/` |
 | zaparoo_ui_theme | `Zaparoo.Theme` | `qrc:/qt/qml/Zaparoo/Theme/` |
@@ -58,16 +60,14 @@ License texts live in `src/LICENSES/`.
 
 ## C++ → QML data flow
 
-`ZaparooClient` has a working JSON-RPC 2.0 WebSocket transport. The planned
-data flow is:
-
 ```
-ZaparooClient (signals/callbacks) → QAbstractListModel subclass
-                                   ↓
-                             Carousel.qml (displays games)
+ZaparooClient (WebSocket JSON-RPC 2.0)
+    ↓  mediaBrowse() / run() callbacks
+BrowseModel (QAbstractListModel + QML_SINGLETON, Zaparoo.Browse)
+    ↓  model roles + Q_INVOKABLE methods
+Carousel.qml / Main.qml
 ```
 
-`setContextProperty` is intentionally deferred until a QML-friendly API
-exists (Q_INVOKABLE methods or a model). `src/core/` classes are `QObject`
-subclasses so they can be exposed via `setContextProperty` or
-`QML_ELEMENT` registration when ready.
+`BrowseModel` is a `QML_SINGLETON` registered via `QML_ELEMENT`. The
+singleton instance must be set via `BrowseModel::setInstance()` before the
+QML engine is created. See `src/app/main.cpp` for the wiring.

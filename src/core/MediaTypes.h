@@ -75,4 +75,13 @@ struct MediaBrowseResult
     bool hasNextPage{false};
 };
 
+struct RunParams
+{
+    QString text;
+};
+
+struct RunResult
+{
+};
+
 } // namespace zaparoo

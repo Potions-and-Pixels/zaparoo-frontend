@@ -90,6 +90,7 @@ class MockServer : public QObject
         emit frameReceived();
     }
 
+  private:
     QWebSocketServer m_server;
     QJsonObject m_reply;
     QJsonObject m_lastFrame;
@@ -263,6 +264,24 @@ class TestZaparooClient : public QObject
         QCOMPARE(error.code, -1);
     }
 
+    void testRunRequestFormat() // NOLINT(readability-function-cognitive-complexity)
+    {
+        RunParams params;
+        params.text = "@SNES/Mario.sfc";
+
+        QSignalSpy spy(m_server, &MockServer::frameReceived);
+        m_client->run(params, [](const RunResult&, const JsonRpcError&) {});
+        QTRY_COMPARE(spy.count(), 1);
+
+        const QJsonObject frame = m_server->lastFrame();
+        QCOMPARE(frame["jsonrpc"].toString(), "2.0");
+        QCOMPARE(frame["method"].toString(), "run");
+        QVERIFY(!frame["id"].toString().isEmpty());
+
+        const QJsonObject p = frame["params"].toObject();
+        QCOMPARE(p["text"].toString(), "@SNES/Mario.sfc");
+    }
+
     void testMalformedFramesIgnoredGracefully() // NOLINT(readability-function-cognitive-complexity)
     {
         // Send a JSON array instead of an object — should be ignored, no crash.
@@ -283,6 +302,7 @@ class TestZaparooClient : public QObject
         QTRY_COMPARE(spy.count(), 1);
     }
 
+  private:
     MockServer* m_server{nullptr};    // NOLINT(cppcoreguidelines-owning-memory)
     ZaparooClient* m_client{nullptr}; // NOLINT(cppcoreguidelines-owning-memory)
 };

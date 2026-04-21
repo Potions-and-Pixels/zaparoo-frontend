@@ -6,9 +6,15 @@ import QtQuick.Window
 import QtQuick.Controls
 import Zaparoo.Ui
 import Zaparoo.Theme
+import Zaparoo.Browse as Browse
 
 ApplicationWindow {
     id: root
+
+    // Local reference to the singleton — typed property for QML tooling.
+    // qmllint disable compiler
+    readonly property Browse.BrowseModel browseRef: Browse.BrowseModel
+    // qmllint enable compiler
 
     property bool fullScreen: false
 
@@ -32,24 +38,6 @@ ApplicationWindow {
         Sizing.screenHeight = height
     }
 
-    // Placeholder game data — will be replaced by a C++ model.
-    readonly property list<url> coverImages: [
-        "qrc:/qt/qml/Zaparoo/App/resources/images/placeholder/cover1.png",
-        "qrc:/qt/qml/Zaparoo/App/resources/images/placeholder/cover2.png",
-        "qrc:/qt/qml/Zaparoo/App/resources/images/placeholder/cover3.png",
-        "qrc:/qt/qml/Zaparoo/App/resources/images/placeholder/cover4.png",
-        "qrc:/qt/qml/Zaparoo/App/resources/images/placeholder/cover5.png",
-        "qrc:/qt/qml/Zaparoo/App/resources/images/placeholder/cover6.png"
-    ]
-    readonly property list<string> gameNames: [
-        "Super Mario World",
-        "Sonic the Hedgehog",
-        "Street Fighter II",
-        "The Legend of Zelda",
-        "Metroid",
-        "Castlevania"
-    ]
-
     property bool inMenu: false
     property int menuIndex: 0
     property bool crtEnabled: false
@@ -62,6 +50,13 @@ ApplicationWindow {
         to: 1
         duration: 12000
         loops: Animation.Infinite
+    }
+
+    // Reset carousel to index 0 when root.browseRef loads a new folder.
+    Connections {
+        target: root.browseRef
+        function onModelReset(): void { carousel.currentIndex = 0 }
+        function onIndexRestored(newIndex: int): void { carousel.currentIndex = newIndex }
     }
 
     // ── Background ────────────────────────────────────────────────────────────
@@ -100,6 +95,7 @@ ApplicationWindow {
 
     // ── Carousel ──────────────────────────────────────────────────────────────
 
+    // qmllint disable compiler
     Carousel {
         id: carousel
 
@@ -108,10 +104,13 @@ ApplicationWindow {
         anchors.topMargin: Sizing.pctH(12)
         width: parent.width
         height: Sizing.pctH(55)
-        opacity: root.inMenu ? 0.3 : 1.0
+        opacity: root.inMenu ? 0.3 : (root.browseRef.loading ? 0.5 : 1.0)
 
-        coverImages: root.coverImages
+        browseModel: root.browseRef
+        placeholderCover: "qrc:/qt/qml/Zaparoo/App/resources/images/placeholder/cover_generic.png"
         rainbowHue: root.rainbowHue
+
+        onCurrentIndexChanged: root.browseRef.setSelectedIndex(currentIndex)
 
         Behavior on opacity {
             NumberAnimation {
@@ -119,6 +118,7 @@ ApplicationWindow {
             }
         }
     }
+    // qmllint enable compiler
 
     // ── Game title ────────────────────────────────────────────────────────────
 
@@ -126,7 +126,9 @@ ApplicationWindow {
         anchors.horizontalCenter: parent.horizontalCenter
         anchors.top: carousel.bottom
         anchors.topMargin: Sizing.pctH(1)
-        text: root.gameNames[carousel.currentIndex]
+        // qmllint disable compiler
+        text: { root.browseRef.count; return root.browseRef.nameAt(carousel.currentIndex) }
+        // qmllint enable compiler
         font.family: Theme.fontRetro
         font.pixelSize: Sizing.fontSize(4)
         color: Theme.textPrimary
@@ -145,7 +147,9 @@ ApplicationWindow {
         anchors.horizontalCenter: parent.horizontalCenter
         anchors.top: carousel.bottom
         anchors.topMargin: Sizing.pctH(8)
-        count: root.gameNames.length
+        // qmllint disable compiler
+        count: root.browseRef.count
+        // qmllint enable compiler
         currentIndex: carousel.currentIndex
         rainbowHue: root.rainbowHue
         opacity: root.inMenu ? 0.3 : 1.0
@@ -197,7 +201,17 @@ ApplicationWindow {
 
         Text {
             anchors.centerIn: parent
-            text: root.inMenu ? "[<>] SEL  [OK] GO  [^] BACK" : "[<>] BROWSE  [v] MENU"
+            // qmllint disable compiler
+            text: {
+                root.browseRef.count
+                const action = root.browseRef.isFolderAt(carousel.currentIndex) ? "OPEN" : "PLAY"
+                if (root.inMenu)
+                    return "[<>] SEL  [OK] GO  [^] BACK"
+                return root.browseRef.canGoBack
+                    ? "[<>] BROWSE  [OK] " + action + "  [ESC] BACK  [v] MENU"
+                    : "[<>] BROWSE  [OK] " + action + "  [v] MENU"
+            }
+            // qmllint enable compiler
             font.family: Theme.fontRetro
             font.pixelSize: Sizing.fontSize(2.5)
             color: Theme.textDim
@@ -217,17 +231,18 @@ ApplicationWindow {
     Item {
         focus: true
 
+        // qmllint disable compiler
         Keys.onPressed: function (event) {
             if (root.inMenu) {
                 if (event.key === Qt.Key_Left) {
-                    root.menuIndex = (root.menuIndex - 1 + 3) % 3
+                    root.menuIndex = (root.menuIndex - 1 + menuBar.menuItems.length) % menuBar.menuItems.length
                 } else if (event.key === Qt.Key_Right) {
-                    root.menuIndex = (root.menuIndex + 1) % 3
+                    root.menuIndex = (root.menuIndex + 1) % menuBar.menuItems.length
                 } else if (event.key === Qt.Key_Up) {
                     root.inMenu = false
                 } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
                     if (root.menuIndex === 0) {
-                        console.log("Playing:", root.gameNames[carousel.currentIndex])
+                        root.browseRef.launchAt(carousel.currentIndex)
                     } else if (root.menuIndex === 1) {
                         root.crtEnabled = !root.crtEnabled
                     } else if (root.menuIndex === 2) {
@@ -238,18 +253,29 @@ ApplicationWindow {
                 }
             } else {
                 if (event.key === Qt.Key_Left) {
-                    carousel.currentIndex = (carousel.currentIndex - 1 + carousel.itemCount) % carousel.itemCount
+                    if (carousel.itemCount > 0)
+                        carousel.currentIndex = (carousel.currentIndex - 1 + carousel.itemCount) % carousel.itemCount
                 } else if (event.key === Qt.Key_Right) {
-                    carousel.currentIndex = (carousel.currentIndex + 1) % carousel.itemCount
+                    if (carousel.itemCount > 0)
+                        carousel.currentIndex = (carousel.currentIndex + 1) % carousel.itemCount
                 } else if (event.key === Qt.Key_Down) {
                     root.inMenu = true
                     root.menuIndex = 0
                 } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-                    console.log("Selected:", root.gameNames[carousel.currentIndex])
-                } else if (event.key === Qt.Key_Escape) {
-                    Qt.quit()
+                    if (root.browseRef.isFolderAt(carousel.currentIndex)) {
+                        root.browseRef.enter(carousel.currentIndex)
+                    } else {
+                        root.browseRef.launchAt(carousel.currentIndex)
+                    }
+                } else if (event.key === Qt.Key_Escape || event.key === Qt.Key_Backspace) {
+                    if (root.browseRef.canGoBack) {
+                        root.browseRef.goBack()
+                    } else {
+                        Qt.quit()
+                    }
                 }
             }
         }
+        // qmllint enable compiler
     }
 }

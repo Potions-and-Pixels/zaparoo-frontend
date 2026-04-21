@@ -10,12 +10,7 @@ set(_RESOURCE_ROOT "${CMAKE_SOURCE_DIR}/resources")
 set(_APP_RESOURCES
     "${_RESOURCE_ROOT}/fonts/DejaVuSans.ttf"
     "${_RESOURCE_ROOT}/fonts/PressStart2P.ttf"
-    "${_RESOURCE_ROOT}/images/placeholder/cover1.png"
-    "${_RESOURCE_ROOT}/images/placeholder/cover2.png"
-    "${_RESOURCE_ROOT}/images/placeholder/cover3.png"
-    "${_RESOURCE_ROOT}/images/placeholder/cover4.png"
-    "${_RESOURCE_ROOT}/images/placeholder/cover5.png"
-    "${_RESOURCE_ROOT}/images/placeholder/cover6.png"
+    "${_RESOURCE_ROOT}/images/placeholder/cover_generic.png"
 )
 
 foreach(_res IN LISTS _APP_RESOURCES)
@@ -32,6 +27,7 @@ qt_add_qml_module(
     IMPORTS
         Zaparoo.Ui
         Zaparoo.Theme
+        Zaparoo.Browse
 )
 
 target_link_libraries(
@@ -40,5 +36,7 @@ target_link_libraries(
         Qt6::Quick
         zaparoo_ui_componentsplugin
         zaparoo_ui_themeplugin
-    PRIVATE Zaparoo::CompileOptions
+    PRIVATE
+        zaparoo_coreplugin
+        Zaparoo::CompileOptions
 )

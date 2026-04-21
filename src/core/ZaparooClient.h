@@ -9,6 +9,7 @@
 #include <QJsonValue>
 #include <QObject>
 #include <QString>
+#include <QTimer>
 #include <QUrl>
 #include <QWebSocket>
 #include <functional>
@@ -25,6 +26,7 @@ struct JsonRpcError
 
 using MediaSearchCallback = std::function<void(const MediaSearchResult&, const JsonRpcError&)>;
 using MediaBrowseCallback = std::function<void(const MediaBrowseResult&, const JsonRpcError&)>;
+using RunCallback = std::function<void(const RunResult&, const JsonRpcError&)>;
 
 // Asynchronous client for the Zaparoo Core JSON-RPC 2.0 WebSocket API.
 // Call connectToCore() to open the connection; use mediaSearch()/mediaBrowse()
@@ -46,6 +48,7 @@ class ZaparooClient : public QObject
 
     QString mediaSearch(const MediaSearchParams& params, MediaSearchCallback callback);
     QString mediaBrowse(const MediaBrowseParams& params, MediaBrowseCallback callback);
+    QString run(const RunParams& params, RunCallback callback);
 
   signals:
     void connected();
@@ -71,6 +74,8 @@ class ZaparooClient : public QObject
 
     QWebSocket m_socket;
     QHash<QString, PendingRequest> m_pending;
+    QUrl m_endpoint;
+    QTimer m_reconnectTimer;
 };
 
 } // namespace zaparoo

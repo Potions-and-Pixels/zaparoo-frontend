@@ -4,24 +4,28 @@ pragma ComponentBehavior: Bound
 
 import QtQuick
 import Zaparoo.Theme
+import Zaparoo.Browse as Browse
 
 // Horizontal cover-art carousel.
 // Displays up to visibleCovers items centred on currentIndex.
 Item {
     id: root
 
-    required property list<url> coverImages
+    required property Browse.BrowseModel browseModel
+    required property url placeholderCover
     required property real rainbowHue
 
     property int currentIndex: 0
-    readonly property int itemCount: coverImages.length
+    readonly property int itemCount: itemRepeater.count
 
     readonly property int coverWidth: Sizing.pctH(30)
     readonly property int coverHeight: Sizing.pctH(45)
     readonly property int coverSpacing: Sizing.pctH(35)
 
     Repeater {
-        model: root.itemCount
+        id: itemRepeater
+
+        model: root.browseModel
 
         Item {
             id: coverItem
@@ -29,6 +33,8 @@ Item {
             required property int index
 
             property int offset: {
+                if (root.itemCount === 0)
+                    return 0
                 var diff = index - root.currentIndex
                 if (diff > root.itemCount / 2)
                     diff -= root.itemCount
@@ -76,7 +82,7 @@ Item {
                 Image {
                     anchors.fill: parent
                     anchors.margins: 1
-                    source: root.coverImages[coverItem.index]
+                    source: root.placeholderCover
                     fillMode: Image.PreserveAspectFit
                     smooth: false
                     cache: true

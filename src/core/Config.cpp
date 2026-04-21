@@ -4,7 +4,6 @@
 #include "Config.h"
 
 #include "Logger.h"
-#include "PlatformPaths.h"
 
 namespace zaparoo
 {

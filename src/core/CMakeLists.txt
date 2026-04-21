@@ -6,6 +6,8 @@ qt_add_library(zaparoo_core STATIC)
 target_sources(
     zaparoo_core
     PRIVATE
+        BrowseModel.cpp
+        BrowseModel.h
         Config.cpp
         Config.h
         Logger.cpp
@@ -17,12 +19,19 @@ target_sources(
         ZaparooClient.h
 )
 
+qt_add_qml_module(
+    zaparoo_core
+    URI Zaparoo.Browse
+    VERSION 1.0
+)
+
 target_include_directories(zaparoo_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 
 target_link_libraries(
     zaparoo_core
     PUBLIC
         Qt6::Core
+        Qt6::Qml
         Qt6::WebSockets
     PRIVATE
         Zaparoo::CompileOptions

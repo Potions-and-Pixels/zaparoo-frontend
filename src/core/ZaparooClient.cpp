@@ -101,6 +101,17 @@ ZaparooClient::ZaparooClient(QObject* parent) : QObject(parent)
     connect(&m_socket, &QWebSocket::textMessageReceived, this,
             &ZaparooClient::onTextMessageReceived);
     connect(&m_socket, &QWebSocket::errorOccurred, this, &ZaparooClient::onError);
+
+    m_reconnectTimer.setSingleShot(true);
+    connect(&m_reconnectTimer, &QTimer::timeout, this,
+            [this]()
+            {
+                if (!m_endpoint.isEmpty())
+                {
+                    qCDebug(zapNet) << "reconnecting to Core...";
+                    m_socket.open(m_endpoint);
+                }
+            });
 }
 
 ZaparooClient::~ZaparooClient() = default;
@@ -108,12 +119,16 @@ ZaparooClient::~ZaparooClient() = default;
 void ZaparooClient::connectToCore(const QUrl& endpoint)
 {
     qCDebug(zapNet) << "connectToCore:" << endpoint;
+    m_endpoint = endpoint;
+    m_reconnectTimer.stop();
     m_socket.open(endpoint);
 }
 
 void ZaparooClient::disconnectFromCore()
 {
     qCDebug(zapNet) << "disconnectFromCore";
+    m_endpoint.clear();
+    m_reconnectTimer.stop();
     m_socket.close();
 }
 
@@ -125,6 +140,7 @@ bool ZaparooClient::isConnected() const
 void ZaparooClient::onConnected()
 {
     qCDebug(zapNet) << "connected to Core";
+    m_reconnectTimer.stop();
     emit connected();
 }
 
@@ -142,6 +158,11 @@ void ZaparooClient::onDisconnected()
         req.callback(QJsonValue{}, err);
     }
     emit disconnected();
+    if (!m_endpoint.isEmpty())
+    {
+        qCDebug(zapNet) << "scheduling reconnect in 3s";
+        m_reconnectTimer.start(3000);
+    }
 }
 
 void ZaparooClient::onError(QAbstractSocket::SocketError error)
@@ -311,6 +332,15 @@ QString ZaparooClient::mediaBrowse(const MediaBrowseParams& params, MediaBrowseC
             }
             cb(parseBrowseResult(result.toObject()), JsonRpcError{});
         });
+}
+
+QString ZaparooClient::run(const RunParams& params, RunCallback callback)
+{
+    QJsonObject jsonParams;
+    jsonParams["text"] = params.text;
+    return sendRequest("run", jsonParams,
+                       [cb = std::move(callback)](const QJsonValue&, const JsonRpcError& error)
+                       { cb(RunResult{}, error); });
 }
 
 } // namespace zaparoo

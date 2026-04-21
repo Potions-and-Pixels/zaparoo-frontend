@@ -101,11 +101,18 @@ written the code:
 | `src/ui/theme/` | `Zaparoo.Theme` | `Theme`, `Sizing` singletons |
 | `src/ui/components/` | `Zaparoo.Ui` | `Carousel`, `Starfield`, `FpsCounter`, `MenuBar`, `SelectionDots`, `CrtOverlay` |
 | `src/ui/app/` | `Zaparoo.App` | `Main.qml` + embedded fonts and images |
-| `src/core/` | _(C++ only)_ | `Config`, `Logger`, `PlatformPaths`, `ZaparooClient` |
+| `src/core/` | `Zaparoo.Browse` | `BrowseModel` singleton (QML) + `Config`, `Logger`, `PlatformPaths`, `ZaparooClient` (C++) |
 
 Import QML modules as `import Zaparoo.Theme`, `import Zaparoo.Ui`, etc.
 Resources are embedded at `qrc:/qt/qml/Zaparoo/App/resources/...`.
 `compile_commands.json` is always generated in `build/`; no extra CMake flag needed.
+
+## Zaparoo Core API
+
+Full API reference: https://zaparoo.org/docs/core/api/
+
+Before adding or modifying any `ZaparooClient` method, check the upstream docs
+to verify method names, param shapes, and return types.
 
 ## Further Reading
 

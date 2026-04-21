@@ -25,6 +25,7 @@ RUN mkdir build && cd build && \
     /opt/qt6-arm32/bin/qt-cmake .. \
         -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_SHARED_LIBS=OFF \
         -DZAPAROO_BUILD_TESTS=OFF \
     && ninja
 

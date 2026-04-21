@@ -4,6 +4,7 @@
 import QtQuick
 import QtTest
 import Zaparoo.App
+import Zaparoo.Browse as Browse
 
 TestCase {
     name: "UiSmoke"
@@ -26,7 +27,11 @@ TestCase {
         verify(!mainWindow.crtEnabled, "CRT should start off")
     }
 
-    function test_game_names_present() {
-        verify(mainWindow.gameNames.length > 0, "Should have at least one game name")
+    // qmllint disable compiler
+    function test_browse_model_initial_state() {
+        compare(Browse.BrowseModel.rowCount(), 0)
+        compare(Browse.BrowseModel.currentPath, "")
+        verify(!Browse.BrowseModel.canGoBack)
     }
+    // qmllint enable compiler
 }

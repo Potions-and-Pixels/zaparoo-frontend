@@ -14,6 +14,8 @@ qt_add_qml_module(
         MenuBar.qml
         SelectionDots.qml
         Starfield.qml
+    IMPORTS
+        Zaparoo.Browse
 )
 
 target_link_libraries(

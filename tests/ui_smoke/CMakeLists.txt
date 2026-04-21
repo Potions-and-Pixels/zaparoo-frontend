@@ -10,6 +10,7 @@ qt_add_qml_module(
     QML_FILES tst_smoke.qml
     IMPORTS
         Zaparoo.App
+        Zaparoo.Browse
         Zaparoo.Ui
         Zaparoo.Theme
 )
@@ -25,6 +26,8 @@ target_link_libraries(
     tst_ui_smoke
     PRIVATE
         Zaparoo::CompileOptions
+        zaparoo_core
+        zaparoo_coreplugin
         zaparoo_ui_appplugin
         zaparoo_ui_componentsplugin
         zaparoo_ui_themeplugin
