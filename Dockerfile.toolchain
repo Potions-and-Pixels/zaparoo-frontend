@@ -187,3 +187,18 @@ RUN mkdir qtwebsockets-arm-build && cd qtwebsockets-arm-build && \
     /opt/qt6-arm32/bin/qt-configure-module ../qtwebsockets \
     && cmake --build . --parallel $(nproc) \
     && cmake --install .
+
+# Rust toolchain for cross-compiling launcher-rs to ARM32.
+# Added AFTER the Qt builds so changes here don't invalidate the Qt layer cache.
+# Installs stable with minimal profile plus the ARM32 cross-compile target.
+# Uses wget (already installed) since curl is not in the base image.
+RUN wget -qO- https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain stable --profile minimal \
+    && /root/.cargo/bin/rustup target add armv7-unknown-linux-gnueabihf
+
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Global cargo config: ARM32 linker points to the MiSTer ARM GCC toolchain.
+# Placed in CARGO_HOME so all cargo invocations in this image pick it up.
+RUN printf '[target.armv7-unknown-linux-gnueabihf]\nlinker = "arm-none-linux-gnueabihf-gcc"\n' \
+        > /root/.cargo/config.toml

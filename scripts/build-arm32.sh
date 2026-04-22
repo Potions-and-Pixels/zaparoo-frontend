@@ -34,8 +34,12 @@ docker build \
 if [ -f "${OUTPUT_DIR}/launcher" ]; then
     echo ""
     echo "=== Build successful! ==="
-    echo "Binary: ${OUTPUT_DIR}/launcher"
+    echo "C++ binary:  ${OUTPUT_DIR}/launcher"
     file "${OUTPUT_DIR}/launcher"
+    if [ -f "${OUTPUT_DIR}/launcher-rs" ]; then
+        echo "Rust binary: ${OUTPUT_DIR}/launcher-rs"
+        file "${OUTPUT_DIR}/launcher-rs"
+    fi
 else
     echo "Build failed — binary not found in ${OUTPUT_DIR}"
     exit 1
