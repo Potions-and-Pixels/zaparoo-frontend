@@ -49,6 +49,7 @@ int main(int argc, char* argv[])
     // nor loadConfig() requires a QCoreApplication instance.
     zaparoo::Logger::install();
     const zaparoo::Config config = zaparoo::loadConfig();
+    zaparoo::Logger::applyConfig(config);
 
     // On MiSTer: sets QT_QPA_PLATFORM/QT_QUICK_BACKEND and calls vmode.
     // Must run before QGuiApplication so Qt reads the env vars on init.

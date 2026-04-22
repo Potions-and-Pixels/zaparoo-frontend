@@ -128,6 +128,32 @@ Import QML modules as `import Zaparoo.Theme`, `import Zaparoo.Ui`, etc.
 Resources are embedded at `qrc:/qt/qml/Zaparoo/App/resources/...`.
 `compile_commands.json` is always generated in `build/`; no extra CMake flag needed.
 
+## Logging
+
+Use `qCInfo`, `qCDebug`, `qCWarning`, `qCCritical` with one of the three
+logging categories rather than bare `qDebug`/`qWarning`:
+
+```cpp
+#include "Logger.h"   // declares zapApp, zapCore, zapNet
+
+qCInfo(zapCore)  << "message";   // general core logic
+qCDebug(zapApp)  << "verbose";   // app-lifecycle events
+qCWarning(zapNet)<< "trouble";   // network / WebSocket
+```
+
+**Never use `qDebug()` without a category** — it bypasses the filter rules
+and clutters release logs.
+
+The logger writes two sinks simultaneously:
+- **stderr**: human-readable `[hh:mm:ss.zzz L] message`
+- **file**: JSONL at `PlatformPaths::logFilePath()` — rotated at 1 MB,
+  keeping `.1` and `.2` backups. MiSTer: `/tmp/zaparoo/launcher.log`.
+  Desktop: `~/.local/share/zaparoo/logs/launcher.log`.
+
+Debug-level output is filtered out by default. Enable it two ways:
+- **Config**: set `[logging] debug = true` in `launcher.toml`.
+- **Env var**: `ZAPAROO_DEBUG=1 ./launcher` (takes effect before config loads).
+
 ## Zaparoo Core API
 
 Full API reference: https://zaparoo.org/docs/core/api/

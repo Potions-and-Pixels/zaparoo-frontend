@@ -24,6 +24,7 @@ class TstConfig : public QObject
         QCOMPARE(cfg.coreEndpoint, dflt.coreEndpoint);
         QCOMPARE(cfg.videoWidth, dflt.videoWidth);
         QCOMPARE(cfg.videoHeight, dflt.videoHeight);
+        QCOMPARE(cfg.debugLogging, dflt.debugLogging);
     }
 
     void roundtrip()
@@ -36,6 +37,7 @@ class TstConfig : public QObject
         original.coreEndpoint = QUrl("ws://192.168.1.42:7497/api/v0.1");
         original.videoWidth = 1280;
         original.videoHeight = 720;
+        original.debugLogging = true;
 
         saveConfigTo(path, original);
         QVERIFY(QFile::exists(path));
@@ -44,6 +46,7 @@ class TstConfig : public QObject
         QCOMPARE(loaded.coreEndpoint, original.coreEndpoint);
         QCOMPARE(loaded.videoWidth, original.videoWidth);
         QCOMPARE(loaded.videoHeight, original.videoHeight);
+        QCOMPARE(loaded.debugLogging, original.debugLogging);
     }
 
     void defaults_on_malformed_toml()
@@ -92,6 +95,23 @@ class TstConfig : public QObject
 
         const Config cfg = loadConfigFrom(path);
         QCOMPARE(cfg.coreEndpoint, QUrl("ws://1.2.3.4:7497/api/v0.1"));
+        QCOMPARE(cfg.videoWidth, Config{}.videoWidth);
+        QCOMPARE(cfg.videoHeight, Config{}.videoHeight);
+    }
+
+    void debug_logging_parsed_from_handwritten_toml()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath("launcher.conf");
+
+        QFile f(path);
+        QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Text));
+        f.write("[logging]\ndebug = true\n");
+        f.close();
+
+        const Config cfg = loadConfigFrom(path);
+        QCOMPARE(cfg.debugLogging, true);
         QCOMPARE(cfg.videoWidth, Config{}.videoWidth);
         QCOMPARE(cfg.videoHeight, Config{}.videoHeight);
     }

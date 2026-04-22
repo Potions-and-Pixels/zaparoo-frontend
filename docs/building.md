@@ -103,12 +103,15 @@ config, defaulting to 1920×1080), and starts
 `/media/fat/Scripts/zaparoo.sh -service start` automatically. Just run the
 binary — no wrapper script required.
 
-User-editable config lives at `/media/fat/zaparoo/launcher.toml`. Example to override resolution:
+User-editable config lives at `/media/fat/zaparoo/launcher.toml`. Example:
 
 ```toml
 [video]
 width = 1280
 height = 720
+
+[logging]
+debug = true
 ```
 
 ## Run on framebuffer (desktop headless)

@@ -39,3 +39,16 @@ target_link_libraries(
 
 add_test(NAME config COMMAND tst_config)
 set_tests_properties(config PROPERTIES TIMEOUT 10)
+
+qt_add_executable(tst_logger tst_logger.cpp)
+
+target_link_libraries(
+    tst_logger
+    PRIVATE
+        Zaparoo::CompileOptions
+        zaparoo_core
+        Qt6::Test
+)
+
+add_test(NAME logger COMMAND tst_logger)
+set_tests_properties(logger PROPERTIES TIMEOUT 15)

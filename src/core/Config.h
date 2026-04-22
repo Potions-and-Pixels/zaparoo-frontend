@@ -20,6 +20,7 @@ struct Config
 #endif
     int videoWidth{1920};
     int videoHeight{1080};
+    bool debugLogging{false};
 };
 
 // Loads config from path, returning defaults for missing or malformed files.

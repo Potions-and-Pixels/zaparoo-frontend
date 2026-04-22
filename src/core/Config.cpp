@@ -64,6 +64,10 @@ Config loadConfigFrom(const QString& path)
         };
         loadDim("width", config.videoWidth);
         loadDim("height", config.videoHeight);
+        if (const auto v = table["logging"]["debug"].value<bool>())
+        {
+            config.debugLogging = *v;
+        }
         qCInfo(zapCore) << "loadConfig: loaded from" << path;
     }
     catch (const toml::parse_error& e)
@@ -81,6 +85,7 @@ void saveConfigTo(const QString& path, const Config& config)
     auto table = toml::table{
         {"core", toml::table{{"url", config.coreEndpoint.toString().toStdString()}}},
         {"video", toml::table{{"width", config.videoWidth}, {"height", config.videoHeight}}},
+        {"logging", toml::table{{"debug", config.debugLogging}}},
     };
 
     std::ostringstream oss;

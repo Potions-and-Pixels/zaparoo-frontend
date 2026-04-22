@@ -21,6 +21,10 @@ class PlatformPaths
     // Directory for cached data (cover art, metadata).
     static QString cacheDir();
 
+    // Path to the JSONL log file (e.g. MiSTer: /tmp/zaparoo/launcher.log,
+    // Desktop: ~/.local/share/zaparoo/logs/launcher.log).
+    static QString logFilePath();
+
     // Returns true when running on a MiSTer FPGA (/media/fat is present).
     static bool isMiSTer();
 };

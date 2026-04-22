@@ -78,6 +78,7 @@ class MockServer : public QObject
         emit frameReceived(frame);
     }
 
+  private:
     QWebSocketServer m_server;
     QJsonObject m_reply;
     QWebSocket* m_peer{nullptr};
@@ -364,6 +365,7 @@ class TestBrowseModel : public QObject
         QTest::qWait(50);      // nothing sent to server
     }
 
+  private:
     MockServer* m_server{nullptr};    // NOLINT(cppcoreguidelines-owning-memory)
     ZaparooClient* m_client{nullptr}; // NOLINT(cppcoreguidelines-owning-memory)
     BrowseModel* m_model{nullptr};    // NOLINT(cppcoreguidelines-owning-memory)

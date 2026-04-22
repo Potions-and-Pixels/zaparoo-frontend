@@ -33,4 +33,14 @@ QString PlatformPaths::cacheDir()
     return QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
 }
 
+QString PlatformPaths::logFilePath()
+{
+    if (isMiSTer())
+    {
+        return QStringLiteral("/tmp/zaparoo/launcher.log");
+    }
+    const QString dataDir = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation);
+    return dataDir + QStringLiteral("/zaparoo/logs/launcher.log");
+}
+
 } // namespace zaparoo
