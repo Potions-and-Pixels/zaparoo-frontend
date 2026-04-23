@@ -198,7 +198,14 @@ RUN wget -qO- https://sh.rustup.rs \
 
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-# Global cargo config: ARM32 linker points to the MiSTer ARM GCC toolchain.
-# Placed in CARGO_HOME so all cargo invocations in this image pick it up.
-RUN printf '[target.armv7-unknown-linux-gnueabihf]\nlinker = "arm-none-linux-gnueabihf-gcc"\n' \
-        > /root/.cargo/config.toml
+# Global cargo config: ARM32 linker and C++ compiler point to the MiSTer ARM
+# GCC toolchain. CC/CXX are required by cxx_qt_build (via the cc crate) so
+# the generated CXX-Qt bridge code is compiled with the cross-compiler.
+RUN printf '[target.armv7-unknown-linux-gnueabihf]\n\
+linker = "arm-none-linux-gnueabihf-gcc"\n\
+\n\
+[env]\n\
+CC_armv7-unknown-linux-gnueabihf = "arm-none-linux-gnueabihf-gcc"\n\
+CXX_armv7-unknown-linux-gnueabihf = "arm-none-linux-gnueabihf-g++"\n\
+AR_armv7-unknown-linux-gnueabihf = "arm-none-linux-gnueabihf-ar"\n\
+' > /root/.cargo/config.toml

@@ -14,6 +14,13 @@
 
 FROM zaparoo/qt6-arm32-mister:6.7.2 AS app-build
 
+# cxx-qt's build script resolves Qt paths via qmake, which returns
+# sysroot-prefixed paths (e.g. {sysroot}/opt/qt6-arm32/...). Symlink Qt
+# into the sysroot so those paths resolve on the build host.
+RUN mkdir -p /opt/gcc-arm-10.2-2020.11-x86_64-arm-none-linux-gnueabihf/arm-none-linux-gnueabihf/libc/opt && \
+    ln -s /opt/qt6-arm32 \
+          /opt/gcc-arm-10.2-2020.11-x86_64-arm-none-linux-gnueabihf/arm-none-linux-gnueabihf/libc/opt/qt6-arm32
+
 WORKDIR /src
 
 COPY CMakeLists.txt .

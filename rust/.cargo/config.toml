@@ -6,6 +6,7 @@
 # libs (compiled without -fPIC). GCC/BFD ld accepts this combination.
 [target.x86_64-unknown-linux-gnu]
 linker = "cc"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
 
 # ARM32 / MiSTer: use the ARM cross-compiler as the linker driver.
 # The linker binary is the MiSTer ARM GCC toolchain; cargo sets this when

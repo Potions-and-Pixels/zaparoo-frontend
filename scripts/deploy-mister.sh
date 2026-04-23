@@ -11,7 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 ENV_FILE="${PROJECT_ROOT}/.env"
 REMOTE_PATH="/media/fat/zaparoo/launcher"
-BINARY="${PROJECT_ROOT}/output/launcher"
+BINARY="${PROJECT_ROOT}/output/launcher-rs"
 
 if [ ! -f "${ENV_FILE}" ]; then
     echo "Error: .env file not found at ${ENV_FILE}"
@@ -48,5 +48,6 @@ echo "Deployed ${BINARY} → root@${MISTER_IP}:${REMOTE_PATH}"
 ssh "root@${MISTER_IP}" "
     killall launcher 2>/dev/null && echo 'Killed running launcher' || true
     killall MiSTer_Zaparoo 2>/dev/null && echo 'Killed running MiSTer_Zaparoo' || true
+    rm -f /tmp/zaparoo/launcher.log /tmp/zaparoo/qt.log
     nohup /media/fat/MiSTer_Zaparoo >/dev/null 2>&1 &
 "

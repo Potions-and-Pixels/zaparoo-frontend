@@ -2,5 +2,5 @@
 # SPDX-FileCopyrightText: 2026 Callan Barrett
 
 [workspace]
-members = ["launcher"]
+members = ["launcher", "zaparoo-core"]
 resolver = "2"
