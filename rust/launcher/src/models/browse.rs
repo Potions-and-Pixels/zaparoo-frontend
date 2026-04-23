@@ -5,7 +5,9 @@
 // module registration. Full implementation deferred to a future phase.
 
 use cxx_qt_lib::{QByteArray, QHash, QHashPair_i32_QByteArray, QModelIndex, QString, QVariant};
+use std::pin::Pin;
 
+#[derive(Default)]
 pub struct BrowseModelRust {
     count: i32,
     current_path: QString,
@@ -14,30 +16,17 @@ pub struct BrowseModelRust {
     error_message: QString,
 }
 
-impl Default for BrowseModelRust {
-    fn default() -> Self {
-        Self {
-            count: 0,
-            current_path: QString::default(),
-            can_go_back: false,
-            loading: false,
-            error_message: QString::default(),
-        }
-    }
-}
-
 #[cxx_qt::bridge]
 pub mod ffi {
     unsafe extern "C++" {
         include!("model_includes.h");
 
-        #[allow(non_snake_case)]
+        #[allow(non_snake_case, reason = "Qt class names are PascalCase")]
         type QAbstractListModel;
 
         type QModelIndex = cxx_qt_lib::QModelIndex;
         type QVariant = cxx_qt_lib::QVariant;
-        type QHash_i32_QByteArray =
-            cxx_qt_lib::QHash<cxx_qt_lib::QHashPair_i32_QByteArray>;
+        type QHash_i32_QByteArray = cxx_qt_lib::QHash<cxx_qt_lib::QHashPair_i32_QByteArray>;
         type QByteArray = cxx_qt_lib::QByteArray;
         type QString = cxx_qt_lib::QString;
     }
@@ -85,7 +74,11 @@ pub mod ffi {
 
 impl ffi::BrowseModel {
     fn row_count(&self, parent: &QModelIndex) -> i32 {
-        if parent.is_valid() { 0 } else { self.count }
+        if parent.is_valid() {
+            0
+        } else {
+            self.count
+        }
     }
 
     fn data(&self, _index: &QModelIndex, _role: i32) -> QVariant {
@@ -102,11 +95,11 @@ impl ffi::BrowseModel {
         h
     }
 
-    fn enter(self: std::pin::Pin<&mut Self>, _index: i32) {}
-    fn go_back(self: std::pin::Pin<&mut Self>) {}
-    fn refresh(self: std::pin::Pin<&mut Self>) {}
-    fn launch_at(self: std::pin::Pin<&mut Self>, _index: i32) {}
-    fn set_selected_index(self: std::pin::Pin<&mut Self>, _index: i32) {}
+    fn enter(self: Pin<&mut Self>, _index: i32) {}
+    fn go_back(self: Pin<&mut Self>) {}
+    fn refresh(self: Pin<&mut Self>) {}
+    fn launch_at(self: Pin<&mut Self>, _index: i32) {}
+    fn set_selected_index(self: Pin<&mut Self>, _index: i32) {}
 
     fn name_at(&self, _index: i32) -> QString {
         QString::default()

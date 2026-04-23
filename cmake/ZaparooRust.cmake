@@ -11,9 +11,6 @@ include_guard(GLOBAL)
 
 include(FetchContent)
 
-# Corrosion v0.5.0 cannot parse rustup's "(active, default)" format in
-# `rustup toolchain list --verbose`. Work around by resolving the actual
-# toolchain binary paths via `rustup which`, bypassing the broken discovery.
 # When cross-compiling for MiSTer ARM32, tell Corrosion the Rust target triple
 # explicitly. Corrosion's mapping from CMAKE_SYSTEM_PROCESSOR="arm" is
 # ambiguous; MiSTer is ARMv7 hard-float (armv7-unknown-linux-gnueabihf).
@@ -24,34 +21,10 @@ if(CMAKE_CROSSCOMPILING AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm")
     endif()
 endif()
 
-if(NOT Rust_COMPILER)
-    find_program(_rustup NAMES rustup
-        HINTS "$ENV{HOME}/.cargo/bin" "$ENV{CARGO_HOME}/bin"
-              "/root/.cargo/bin")
-    if(_rustup)
-        execute_process(
-            COMMAND "${_rustup}" which rustc
-            OUTPUT_VARIABLE _rustup_rustc OUTPUT_STRIP_TRAILING_WHITESPACE
-            ERROR_QUIET
-        )
-        execute_process(
-            COMMAND "${_rustup}" which cargo
-            OUTPUT_VARIABLE _rustup_cargo OUTPUT_STRIP_TRAILING_WHITESPACE
-            ERROR_QUIET
-        )
-    endif()
-    if(_rustup_rustc AND EXISTS "${_rustup_rustc}")
-        set(Rust_COMPILER "${_rustup_rustc}" CACHE FILEPATH "Path to rustc" FORCE)
-    endif()
-    if(_rustup_cargo AND EXISTS "${_rustup_cargo}")
-        set(Rust_CARGO "${_rustup_cargo}" CACHE FILEPATH "Path to cargo" FORCE)
-    endif()
-endif()
-
 FetchContent_Declare(
     Corrosion
     GIT_REPOSITORY https://github.com/corrosion-rs/corrosion.git
-    GIT_TAG v0.5.0
+    GIT_TAG v0.6.1
 )
 FetchContent_MakeAvailable(Corrosion)
 

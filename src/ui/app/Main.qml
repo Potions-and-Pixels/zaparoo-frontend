@@ -275,50 +275,54 @@ ApplicationWindow {
 
     Item {
         focus: true
+        Keys.onPressed: event => root.handleKey(event.key)
+    }
 
-        // qmllint disable compiler
-        function navigateCarousel(carousel, delta) {
-            if (carousel.itemCount > 0)
-                carousel.currentIndex = (carousel.currentIndex + delta + carousel.itemCount) % carousel.itemCount
-        }
+    // qmllint disable compiler
+    function navigateCarousel(carousel, delta) {
+        if (carousel.itemCount > 0)
+            carousel.currentIndex = (carousel.currentIndex + delta + carousel.itemCount) % carousel.itemCount
+    }
 
-        Keys.onPressed: function (event) {
-            if (root.activeScreen === root.screenGames) {
-                if (event.key === Qt.Key_Left) {
-                    navigateCarousel(gamesCarousel, -1)
-                } else if (event.key === Qt.Key_Right) {
-                    navigateCarousel(gamesCarousel, 1)
-                } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-                    root.gamesRef.launch_at(gamesCarousel.currentIndex)
-                } else if (event.key === Qt.Key_Escape || event.key === Qt.Key_Backspace) {
-                    root.activeScreen = root.screenHub
-                }
-            } else if (root.hubFocus === root.focusSystems) {
-                if (event.key === Qt.Key_Left) {
-                    navigateCarousel(systemsCarousel, -1)
-                } else if (event.key === Qt.Key_Right) {
-                    navigateCarousel(systemsCarousel, 1)
-                } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-                    root.gamesRef.set_system(root.systemsRef.system_id_at(systemsCarousel.currentIndex))
-                    gamesCarousel.currentIndex = 0
-                    root.activeScreen = root.screenGames
-                } else if (event.key === Qt.Key_Escape || event.key === Qt.Key_Backspace) {
-                    root.hubFocus = root.focusCategories
-                }
-            } else {
-                if (event.key === Qt.Key_Left) {
-                    navigateCarousel(categoriesCarousel, -1)
-                } else if (event.key === Qt.Key_Right) {
-                    navigateCarousel(categoriesCarousel, 1)
-                } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-                    systemsCarousel.currentIndex = 0
-                    root.systemsRef.set_category(root.categoriesRef.category_at(categoriesCarousel.currentIndex))
-                    root.hubFocus = root.focusSystems
-                } else if (event.key === Qt.Key_Escape || event.key === Qt.Key_Backspace) {
-                    Qt.quit()
-                }
+    // Navigation key router. Called by the focus Item's Keys.onPressed and
+    // directly from tests (offscreen key routing is unreliable). Kept as a
+    // pure function of root state + the three carousel ids.
+    function handleKey(key) {
+        if (root.activeScreen === root.screenGames) {
+            if (key === Qt.Key_Left) {
+                navigateCarousel(gamesCarousel, -1)
+            } else if (key === Qt.Key_Right) {
+                navigateCarousel(gamesCarousel, 1)
+            } else if (key === Qt.Key_Return || key === Qt.Key_Enter) {
+                root.gamesRef.launch_at(gamesCarousel.currentIndex)
+            } else if (key === Qt.Key_Escape || key === Qt.Key_Backspace) {
+                root.activeScreen = root.screenHub
+            }
+        } else if (root.hubFocus === root.focusSystems) {
+            if (key === Qt.Key_Left) {
+                navigateCarousel(systemsCarousel, -1)
+            } else if (key === Qt.Key_Right) {
+                navigateCarousel(systemsCarousel, 1)
+            } else if (key === Qt.Key_Return || key === Qt.Key_Enter) {
+                root.gamesRef.set_system(root.systemsRef.system_id_at(systemsCarousel.currentIndex))
+                gamesCarousel.currentIndex = 0
+                root.activeScreen = root.screenGames
+            } else if (key === Qt.Key_Escape || key === Qt.Key_Backspace) {
+                root.hubFocus = root.focusCategories
+            }
+        } else {
+            if (key === Qt.Key_Left) {
+                navigateCarousel(categoriesCarousel, -1)
+            } else if (key === Qt.Key_Right) {
+                navigateCarousel(categoriesCarousel, 1)
+            } else if (key === Qt.Key_Return || key === Qt.Key_Enter) {
+                systemsCarousel.currentIndex = 0
+                root.systemsRef.set_category(root.categoriesRef.category_at(categoriesCarousel.currentIndex))
+                root.hubFocus = root.focusSystems
+            } else if (key === Qt.Key_Escape || key === Qt.Key_Backspace) {
+                Qt.quit()
             }
         }
-        // qmllint enable compiler
     }
+    // qmllint enable compiler
 }

@@ -5,13 +5,14 @@
 ### Desktop
 
 - Qt 6.7+ (Quick, QuickControls2, Qml)
-- CMake 3.21+
+- CMake 3.22+
 - C++17 compiler (GCC 10+, Clang 12+, MSVC 2019+)
 - Rust stable toolchain (`rustup install stable`)
-- Ninja (recommended) or Make
+- Ninja (required — pinned by `CMakePresets.json`)
+- mold (used as linker on x86_64 Linux; pinned by `rust/.cargo/config.toml`)
 
-On Fedora/RHEL: `sudo dnf install qt6-qtdeclarative-devel qt6-qtquickcontrols2-devel cmake ninja-build`
-On Ubuntu/Debian: `sudo apt install qt6-declarative-dev qt6-quick-controls2-dev cmake ninja-build`
+On Fedora/RHEL: `sudo dnf install qt6-qtdeclarative-devel qt6-qtquickcontrols2-devel cmake ninja-build mold`
+On Ubuntu/Debian: `sudo apt install qt6-declarative-dev qt6-quick-controls2-dev cmake ninja-build mold`
 
 Install Rust via rustup: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
 

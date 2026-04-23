@@ -55,7 +55,7 @@ impl std::error::Error for ClientError {}
 
 type PendingMap = Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, ClientError>>>>>;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Client {
     tx: tokio::sync::mpsc::UnboundedSender<String>,
     pending: PendingMap,
@@ -63,7 +63,7 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(endpoint: String, runtime: Arc<tokio::runtime::Runtime>) -> Arc<Self> {
+    pub fn new(endpoint: String, runtime: &Arc<tokio::runtime::Runtime>) -> Arc<Self> {
         let (msg_tx, mut msg_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let (connected_tx, _) = broadcast::channel::<bool>(16);
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
@@ -90,7 +90,7 @@ impl Client {
                                 msg = msg_rx.recv() => {
                                     match msg {
                                         Some(text) => {
-                                            if let Err(e) = write.send(Message::Text(text.into())).await {
+                                            if let Err(e) = write.send(Message::Text(text)).await {
                                                 warn!("ws send error: {e}");
                                                 break;
                                             }
@@ -103,6 +103,7 @@ impl Client {
                                         Some(Ok(Message::Text(text))) => {
                                             if let Ok(resp) = serde_json::from_str::<RpcResponse>(text.as_str()) {
                                                 if let Some(id) = resp.id {
+                                                    #[allow(clippy::unwrap_used, reason = "mutex poisoning is unrecoverable")]
                                                     let sender = pending_clone.lock().unwrap().remove(&id);
                                                     if let Some(tx) = sender {
                                                         let result = if let Some(err) = resp.error {
@@ -131,6 +132,7 @@ impl Client {
 
                         let _ = connected_clone.send(false);
                         // Fail all pending requests
+                        #[allow(clippy::unwrap_used, reason = "mutex poisoning is unrecoverable")]
                         let drained: Vec<_> = pending_clone.lock().unwrap().drain().collect();
                         for (_, tx) in drained {
                             let _ = tx.send(Err(ClientError { message: "disconnected".into() }));
@@ -149,16 +151,29 @@ impl Client {
 
     async fn call<P: Serialize>(&self, method: &str, params: &P) -> Result<Value, ClientError> {
         let id = Uuid::new_v4().to_string();
-        let req = RpcRequest { jsonrpc: "2.0", method, params, id: id.clone() };
-        let text = serde_json::to_string(&req)
-            .map_err(|e| ClientError { message: e.to_string() })?;
+        let req = RpcRequest {
+            jsonrpc: "2.0",
+            method,
+            params,
+            id: id.clone(),
+        };
+        let text = serde_json::to_string(&req).map_err(|e| ClientError {
+            message: e.to_string(),
+        })?;
 
         let (resp_tx, resp_rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(id, resp_tx);
+        #[allow(clippy::unwrap_used, reason = "mutex poisoning is unrecoverable")]
+        {
+            self.pending.lock().unwrap().insert(id, resp_tx);
+        }
 
-        self.tx.send(text).map_err(|_| ClientError { message: "not connected".into() })?;
+        self.tx.send(text).map_err(|_| ClientError {
+            message: "not connected".into(),
+        })?;
 
-        resp_rx.await.map_err(|_| ClientError { message: "channel closed".into() })?
+        resp_rx.await.map_err(|_| ClientError {
+            message: "channel closed".into(),
+        })?
     }
 
     pub async fn systems(&self, params: SystemsParams) -> Result<SystemsResult, ClientError> {
@@ -166,7 +181,9 @@ impl Client {
         struct P {}
         let _ = params;
         let val = self.call("systems", &P {}).await?;
-        serde_json::from_value(val).map_err(|e| ClientError { message: e.to_string() })
+        serde_json::from_value(val).map_err(|e| ClientError {
+            message: e.to_string(),
+        })
     }
 
     pub async fn media_search(
@@ -182,10 +199,15 @@ impl Client {
         let val = self
             .call(
                 "media.search",
-                &P { systems: params.systems, max_results: params.max_results },
+                &P {
+                    systems: params.systems,
+                    max_results: params.max_results,
+                },
             )
             .await?;
-        serde_json::from_value(val).map_err(|e| ClientError { message: e.to_string() })
+        serde_json::from_value(val).map_err(|e| ClientError {
+            message: e.to_string(),
+        })
     }
 
     pub async fn media_browse(
@@ -197,7 +219,9 @@ impl Client {
             path: String,
         }
         let val = self.call("media.browse", &P { path: params.path }).await?;
-        serde_json::from_value(val).map_err(|e| ClientError { message: e.to_string() })
+        serde_json::from_value(val).map_err(|e| ClientError {
+            message: e.to_string(),
+        })
     }
 
     pub async fn run(&self, params: RunParams) -> Result<RunResult, ClientError> {
@@ -206,6 +230,8 @@ impl Client {
             text: String,
         }
         let val = self.call("run", &P { text: params.text }).await?;
-        serde_json::from_value(val).map_err(|e| ClientError { message: e.to_string() })
+        serde_json::from_value(val).map_err(|e| ClientError {
+            message: e.to_string(),
+        })
     }
 }

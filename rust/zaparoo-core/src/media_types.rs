@@ -84,3 +84,86 @@ pub struct SystemsParams {}
 pub struct SystemsResult {
     pub systems: Vec<SystemInfo>,
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        clippy::panic,
+        reason = "tests should fail-fast on unexpected errors"
+    )]
+
+    use super::{BrowseEntry, MediaSearchResult, SystemsResult};
+
+    #[test]
+    fn is_folder_accepts_both_spellings() {
+        let folder = BrowseEntry {
+            entry_type: "folder".into(),
+            ..BrowseEntry::default()
+        };
+        let directory = BrowseEntry {
+            entry_type: "directory".into(),
+            ..BrowseEntry::default()
+        };
+        let file = BrowseEntry {
+            entry_type: "file".into(),
+            ..BrowseEntry::default()
+        };
+        assert!(folder.is_folder());
+        assert!(directory.is_folder());
+        assert!(!file.is_folder());
+    }
+
+    #[test]
+    fn is_folder_unknown_type_is_false() {
+        for entry_type in ["", "symlink", "archive", "unknown", "FOLDER"] {
+            let entry = BrowseEntry {
+                entry_type: entry_type.into(),
+                ..BrowseEntry::default()
+            };
+            assert!(
+                !entry.is_folder(),
+                "entry_type={entry_type:?} should not be classified as folder"
+            );
+        }
+    }
+
+    #[test]
+    fn systems_result_deserialises_camelcase_payload() {
+        let json = r#"{"systems":[{"id":"nes","name":"Nintendo","category":"Consoles"}]}"#;
+        let result: SystemsResult = serde_json::from_str(json).expect("parse");
+        assert_eq!(result.systems.len(), 1);
+        assert_eq!(result.systems[0].id, "nes");
+        assert_eq!(result.systems[0].category, "Consoles");
+    }
+
+    #[test]
+    fn system_info_category_defaults_to_empty_when_missing() {
+        let json = r#"{"systems":[{"id":"x","name":"X"}]}"#;
+        let result: SystemsResult = serde_json::from_str(json).expect("parse");
+        assert_eq!(result.systems[0].category, "");
+    }
+
+    #[test]
+    fn media_search_result_parses_has_next_page() {
+        let json = r#"{
+            "results": [
+                {"name":"Game","path":"/p","zapScript":"s","system":{"id":"nes"}}
+            ],
+            "hasNextPage": true
+        }"#;
+        let result: MediaSearchResult = serde_json::from_str(json).expect("parse");
+        assert_eq!(result.results.len(), 1);
+        assert!(result.has_next_page);
+        assert_eq!(result.results[0].system.id, "nes");
+        assert_eq!(result.results[0].zap_script, "s");
+    }
+
+    #[test]
+    fn media_search_result_defaults_has_next_page() {
+        let json = r#"{"results":[]}"#;
+        let result: MediaSearchResult = serde_json::from_str(json).expect("parse");
+        assert!(!result.has_next_page);
+    }
+}

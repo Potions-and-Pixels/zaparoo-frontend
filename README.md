@@ -6,18 +6,35 @@ A Qt/QML game launcher frontend for [Zaparoo Core](https://zaparoo.org), designe
 
 See [docs/building.md](docs/building.md) for full instructions.
 
+Common tasks are wrapped in a [`justfile`](justfile); run `just --list` to see
+them. The raw cmake/cargo commands still work the same.
+
 **Desktop (quick start):**
 
 ```bash
-cmake -S . -B build && cmake --build build
-./build/bin/launcher
+just build && just run
+# or: cmake -S . -B build && cmake --build build && ./build/bin/launcher
 ```
 
 **MiSTer ARM32 (requires Docker):**
 
 ```bash
-./scripts/build-arm32.sh
+just arm32
 # output/launcher
+```
+
+**Tests and lints:**
+
+```bash
+just test     # ctest + cargo nextest
+just lint     # clang-tidy, qmllint, rustfmt, clippy, cargo-deny
+```
+
+`just test` and `just lint` require `cargo-nextest` and `cargo-deny`. Install
+them once with:
+
+```bash
+cargo install --locked cargo-nextest cargo-deny
 ```
 
 ## Running on framebuffer

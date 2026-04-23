@@ -4,3 +4,79 @@
 [workspace]
 members = ["launcher", "zaparoo-core"]
 resolver = "2"
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2021"
+rust-version = "1.90"
+license      = "LicenseRef-PolyForm-Noncommercial-1.0.0"
+authors      = ["Callan Barrett"]
+
+[workspace.dependencies]
+cxx             = "1"
+cxx-qt          = "0.7"
+cxx-qt-lib      = "0.7"
+cxx-qt-build    = "0.7"
+serde           = { version = "1", features = ["derive"] }
+serde_json      = "1"
+toml            = "0.8"
+tokio           = { version = "1", default-features = false }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
+tracing         = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json", "local-time"] }
+tracing-appender = "0.2"
+time            = { version = "0.3", features = ["local-offset", "macros"] }
+futures-util    = { version = "0.3", default-features = false, features = ["sink", "std"] }
+uuid            = { version = "1", features = ["v4"] }
+dirs-next       = "2"
+insta           = { version = "1", features = ["yaml"] }
+tempfile        = "3"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn        = "deny"
+missing_debug_implementations = "warn"
+unused_qualifications         = "warn"
+# `unreachable_pub` intentionally omitted — cxx-qt bridge macros emit dozens
+# of `pub` items that cannot be demoted without breaking the macro contract.
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+
+[workspace.lints.clippy]
+# Pedantic as the baseline; noisy lints allowed below.
+pedantic = { level = "warn", priority = -1 }
+
+# Pedantic lints that produce more noise than signal for this codebase.
+module_name_repetitions  = "allow"
+must_use_candidate       = "allow"
+missing_errors_doc       = "allow"
+missing_panics_doc       = "allow"
+cast_possible_truncation = "allow"
+cast_possible_wrap       = "allow"
+cast_sign_loss           = "allow"
+cast_precision_loss      = "allow"
+similar_names            = "allow"
+# cxx-qt bridge macros and trait-shaped impls require `&self`/`&mut self`
+# even when the method body doesn't touch it.
+unused_self              = "allow"
+# cxx-qt macro expansion returns `Box<T>` for the generated constructors;
+# unavoidable at the bridge boundary.
+unnecessary_box_returns  = "allow"
+
+# Correctness lints from `restriction` — target AI-generated failure modes.
+unwrap_used                     = "deny"
+expect_used                     = "warn"
+panic                           = "warn"
+todo                            = "warn"
+unimplemented                   = "warn"
+dbg_macro                       = "warn"
+print_stdout                    = "warn"
+print_stderr                    = "warn"
+allow_attributes_without_reason = "warn"
+undocumented_unsafe_blocks      = "deny"
+
+[profile.release]
+lto           = "thin"
+codegen-units = 1
+strip         = true
+# `panic = "abort"` intentionally not set — tokio/tracing rely on unwinding.

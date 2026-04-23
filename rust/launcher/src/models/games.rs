@@ -44,13 +44,12 @@ pub mod ffi {
     unsafe extern "C++" {
         include!("model_includes.h");
 
-        #[allow(non_snake_case)]
+        #[allow(non_snake_case, reason = "Qt class names are PascalCase")]
         type QAbstractListModel;
 
         type QModelIndex = cxx_qt_lib::QModelIndex;
         type QVariant = cxx_qt_lib::QVariant;
-        type QHash_i32_QByteArray =
-            cxx_qt_lib::QHash<cxx_qt_lib::QHashPair_i32_QByteArray>;
+        type QHash_i32_QByteArray = cxx_qt_lib::QHash<cxx_qt_lib::QHashPair_i32_QByteArray>;
         type QByteArray = cxx_qt_lib::QByteArray;
         type QString = cxx_qt_lib::QString;
     }
@@ -99,7 +98,11 @@ pub mod ffi {
 
 impl ffi::GamesModel {
     fn row_count(&self, parent: &QModelIndex) -> i32 {
-        if parent.is_valid() { 0 } else { self.count }
+        if parent.is_valid() {
+            0
+        } else {
+            self.count
+        }
     }
 
     fn data(&self, index: &QModelIndex, role: i32) -> QVariant {
@@ -125,7 +128,7 @@ impl ffi::GamesModel {
         h
     }
 
-    fn set_system(mut self: std::pin::Pin<&mut Self>, system_id: QString) {
+    fn set_system(mut self: Pin<&mut Self>, system_id: QString) {
         use crate::models::{global_client, global_runtime};
         use tracing::warn;
 
@@ -145,7 +148,10 @@ impl ffi::GamesModel {
 
         global_runtime().spawn(async move {
             let result = client
-                .media_search(MediaSearchParams { systems: vec![sid.clone()], max_results: 100 })
+                .media_search(MediaSearchParams {
+                    systems: vec![sid.clone()],
+                    max_results: 100,
+                })
                 .await;
 
             let _ = qt_thread.queue(move |mut model| {
@@ -156,9 +162,7 @@ impl ffi::GamesModel {
                 match result {
                     Ok(r) => {
                         if r.has_next_page {
-                            warn!(
-                                "games list for {sid} has >100 results; only first page shown"
-                            );
+                            warn!("games list for {sid} has >100 results; only first page shown");
                         }
                         let count = r.results.len() as i32;
                         model.as_mut().begin_reset_model();
@@ -169,14 +173,16 @@ impl ffi::GamesModel {
                         model.as_mut().set_has_next_page(r.has_next_page);
                     }
                     Err(e) => {
-                        model.as_mut().set_error_message(QString::from(e.message.as_str()));
+                        model
+                            .as_mut()
+                            .set_error_message(QString::from(e.message.as_str()));
                     }
                 }
             });
         });
     }
 
-    fn launch_at(self: std::pin::Pin<&mut Self>, index: i32) {
+    fn launch_at(self: Pin<&mut Self>, index: i32) {
         use crate::models::{global_client, global_runtime};
         use tracing::warn;
 
@@ -204,7 +210,7 @@ impl ffi::GamesModel {
         QString::from(self.items[index as usize].name.as_str())
     }
 
-    fn set_selected_index(mut self: std::pin::Pin<&mut Self>, index: i32) {
+    fn set_selected_index(mut self: Pin<&mut Self>, index: i32) {
         self.as_mut().rust_mut().selected_index = index;
     }
 }

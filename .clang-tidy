@@ -17,9 +17,7 @@ Checks: >
   -modernize-avoid-c-arrays,
   -readability-identifier-length,
 
-# Treat warnings as non-fatal during initial foundation pass.
-# Tighten in a future pass once code is fully settled.
-WarningsAsErrors: ""
+WarningsAsErrors: "*"
 
 HeaderFilterRegex: "src/.*"
 

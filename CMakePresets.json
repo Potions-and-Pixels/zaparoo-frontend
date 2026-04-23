@@ -1,0 +1,64 @@
+{
+    "version": 6,
+    "cmakeMinimumRequired": { "major": 3, "minor": 22, "patch": 0 },
+    "configurePresets": [
+        {
+            "name": "desktop-debug",
+            "displayName": "Desktop Debug",
+            "description": "Default desktop Debug build into build/",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+            }
+        },
+        {
+            "name": "desktop-release",
+            "displayName": "Desktop Release",
+            "inherits": "desktop-debug",
+            "binaryDir": "${sourceDir}/build-release",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            }
+        },
+        {
+            "name": "desktop-dev",
+            "displayName": "Desktop Dev (windowed + dev endpoint)",
+            "inherits": "desktop-debug",
+            "binaryDir": "${sourceDir}/build-dev",
+            "cacheVariables": {
+                "ZAPAROO_DEV": "ON",
+                "ZAPAROO_BUILD_TESTS": "OFF"
+            }
+        },
+        {
+            "name": "desktop-sanitized",
+            "displayName": "Desktop Debug + ASan + UBSan",
+            "inherits": "desktop-debug",
+            "binaryDir": "${sourceDir}/build-san",
+            "cacheVariables": {
+                "ZAPAROO_ENABLE_ASAN": "ON",
+                "ZAPAROO_ENABLE_UBSAN": "ON"
+            }
+        }
+    ],
+    "buildPresets": [
+        { "name": "desktop-debug",     "configurePreset": "desktop-debug" },
+        { "name": "desktop-release",   "configurePreset": "desktop-release" },
+        { "name": "desktop-dev",       "configurePreset": "desktop-dev" },
+        { "name": "desktop-sanitized", "configurePreset": "desktop-sanitized" }
+    ],
+    "testPresets": [
+        {
+            "name": "desktop-debug",
+            "configurePreset": "desktop-debug",
+            "output": { "outputOnFailure": true }
+        },
+        {
+            "name": "desktop-sanitized",
+            "configurePreset": "desktop-sanitized",
+            "output": { "outputOnFailure": true }
+        }
+    ]
+}

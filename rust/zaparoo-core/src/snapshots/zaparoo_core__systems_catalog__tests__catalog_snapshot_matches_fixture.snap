@@ -1,0 +1,39 @@
+---
+source: zaparoo-core/src/systems_catalog.rs
+expression: "CatalogData { systems, categories }"
+---
+CatalogData {
+    systems: [
+        SystemInfo {
+            id: "gb",
+            name: "Game Boy",
+            category: "Handhelds",
+        },
+        SystemInfo {
+            id: "mame",
+            name: "MAME",
+            category: "arcade",
+        },
+        SystemInfo {
+            id: "nes",
+            name: "Nintendo",
+            category: "Consoles",
+        },
+        SystemInfo {
+            id: "odd",
+            name: "Odd One",
+            category: "",
+        },
+        SystemInfo {
+            id: "snes",
+            name: "Super Nintendo",
+            category: "Consoles",
+        },
+    ],
+    categories: [
+        "arcade",
+        "Consoles",
+        "Handhelds",
+        "Other",
+    ],
+}

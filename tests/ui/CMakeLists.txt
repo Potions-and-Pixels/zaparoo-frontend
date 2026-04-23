@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0
 # SPDX-FileCopyrightText: 2026 Callan Barrett
 
-qt_add_executable(tst_ui_smoke tst_main.cpp)
+qt_add_executable(tst_ui tst_main.cpp)
 
 qt_add_qml_module(
-    tst_ui_smoke
-    URI ZaparooTest.UiSmoke
+    tst_ui
+    URI ZaparooTest.Ui
     VERSION 1.0
-    QML_FILES tst_smoke.qml
+    QML_FILES
+        tst_smoke.qml
+        tst_navigation.qml
+        tst_sizing.qml
     IMPORTS
         Zaparoo.App
         Zaparoo.Browse
@@ -15,15 +18,15 @@ qt_add_qml_module(
         Zaparoo.Theme
 )
 
-qt_import_qml_plugins(tst_ui_smoke)
+qt_import_qml_plugins(tst_ui)
 
 target_compile_definitions(
-    tst_ui_smoke
+    tst_ui
     PRIVATE QUICK_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
 )
 
 target_link_libraries(
-    tst_ui_smoke
+    tst_ui
     PRIVATE
         Zaparoo::CompileOptions
         zaparoo_launcher_rs
@@ -35,5 +38,5 @@ target_link_libraries(
         Qt6::QuickControls2
 )
 
-add_test(NAME ui_smoke COMMAND tst_ui_smoke -input "${CMAKE_CURRENT_SOURCE_DIR}" -platform offscreen)
-set_tests_properties(ui_smoke PROPERTIES TIMEOUT 30)
+add_test(NAME ui COMMAND tst_ui -input "${CMAKE_CURRENT_SOURCE_DIR}" -platform offscreen)
+set_tests_properties(ui PROPERTIES TIMEOUT 30)

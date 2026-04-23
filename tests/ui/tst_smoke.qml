@@ -6,7 +6,7 @@ import QtTest
 import Zaparoo.App
 
 TestCase {
-    name: "UiSmoke"
+    name: "UiWindow"
     when: windowShown
 
     Main {

@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0
 // SPDX-FileCopyrightText: 2026 Callan Barrett
 
+#![allow(
+    clippy::unwrap_used,
+    reason = "RwLock poisoning signals another thread panicked with the lock held; state is unrecoverable"
+)]
+
 use cxx_qt::{CxxQtType, Initialize, Threading};
 use cxx_qt_lib::{QByteArray, QHash, QHashPair_i32_QByteArray, QModelIndex, QString, QVariant};
 use std::pin::Pin;
@@ -41,13 +46,12 @@ pub mod ffi {
     unsafe extern "C++" {
         include!("model_includes.h");
 
-        #[allow(non_snake_case)]
+        #[allow(non_snake_case, reason = "Qt class names are PascalCase")]
         type QAbstractListModel;
 
         type QModelIndex = cxx_qt_lib::QModelIndex;
         type QVariant = cxx_qt_lib::QVariant;
-        type QHash_i32_QByteArray =
-            cxx_qt_lib::QHash<cxx_qt_lib::QHashPair_i32_QByteArray>;
+        type QHash_i32_QByteArray = cxx_qt_lib::QHash<cxx_qt_lib::QHashPair_i32_QByteArray>;
         type QByteArray = cxx_qt_lib::QByteArray;
         type QString = cxx_qt_lib::QString;
     }
@@ -90,7 +94,7 @@ pub mod ffi {
 }
 
 impl Initialize for ffi::SystemsModel {
-    fn initialize(self: std::pin::Pin<&mut Self>) {
+    fn initialize(self: Pin<&mut Self>) {
         use crate::models::{global_runtime, subscribe_catalog};
 
         let catalog_arc = self.rust().catalog.clone();
@@ -141,7 +145,11 @@ impl Initialize for ffi::SystemsModel {
 
 impl ffi::SystemsModel {
     fn row_count(&self, parent: &QModelIndex) -> i32 {
-        if parent.is_valid() { 0 } else { self.count }
+        if parent.is_valid() {
+            0
+        } else {
+            self.count
+        }
     }
 
     fn data(&self, index: &QModelIndex, role: i32) -> QVariant {
@@ -165,7 +173,7 @@ impl ffi::SystemsModel {
         h
     }
 
-    fn set_category(mut self: std::pin::Pin<&mut Self>, category: QString) {
+    fn set_category(mut self: Pin<&mut Self>, category: QString) {
         let cat = category.to_string();
         let systems = self
             .rust()
@@ -178,12 +186,16 @@ impl ffi::SystemsModel {
         let count = systems.len() as i32;
         let rows: Vec<SystemInfo> = systems
             .into_iter()
-            .map(|s| SystemInfo { id: s.id, name: s.name, category: s.category })
+            .map(|s| SystemInfo {
+                id: s.id,
+                name: s.name,
+                category: s.category,
+            })
             .collect();
         self.as_mut().begin_reset_model();
         self.as_mut().rust_mut().systems = rows;
         self.as_mut().rust_mut().count = count;
-        self.as_mut().rust_mut().current_category = QString::from(cat.as_str());
+        self.as_mut().rust_mut().current_category = category;
         self.as_mut().end_reset_model();
         self.as_mut().count_changed();
         self.as_mut().current_category_changed();

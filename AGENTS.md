@@ -39,31 +39,39 @@ lost on kill.
 
 ## Commands
 
+Common workflows are wrapped in `justfile` recipes — run `just --list` for the
+full menu. Prefer `just X` over raw cmake/cargo invocations.
+
 ```bash
 # Build and run (desktop)
-cmake -S . -B build && cmake --build build
-./build/bin/launcher
+just build        # cmake configure + build
+just run          # build + launch desktop binary
 
 # Tests
-ctest --test-dir build --output-on-failure
+just test         # ctest + cargo nextest
+just test-qml     # QML smoke tests only
+just test-rust    # Rust unit tests only
 
-# Rust tests (unit tests for zaparoo-core)
-cargo test --manifest-path rust/Cargo.toml
+# Linters (clang-format + clang-tidy + qmllint + rustfmt + clippy + cargo-deny)
+just lint
+just lint-cpp     # C++/QML only
+just lint-rust    # Rust only
 
-# All linters (clang-format check + clang-tidy + qmllint)
-cmake --build build --target lint
+# Auto-format (pre-commit for C++/QML, cargo fmt for Rust)
+just fmt
 
-# Individual linters
-cmake --build build --target format-check   # clang-format dry-run
-cmake --build build --target tidy           # clang-tidy
-cmake --build build --target all_qmllint    # QML linting
+# ARM32 cross-build and deploy
+just arm32
+just deploy-mister
+```
 
-# Rust linting
-cargo fmt --manifest-path rust/Cargo.toml --check
-cargo clippy --manifest-path rust/Cargo.toml -- -D warnings
+The raw commands still work; `just` just wraps them. Equivalents:
 
-# Auto-format C++ (after tidy finds issues)
-pre-commit run --all-files
+```bash
+cmake -S . -B build && cmake --build build         # just build
+ctest --test-dir build --output-on-failure         # just test-qml
+cmake --build build --target lint                  # just lint-cpp
+cd rust && cargo clippy --workspace --all-targets -- -D warnings  # part of just lint-rust
 ```
 
 # Deploy to MiSTer
@@ -95,9 +103,9 @@ For ARM32 / MiSTer builds and deploy bundle, see @docs/building.md.
 ## IMPORTANT: Repo Policy
 
 After editing any C++, Rust, or QML file, ALWAYS run:
-1. `cmake --build build --target lint` — zero warnings is the bar.
-2. `ctest --test-dir build --output-on-failure` — if the change can affect
-   runtime behaviour.
+1. `just lint` — zero warnings is the bar (covers clang-tidy, qmllint,
+   rustfmt, clippy, and cargo-deny).
+2. `just test` — if the change can affect runtime behaviour.
 
 Never leave a lint warning or failing test unresolved.
 

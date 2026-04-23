@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0
+# SPDX-FileCopyrightText: 2026 Callan Barrett
+
+[graph]
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "armv7-unknown-linux-gnueabihf" },
+]
+
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked  = "deny"
+ignore  = []
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+    "LicenseRef-PolyForm-Noncommercial-1.0.0",
+]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions    = "warn"
+wildcards            = "deny"
+allow-wildcard-paths = true  # Workspace path deps have no version pin; this is fine.
+
+[sources]
+unknown-registry = "deny"
+unknown-git      = "deny"
+allow-registry   = ["https://github.com/rust-lang/crates.io-index"]

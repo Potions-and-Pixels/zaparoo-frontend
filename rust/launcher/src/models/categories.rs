@@ -7,15 +7,10 @@ use std::pin::Pin;
 
 const NAME_ROLE: i32 = 256 + 1; // Qt::UserRole + 1
 
+#[derive(Default)]
 pub struct CategoriesModelRust {
     categories: Vec<String>,
     count: i32,
-}
-
-impl Default for CategoriesModelRust {
-    fn default() -> Self {
-        Self { categories: Vec::new(), count: 0 }
-    }
 }
 
 #[cxx_qt::bridge]
@@ -23,13 +18,12 @@ pub mod ffi {
     unsafe extern "C++" {
         include!("model_includes.h");
 
-        #[allow(non_snake_case)]
+        #[allow(non_snake_case, reason = "Qt class names are PascalCase")]
         type QAbstractListModel;
 
         type QModelIndex = cxx_qt_lib::QModelIndex;
         type QVariant = cxx_qt_lib::QVariant;
-        type QHash_i32_QByteArray =
-            cxx_qt_lib::QHash<cxx_qt_lib::QHashPair_i32_QByteArray>;
+        type QHash_i32_QByteArray = cxx_qt_lib::QHash<cxx_qt_lib::QHashPair_i32_QByteArray>;
         type QByteArray = cxx_qt_lib::QByteArray;
         type QString = cxx_qt_lib::QString;
     }
@@ -66,7 +60,7 @@ pub mod ffi {
 }
 
 impl Initialize for ffi::CategoriesModel {
-    fn initialize(mut self: std::pin::Pin<&mut Self>) {
+    fn initialize(mut self: Pin<&mut Self>) {
         use crate::models::{global_runtime, subscribe_catalog};
 
         let mut catalog_rx = subscribe_catalog();
@@ -102,7 +96,11 @@ impl Initialize for ffi::CategoriesModel {
 
 impl ffi::CategoriesModel {
     fn row_count(&self, parent: &QModelIndex) -> i32 {
-        if parent.is_valid() { 0 } else { self.count }
+        if parent.is_valid() {
+            0
+        } else {
+            self.count
+        }
     }
 
     fn data(&self, index: &QModelIndex, role: i32) -> QVariant {
