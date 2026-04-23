@@ -43,7 +43,6 @@ pub mod ffi {
         type CategoriesModel = super::CategoriesModelRust;
 
         #[qinvokable]
-        #[cxx_name = "categoryAt"]
         fn category_at(self: &CategoriesModel, index: i32) -> QString;
 
         #[inherit]

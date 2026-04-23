@@ -155,7 +155,7 @@ ApplicationWindow {
             // qmllint disable compiler
             text: {
                 root.systemsRef.count
-                return root.systemsRef.systemNameAt(systemsCarousel.currentIndex)
+                return root.systemsRef.system_name_at(systemsCarousel.currentIndex)
             }
             // qmllint enable compiler
             font.family: Theme.fontRetro
@@ -189,7 +189,7 @@ ApplicationWindow {
 
             onCurrentIndexChanged: {
                 // qmllint disable compiler
-                root.gamesRef.setSelectedIndex(currentIndex)
+                root.gamesRef.set_selected_index(currentIndex)
                 // qmllint enable compiler
             }
 
@@ -222,7 +222,7 @@ ApplicationWindow {
             // qmllint disable compiler
             text: {
                 root.gamesRef.count
-                return root.gamesRef.nameAt(gamesCarousel.currentIndex)
+                return root.gamesRef.name_at(gamesCarousel.currentIndex)
             }
             // qmllint enable compiler
             font.family: Theme.fontRetro
@@ -289,7 +289,7 @@ ApplicationWindow {
                 } else if (event.key === Qt.Key_Right) {
                     navigateCarousel(gamesCarousel, 1)
                 } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-                    root.gamesRef.launchAt(gamesCarousel.currentIndex)
+                    root.gamesRef.launch_at(gamesCarousel.currentIndex)
                 } else if (event.key === Qt.Key_Escape || event.key === Qt.Key_Backspace) {
                     root.activeScreen = root.screenHub
                 }
@@ -299,7 +299,7 @@ ApplicationWindow {
                 } else if (event.key === Qt.Key_Right) {
                     navigateCarousel(systemsCarousel, 1)
                 } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-                    root.gamesRef.setSystem(root.systemsRef.systemIdAt(systemsCarousel.currentIndex))
+                    root.gamesRef.set_system(root.systemsRef.system_id_at(systemsCarousel.currentIndex))
                     gamesCarousel.currentIndex = 0
                     root.activeScreen = root.screenGames
                 } else if (event.key === Qt.Key_Escape || event.key === Qt.Key_Backspace) {
@@ -312,7 +312,7 @@ ApplicationWindow {
                     navigateCarousel(categoriesCarousel, 1)
                 } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
                     systemsCarousel.currentIndex = 0
-                    root.systemsRef.setCategory(root.categoriesRef.categoryAt(categoriesCarousel.currentIndex))
+                    root.systemsRef.set_category(root.categoriesRef.category_at(categoriesCarousel.currentIndex))
                     root.hubFocus = root.focusSystems
                 } else if (event.key === Qt.Key_Escape || event.key === Qt.Key_Backspace) {
                     Qt.quit()

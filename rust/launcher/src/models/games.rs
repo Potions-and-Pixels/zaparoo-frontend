@@ -68,19 +68,15 @@ pub mod ffi {
         type GamesModel = super::GamesModelRust;
 
         #[qinvokable]
-        #[cxx_name = "setSystem"]
         fn set_system(self: Pin<&mut GamesModel>, system_id: QString);
 
         #[qinvokable]
-        #[cxx_name = "launchAt"]
         fn launch_at(self: Pin<&mut GamesModel>, index: i32);
 
         #[qinvokable]
-        #[cxx_name = "nameAt"]
         fn name_at(self: &GamesModel, index: i32) -> QString;
 
         #[qinvokable]
-        #[cxx_name = "setSelectedIndex"]
         fn set_selected_index(self: Pin<&mut GamesModel>, index: i32);
 
         #[inherit]

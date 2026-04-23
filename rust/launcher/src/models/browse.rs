@@ -58,26 +58,21 @@ pub mod ffi {
         fn enter(self: Pin<&mut BrowseModel>, index: i32);
 
         #[qinvokable]
-        #[cxx_name = "goBack"]
         fn go_back(self: Pin<&mut BrowseModel>);
 
         #[qinvokable]
         fn refresh(self: Pin<&mut BrowseModel>);
 
         #[qinvokable]
-        #[cxx_name = "launchAt"]
         fn launch_at(self: Pin<&mut BrowseModel>, index: i32);
 
         #[qinvokable]
-        #[cxx_name = "setSelectedIndex"]
         fn set_selected_index(self: Pin<&mut BrowseModel>, index: i32);
 
         #[qinvokable]
-        #[cxx_name = "nameAt"]
         fn name_at(self: &BrowseModel, index: i32) -> QString;
 
         #[qinvokable]
-        #[cxx_name = "isFolderAt"]
         fn is_folder_at(self: &BrowseModel, index: i32) -> bool;
 
         #[cxx_name = "rowCount"]

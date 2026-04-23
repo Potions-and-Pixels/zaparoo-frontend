@@ -62,15 +62,12 @@ pub mod ffi {
         type SystemsModel = super::SystemsModelRust;
 
         #[qinvokable]
-        #[cxx_name = "setCategory"]
         fn set_category(self: Pin<&mut SystemsModel>, category: QString);
 
         #[qinvokable]
-        #[cxx_name = "systemIdAt"]
         fn system_id_at(self: &SystemsModel, index: i32) -> QString;
 
         #[qinvokable]
-        #[cxx_name = "systemNameAt"]
         fn system_name_at(self: &SystemsModel, index: i32) -> QString;
 
         #[inherit]
