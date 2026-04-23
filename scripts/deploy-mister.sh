@@ -11,7 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 ENV_FILE="${PROJECT_ROOT}/.env"
 REMOTE_PATH="/media/fat/zaparoo/launcher"
-BINARY="${PROJECT_ROOT}/output/launcher-rs"
+BINARY="${PROJECT_ROOT}/output/launcher"
 
 if [ ! -f "${ENV_FILE}" ]; then
     echo "Error: .env file not found at ${ENV_FILE}"

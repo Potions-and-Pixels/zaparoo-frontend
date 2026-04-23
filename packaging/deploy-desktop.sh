@@ -113,7 +113,6 @@ info "Copying licenses..."
 cp "${PROJECT_ROOT}/src/LICENSES/LGPLv3.txt" "${DEPLOY_DIR}/"
 cp "${PROJECT_ROOT}/src/LICENSES/Qt-LGPL-NOTICE.txt" "${DEPLOY_DIR}/"
 cp "${PROJECT_ROOT}/COPYING" "${DEPLOY_DIR}/"
-cp "${PROJECT_ROOT}/third_party/tomlplusplus/LICENSE" "${DEPLOY_DIR}/tomlplusplus-LICENSE.txt"
 
 info "Creating launcher script..."
 cat > "${DEPLOY_DIR}/run.sh" << 'EOF'

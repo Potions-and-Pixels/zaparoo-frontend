@@ -47,6 +47,9 @@ cmake -S . -B build && cmake --build build
 # Tests
 ctest --test-dir build --output-on-failure
 
+# Rust tests (unit tests for zaparoo-core)
+cargo test --manifest-path rust/Cargo.toml
+
 # All linters (clang-format check + clang-tidy + qmllint)
 cmake --build build --target lint
 
@@ -54,6 +57,10 @@ cmake --build build --target lint
 cmake --build build --target format-check   # clang-format dry-run
 cmake --build build --target tidy           # clang-tidy
 cmake --build build --target all_qmllint    # QML linting
+
+# Rust linting
+cargo fmt --manifest-path rust/Cargo.toml --check
+cargo clippy --manifest-path rust/Cargo.toml -- -D warnings
 
 # Auto-format C++ (after tidy finds issues)
 pre-commit run --all-files
@@ -87,7 +94,7 @@ For ARM32 / MiSTer builds and deploy bundle, see @docs/building.md.
 
 ## IMPORTANT: Repo Policy
 
-After editing any C++ or QML file, ALWAYS run:
+After editing any C++, Rust, or QML file, ALWAYS run:
 1. `cmake --build build --target lint` — zero warnings is the bar.
 2. `ctest --test-dir build --output-on-failure` — if the change can affect
    runtime behaviour.
@@ -115,6 +122,25 @@ written the code:
 - **`NumberAnimation on propName`** conflicts with `property T propName: value`.
   Drop the `: value` initialiser — the animation takes over immediately.
 
+## cxx-qt Bridge Gotchas
+
+When writing Rust QML models via cxx-qt 0.7:
+
+- **`cxx = "1"` must be a direct dependency.** The `#[cxx_qt::bridge]` macro
+  expands to `#[cxx::bridge]`. Rust resolves proc-macro attributes in the
+  calling crate's scope, so `cxx` must appear in that crate's `[dependencies]`
+  — being a transitive dep through `cxx-qt` is not sufficient.
+- **`#[qproperty(T, snake_case_name)]` auto-converts to camelCase** on the Qt
+  and QML side. `#[qproperty(bool, has_next_page)]` → accessible as
+  `hasNextPage` in QML.
+- **User-defined `#[qinvokable]` methods are exposed with their Rust name**
+  (snake_case). QML calls them as `model.set_system(id)` etc. Add
+  `#[cxx_name = "..."]` only when you need camelCase (e.g. to match a Qt
+  base-class virtual like `rowCount`, `roleNames`, `beginResetModel`).
+- **cxx-qt plugin class name** for a `Zaparoo.Browse` module is
+  `Zaparoo_Browse_plugin` (not `Zaparoo_BrowsePlugin`). Use
+  `Q_IMPORT_QML_PLUGIN(Zaparoo_Browse_plugin)` in the C++ entry point.
+
 ## Module Map
 
 | Directory | URI | Contents |
@@ -122,7 +148,8 @@ written the code:
 | `src/ui/theme/` | `Zaparoo.Theme` | `Theme`, `Sizing` singletons |
 | `src/ui/components/` | `Zaparoo.Ui` | `Carousel`, `CoverDelegate`, `TextTileDelegate`, `FpsCounter` |
 | `src/ui/app/` | `Zaparoo.App` | `Main.qml` + embedded fonts and images |
-| `src/core/` | `Zaparoo.Browse` | `CategoriesModel`, `SystemsModel`, `GamesModel`, `BrowseModel` (dormant) singletons + `SystemsCatalog`, `Config`, `Logger`, `PlatformPaths`, `ZaparooClient` (C++) |
+| `rust/launcher/src/models/` | `Zaparoo.Browse` | `CategoriesModel`, `SystemsModel`, `GamesModel`, `BrowseModel` (dormant) — Rust QML singletons via cxx-qt |
+| `rust/zaparoo-core/` | — | `client`, `config`, `logger`, `systems_catalog`, `media_types`, `platform_paths` (Rust, no Qt dependency) |
 
 Import QML modules as `import Zaparoo.Theme`, `import Zaparoo.Ui`, etc.
 Resources are embedded at `qrc:/qt/qml/Zaparoo/App/resources/...`.
@@ -130,25 +157,24 @@ Resources are embedded at `qrc:/qt/qml/Zaparoo/App/resources/...`.
 
 ## Logging
 
-Use `qCInfo`, `qCDebug`, `qCWarning`, `qCCritical` with one of the three
-logging categories rather than bare `qDebug`/`qWarning`:
+Use `tracing::info!`, `tracing::debug!`, `tracing::warn!`, `tracing::error!`
+in Rust code:
 
-```cpp
-#include "Logger.h"   // declares zapApp, zapCore, zapNet
-
-qCInfo(zapCore)  << "message";   // general core logic
-qCDebug(zapApp)  << "verbose";   // app-lifecycle events
-qCWarning(zapNet)<< "trouble";   // network / WebSocket
+```rust
+tracing::info!("catalog loaded: {} systems", count);
+tracing::debug!(target: "qt", "message from Qt layer");
+tracing::warn!("vmode exited with {:?}", code);
 ```
 
-**Never use `qDebug()` without a category** — it bypasses the filter rules
-and clutters release logs.
-
 The logger writes two sinks simultaneously:
-- **stderr**: human-readable `[hh:mm:ss.zzz L] message`
-- **file**: JSONL at `PlatformPaths::logFilePath()` — rotated at 1 MB,
-  keeping `.1` and `.2` backups. MiSTer: `/tmp/zaparoo/launcher.log`.
-  Desktop: `~/.local/share/zaparoo/logs/launcher.log`.
+- **stderr**: human-readable RFC-3339 timestamp + level + message
+- **file**: JSONL at `platform_paths::log_file_path()`. MiSTer:
+  `/tmp/zaparoo/launcher.log`. Desktop:
+  `~/.local/share/zaparoo/logs/launcher.log`.
+
+Qt messages are forwarded through the same tracing registry via the
+`zaparoo_log_qt` extern in `rust/launcher/src/lib.rs`, so Qt warnings
+appear in `launcher.log` with `target="qt"`.
 
 Debug-level output is filtered out by default. Enable it two ways:
 - **Config**: set `[logging] debug = true` in `launcher.toml`.
@@ -158,8 +184,8 @@ Debug-level output is filtered out by default. Enable it two ways:
 
 Full API reference: https://zaparoo.org/docs/core/api/
 
-Before adding or modifying any `ZaparooClient` method, check the upstream docs
-to verify method names, param shapes, and return types.
+Before adding or modifying any `Client` method in `rust/zaparoo-core/src/client.rs`,
+check the upstream docs to verify method names, param shapes, and return types.
 
 ## Further Reading
 

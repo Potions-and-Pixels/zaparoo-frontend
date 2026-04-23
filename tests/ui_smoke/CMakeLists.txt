@@ -26,13 +26,13 @@ target_link_libraries(
     tst_ui_smoke
     PRIVATE
         Zaparoo::CompileOptions
-        zaparoo_core
-        zaparoo_coreplugin
+        zaparoo_launcher_rs
         zaparoo_ui_appplugin
         zaparoo_ui_componentsplugin
         zaparoo_ui_themeplugin
         Qt6::QuickTest
         Qt6::Quick
+        Qt6::QuickControls2
 )
 
 add_test(NAME ui_smoke COMMAND tst_ui_smoke -input "${CMAKE_CURRENT_SOURCE_DIR}" -platform offscreen)

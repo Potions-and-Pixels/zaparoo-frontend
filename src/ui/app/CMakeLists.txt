@@ -37,6 +37,5 @@ target_link_libraries(
         zaparoo_ui_componentsplugin
         zaparoo_ui_themeplugin
     PRIVATE
-        zaparoo_coreplugin
         Zaparoo::CompileOptions
 )

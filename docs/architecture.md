@@ -3,16 +3,33 @@
 ## Module graph
 
 ```
-src/app/
+src/app/main.cpp
   launcher (executable)
-    ├── MiSterRuntime.cpp/.h
-    │     Pre-Qt setup: sets linuxfb env vars, calls vmode, starts zaparoo.sh.
-    │     Compiled only on ZAPAROO_MISTER (ARM32 static Qt); stubs on desktop.
+    │   Thin C++ entry point: constructs QGuiApplication + QQmlApplicationEngine,
+    │   installs Qt message handler, calls zaparoo_rust_init() from the Rust staticlib.
     │
-    ├── src/core/
-    │     zaparoo_core (static lib)
-    │     Qt6::Core, Qt6::Qml, Qt6::WebSockets
-    │     Exposes Zaparoo.Browse QML module (four singletons; BrowseModel is dormant)
+    ├── rust/launcher/  [zaparoo_launcher_rs staticlib]
+    │     ├── src/lib.rs
+    │     │     zaparoo_rust_init()      — tokio runtime, logger, WebSocket client,
+    │     │                               systems catalog, watch channel
+    │     │     zaparoo_rust_post_qt_start() — post-engine hooks
+    │     │     zaparoo_log_qt()         — Qt message handler sink → tracing registry
+    │     │
+    │     ├── src/mister_runtime.rs
+    │     │     Pre-Qt setup on ARM32: vmode resolution switch, zaparoo.sh start.
+    │     │     Compiled on all platforms; MiSTer-specific calls are gated by cfg.
+    │     │
+    │     ├── src/models/  [Zaparoo.Browse QML module via cxx-qt 0.7]
+    │     │     BrowseModel, CategoriesModel, SystemsModel, GamesModel
+    │     │     All four are QML singletons registered via build.rs QmlModule.
+    │     │
+    │     └── rust/zaparoo-core/  [non-Qt Rust crate]
+    │           client.rs          — WebSocket JSON-RPC 2.0 (tokio-tungstenite)
+    │           systems_catalog.rs — derives categories + systems from server data
+    │           config.rs          — TOML config (launcher.toml)
+    │           logger.rs          — tracing-subscriber: stderr + JSONL file sinks
+    │           platform_paths.rs  — log/config paths per platform
+    │           media_types.rs     — file-extension → media-type lookup
     │
     └── src/ui/app/  [Zaparoo.App QML module]
           Main.qml
@@ -29,7 +46,7 @@ src/app/
 
 | Target | URI | Load path |
 |---|---|---|
-| zaparoo_core (plugin) | `Zaparoo.Browse` | `qrc:/qt/qml/Zaparoo/Browse/` |
+| zaparoo_launcher_rs (plugin) | `Zaparoo.Browse` | `qrc:/qt/qml/Zaparoo/Browse/` |
 | zaparoo_ui_app | `Zaparoo.App` | `qrc:/qt/qml/Zaparoo/App/` |
 | zaparoo_ui_components | `Zaparoo.Ui` | `qrc:/qt/qml/Zaparoo/Ui/` |
 | zaparoo_ui_theme | `Zaparoo.Theme` | `qrc:/qt/qml/Zaparoo/Theme/` |
@@ -62,33 +79,43 @@ users may replace the bundled Qt libraries. The MiSTer ARM32 binary is
 statically linked; object files are available on request per LGPL §4(d)(1).
 License texts live in `src/LICENSES/`.
 
-## C++ → QML data flow
+## Rust → QML data flow
 
 ```
-ZaparooClient (WebSocket JSON-RPC 2.0)
+zaparoo_rust_init()
     │
-    ├── systems() callback
-    │     SystemsCatalog (internal C++, not a singleton)
-    │         ├── CategoriesModel (QML_SINGLETON, Zaparoo.Browse)
-    │         │       ↓ category name list
-    │         │   categoriesCarousel in Main.qml
-    │         │
-    │         └── SystemsModel (QML_SINGLETON, Zaparoo.Browse)
-    │                 ↓ systems filtered by current category
-    │             systemsCarousel in Main.qml
+    ├── logger::install()          — tracing-subscriber (stderr + JSONL file)
+    ├── Config::load()             — launcher.toml
+    ├── tokio::Runtime::new()      — multi-thread executor
     │
-    ├── media.search() callback
-    │     GamesModel (QML_SINGLETON, Zaparoo.Browse)
-    │         ↓ game list for current system (up to 100)
-    │     gamesCarousel in Main.qml
+    ├── tokio::sync::watch channel
+    │     Sender<CatalogSnapshot>  — written by WebSocket task
+    │     Receiver<CatalogSnapshot>— cloned into each QML singleton
     │
-    └── run() callback
-          (game launch, no model — direct invokable on GamesModel)
+    └── WebSocket client task (tokio)
+          │
+          ├── systems() → SystemsCatalog::from_systems()
+          │     → watch channel send(snapshot)
+          │         ├── CategoriesModel::on_catalog_changed()
+          │         │       ↓ category name list
+          │         │   categoriesCarousel in Main.qml
+          │         │
+          │         └── SystemsModel::on_catalog_changed()
+          │                 ↓ systems filtered by current category
+          │             systemsCarousel in Main.qml
+          │
+          ├── media.search() → GamesModel::on_search_result()
+          │         ↓ game list for current system (up to 100)
+          │     gamesCarousel in Main.qml
+          │
+          └── run() invoked via GamesModel::launch_at()
+                    (game launch — no model update)
 ```
 
-All four singletons (`CategoriesModel`, `SystemsModel`, `GamesModel`, and the
-dormant `BrowseModel`) must be set via their `setInstance()` methods before the
-`QQmlApplicationEngine` is created. See `src/app/main.cpp` for the wiring.
+Qt message handler (`qInstallMessageHandler`) forwards all Qt log output
+to `zaparoo_log_qt()` in the Rust staticlib, which routes it through the
+same tracing registry. All log output (Rust + Qt) ends up in the same
+sinks: stderr and `launcher.log`.
 
 ### Navigation state (Main.qml)
 
@@ -98,10 +125,10 @@ hubFocus:     "categories" | "systems"
 ```
 
 - **hub + categories**: categoriesCarousel centred; Left/Right cycle categories;
-  Enter calls `SystemsModel.setCategory()` and shifts hubFocus to "systems";
+  Enter calls `SystemsModel.set_category()` and shifts hubFocus to "systems";
   Escape quits.
 - **hub + systems**: categoriesCarousel swoops to top; systemsCarousel fades in
-  below; Enter calls `GamesModel.setSystem()` and sets activeScreen to "games";
+  below; Enter calls `GamesModel.set_system()` and sets activeScreen to "games";
   Escape returns to categories.
-- **games**: gamesCarousel visible; Enter calls `GamesModel.launchAt()`;
+- **games**: gamesCarousel visible; Enter calls `GamesModel.launch_at()`;
   Escape returns to hub (hubFocus preserved).

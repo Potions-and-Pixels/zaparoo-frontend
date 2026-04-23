@@ -7,16 +7,24 @@
 - Qt 6.7+ (Quick, QuickControls2, Qml)
 - CMake 3.21+
 - C++17 compiler (GCC 10+, Clang 12+, MSVC 2019+)
+- Rust stable toolchain (`rustup install stable`)
 - Ninja (recommended) or Make
 
 On Fedora/RHEL: `sudo dnf install qt6-qtdeclarative-devel qt6-qtquickcontrols2-devel cmake ninja-build`
 On Ubuntu/Debian: `sudo apt install qt6-declarative-dev qt6-quick-controls2-dev cmake ninja-build`
+
+Install Rust via rustup: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
 
 ### MiSTer ARM32 cross-build
 
 - Docker (any recent version)
 - x86_64 host (no emulation needed — pure cross-compilation)
 - ~8 GB disk space for the toolchain image
+
+The toolchain Docker image ships a cross-compiler-aware `rust/.cargo/config.toml`
+that sets the correct linker (`arm-linux-gnueabihf-gcc`), target
+(`armv7-unknown-linux-gnueabihf`), and `mold` on desktop for faster links.
+No manual cargo config is needed.
 
 ## Desktop build
 
@@ -126,6 +134,12 @@ QT_QPA_PLATFORM=linuxfb QT_QUICK_BACKEND=software ./build/bin/launcher
 ctest --test-dir build --output-on-failure
 ```
 
+Rust unit tests (zaparoo-core):
+
+```bash
+cargo test --manifest-path rust/Cargo.toml
+```
+
 ## Code quality
 
 ### Run all linters
@@ -143,6 +157,13 @@ This runs clang-format (check only), clang-tidy, and qmllint in one shot.
 cmake --build build --target format-check   # clang-format dry-run
 cmake --build build --target tidy           # clang-tidy static analysis
 cmake --build build --target all_qmllint    # QML linting
+```
+
+### Rust linting
+
+```bash
+cargo fmt --manifest-path rust/Cargo.toml --check   # format check
+cargo clippy --manifest-path rust/Cargo.toml         # static analysis
 ```
 
 ### Auto-format C++ files

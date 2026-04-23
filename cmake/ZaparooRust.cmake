@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2026 Callan Barrett
 #
 # Rust/Cargo integration via Corrosion. Builds zaparoo_launcher_rs as a
-# staticlib and links it into a C++ executable (launcher-rs) so that Qt's
+# staticlib and links it into a thin C++ executable (launcher) so that Qt's
 # CMake machinery (qt_import_qml_plugins) handles all static-plugin and
 # qmldir-resource-init wiring correctly — the documented CXX-Qt static-Qt
 # topology (topology B: C++ exe + Rust staticlib).
@@ -86,26 +86,26 @@ endif()
 # ── C++ executable ───────────────────────────────────────────────────────────
 # Using qt_add_executable (not add_executable) so that Qt's CMake sets up
 # the target with all the properties needed by qt_import_qml_plugins.
-qt_add_executable(launcher-rs "${CMAKE_SOURCE_DIR}/src/app/main_rs.cpp")
+qt_add_executable(launcher "${CMAKE_SOURCE_DIR}/src/app/main.cpp")
 
-target_compile_definitions(launcher-rs
+target_compile_definitions(launcher
     PRIVATE ZAPAROO_VERSION="${CMAKE_PROJECT_VERSION}"
 )
 
-# For static Qt (ARM32): define QT_STATIC so main_rs.cpp's #ifdef fires.
+# For static Qt (ARM32): define QT_STATIC so main.cpp's #ifdef fires.
 # Qt itself defines this in its headers, but the compiler may not see it
 # before the first #include unless we make it explicit here too.
 if(_rs_qt6_core_type STREQUAL "STATIC_LIBRARY")
-    target_compile_definitions(launcher-rs PRIVATE QT_STATIC)
+    target_compile_definitions(launcher PRIVATE QT_STATIC)
 endif()
 
 if(ZAPAROO_DEV)
-    target_compile_definitions(launcher-rs PRIVATE ZAPAROO_DEV_BUILD)
+    target_compile_definitions(launcher PRIVATE ZAPAROO_DEV_BUILD)
 endif()
 
 # Load Qt QML plugin CMake configs so that qt_import_qml_plugins can find
 # and link the correct static plugin archives. These are not loaded by
-# find_package(Qt6 ...) by default. Mirror the pattern from src/app/CMakeLists.txt.
+# find_package(Qt6 ...) by default.
 if(_rs_qt6_core_type STREQUAL "STATIC_LIBRARY")
     get_filename_component(_rs_qt_prefix "${Qt6_DIR}/../../.." ABSOLUTE)
     file(GLOB _rs_qml_plugin_configs
@@ -125,7 +125,7 @@ if(_rs_qt6_core_type STREQUAL "STATIC_LIBRARY")
     endforeach()
 endif()
 
-target_link_libraries(launcher-rs
+target_link_libraries(launcher
     PRIVATE
         zaparoo_launcher_rs
         zaparoo_ui_appplugin
@@ -133,20 +133,18 @@ target_link_libraries(launcher-rs
         Qt6::QuickControls2
 )
 
-# Critical: this is the documented Qt static-plugin machinery. It runs
-# qmlimportscanner, traverses the QML module dependency graph, and emits
-# correct Q_IMPORT_QML_PLUGIN calls + +whole-archive link lines for every
-# Qt static QML plugin and qmldir resource init .o. Replaces the entire
-# hand-rolled start-group / _init OBJECT lib block from the old CMake.
-qt_import_qml_plugins(launcher-rs)
+# Critical: documented Qt static-plugin machinery. Runs qmlimportscanner,
+# traverses the QML module dependency graph, and emits correct
+# Q_IMPORT_QML_PLUGIN calls + --whole-archive link lines for every Qt
+# static QML plugin and qmldir resource init .o.
+qt_import_qml_plugins(launcher)
 
 # For static Qt (ARM32): the Controls chain _init OBJECT targets carry the
-# Q_IMPORT_QML_PLUGIN static-init factories. They are not propagated
-# automatically from the cross-compiled Qt toolchain, so link them explicitly.
-# Mirror of src/app/CMakeLists.txt lines 64-84.
+# Q_IMPORT_QML_PLUGIN static-init factories. Not propagated automatically
+# from a cross-compiled Qt toolchain, so link them explicitly.
 if(_rs_qt6_core_type STREQUAL "STATIC_LIBRARY")
     if(TARGET Qt6::QLinuxFbIntegrationPlugin)
-        target_link_libraries(launcher-rs PRIVATE
+        target_link_libraries(launcher PRIVATE
             Qt6::QLinuxFbIntegrationPlugin
             Qt6::QLinuxFbIntegrationPlugin_init
         )
@@ -158,7 +156,7 @@ if(_rs_qt6_core_type STREQUAL "STATIC_LIBRARY")
             qtquicktemplates2plugin
             quickwindow)
         if(TARGET Qt6::${_rs_qml_plugin})
-            target_link_libraries(launcher-rs PRIVATE
+            target_link_libraries(launcher PRIVATE
                 Qt6::${_rs_qml_plugin}
                 Qt6::${_rs_qml_plugin}_init
             )
@@ -166,6 +164,6 @@ if(_rs_qt6_core_type STREQUAL "STATIC_LIBRARY")
     endforeach()
 endif()
 
-set_target_properties(launcher-rs PROPERTIES
+set_target_properties(launcher PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
