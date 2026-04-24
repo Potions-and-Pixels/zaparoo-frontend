@@ -21,6 +21,17 @@ file(
     "${CMAKE_SOURCE_DIR}/tests/*.h"
 )
 
+# Translation units only. run-clang-tidy treats its positional args as regex
+# filters against compile_commands.json, which never contains headers — so
+# passing headers here produces unmatched filter strings. Headers still get
+# analysed, just indirectly via the TUs that #include them.
+file(
+    GLOB_RECURSE _ZAPAROO_CXX_TIDY_SOURCES
+    CONFIGURE_DEPENDS
+    "${CMAKE_SOURCE_DIR}/src/*.cpp"
+    "${CMAKE_SOURCE_DIR}/tests/*.cpp"
+)
+
 # ── clang-format check ────────────────────────────────────────────────────────
 
 find_program(CLANG_FORMAT_EXE NAMES clang-format)
@@ -55,7 +66,7 @@ if(RUN_CLANG_TIDY_EXE)
     # only stabilized across distros in clang 19+).
     add_custom_target(
         tidy
-        COMMAND ${RUN_CLANG_TIDY_EXE} -p "${CMAKE_BINARY_DIR}" ${_ZAPAROO_CXX_SOURCES}
+        COMMAND ${RUN_CLANG_TIDY_EXE} -p "${CMAKE_BINARY_DIR}" ${_ZAPAROO_CXX_TIDY_SOURCES}
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
         COMMENT "clang-tidy: static analysis (parallel via run-clang-tidy)"
         VERBATIM
@@ -63,7 +74,7 @@ if(RUN_CLANG_TIDY_EXE)
 elseif(CLANG_TIDY_EXE)
     add_custom_target(
         tidy
-        COMMAND ${CLANG_TIDY_EXE} -p "${CMAKE_BINARY_DIR}" ${_ZAPAROO_CXX_SOURCES}
+        COMMAND ${CLANG_TIDY_EXE} -p "${CMAKE_BINARY_DIR}" ${_ZAPAROO_CXX_TIDY_SOURCES}
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
         COMMENT "clang-tidy: static analysis"
         VERBATIM

@@ -14,9 +14,10 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 OUTPUT_DIR="${PROJECT_ROOT}/output"
+TOOLCHAIN_VERSION="$(cat "${PROJECT_ROOT}/toolchain/VERSION")"
 # CI sets TOOLCHAIN_IMAGE to a GHCR tag; local dev defaults to the image
-# produced by build-toolchain.sh.
-TOOLCHAIN_IMAGE="${TOOLCHAIN_IMAGE:-zaparoo/qt6-arm32-mister:6.7.2}"
+# produced by build-toolchain.sh, whose tag derives from toolchain/VERSION.
+TOOLCHAIN_IMAGE="${TOOLCHAIN_IMAGE:-zaparoo/qt6-arm32-mister:${TOOLCHAIN_VERSION}}"
 
 # Build toolchain image locally if it's missing and we're using the local tag.
 # When TOOLCHAIN_IMAGE points at a registry, docker build will pull it.
