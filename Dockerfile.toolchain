@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1.6
+# Zaparoo Launcher
+# Copyright (c) 2026 The Zaparoo Project Contributors.
 # SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0
-# SPDX-FileCopyrightText: 2026 Callan Barrett
 #
 # Builds the reusable Qt 6.7.2 + MiSTer ARM32 toolchain base image.
 # Tag locally as:

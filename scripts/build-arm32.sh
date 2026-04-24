@@ -1,6 +1,7 @@
 #!/bin/bash
+# Zaparoo Launcher
+# Copyright (c) 2026 The Zaparoo Project Contributors.
 # SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0
-# SPDX-FileCopyrightText: 2026 Callan Barrett
 #
 # Cross-compiles the launcher for ARM32 / MiSTer FPGA using Docker.
 # Uses the prebuilt toolchain image; builds the application layer only (~1 min).

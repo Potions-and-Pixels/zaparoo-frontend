@@ -1,6 +1,7 @@
 #!/bin/bash
+# Zaparoo Launcher
+# Copyright (c) 2026 The Zaparoo Project Contributors.
 # SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0
-# SPDX-FileCopyrightText: 2026 Callan Barrett
 #
 # Build the Qt 6.7.2 + MiSTer ARM32 toolchain base image.
 # Run this ONCE (or when Qt version needs bumping). Takes ~45 minutes.
