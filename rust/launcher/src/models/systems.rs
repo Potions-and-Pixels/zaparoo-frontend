@@ -1,5 +1,5 @@
 // Zaparoo Launcher
-// Copyright (c) 2026 The Zaparoo Project Contributors.
+// Copyright (c) 2026 Wizzo Pty Ltd and the Zaparoo Project contributors.
 // SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0
 
 #![allow(
@@ -7,10 +7,12 @@
     reason = "RwLock poisoning signals another thread panicked with the lock held; state is unrecoverable"
 )]
 
-use cxx_qt::{CxxQtType, Initialize, Threading};
+use cxx_qt::CxxQtType;
 use cxx_qt_lib::{QByteArray, QHash, QHashPair_i32_QByteArray, QModelIndex, QString, QVariant};
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
+use zaparoo_core::endpoints::catalog::CatalogEndpoint;
+use zaparoo_core::remote_resource::ResourceStatus;
 use zaparoo_core::systems_catalog::CatalogData;
 
 const ID_ROLE: i32 = 256 + 1;
@@ -27,6 +29,7 @@ pub struct SystemsModelRust {
     systems: Vec<SystemInfo>,
     count: i32,
     current_category: QString,
+    error_message: QString,
     // Shared catalog owned by the background task; model reads it on setCategory
     catalog: Arc<RwLock<Option<CatalogData>>>,
 }
@@ -37,6 +40,7 @@ impl Default for SystemsModelRust {
             systems: Vec::new(),
             count: 0,
             current_category: QString::default(),
+            error_message: QString::default(),
             catalog: Arc::new(RwLock::new(None)),
         }
     }
@@ -64,6 +68,7 @@ pub mod ffi {
         #[qml_singleton]
         #[qproperty(i32, count)]
         #[qproperty(QString, current_category)]
+        #[qproperty(QString, error_message)]
         type SystemsModel = super::SystemsModelRust;
 
         #[qinvokable]
@@ -97,53 +102,56 @@ pub mod ffi {
     impl cxx_qt::Initialize for SystemsModel {}
 }
 
-impl Initialize for ffi::SystemsModel {
-    fn initialize(self: Pin<&mut Self>) {
-        use crate::models::{global_runtime, subscribe_catalog};
+crate::bind_to_endpoint! {
+    for ffi::SystemsModel,
+    endpoint = CatalogEndpoint,
+    args = (),
+    select = project,
+    apply = apply_state,
+}
 
-        let catalog_arc = self.rust().catalog.clone();
-        let qt_thread = self.qt_thread();
-        let mut catalog_rx = subscribe_catalog();
+/// Pull the two pieces this model cares about out of the unified
+/// `ResourceStatus`: the catalog payload (only present on `Ready`) and
+/// the surfaced error message (empty unless `Errored`).
+fn project(status: &ResourceStatus<CatalogData>) -> (Option<CatalogData>, String) {
+    match status {
+        ResourceStatus::Ready(data) => (Some(data.clone()), String::new()),
+        ResourceStatus::Errored { message, .. } => (None, message.clone()),
+        ResourceStatus::Idle | ResourceStatus::Loading => (None, String::new()),
+    }
+}
 
-        // Seed catalog arc with whatever has already loaded.
-        if let Some(data) = catalog_rx.borrow_and_update().clone() {
-            *catalog_arc.write().unwrap() = Some(data);
+fn apply_state(mut model: Pin<&mut ffi::SystemsModel>, (data, err): (Option<CatalogData>, String)) {
+    if let Some(data) = data {
+        // Rebuild visible rows directly from `data` — if the user has
+        // already picked a category — *before* moving it into the
+        // shared catalog cache, so we don't have to re-acquire the
+        // read lock to look at what we just wrote.
+        let cat = model.rust().current_category.to_string();
+        if !cat.is_empty() {
+            let systems = data.systems_by_category(&cat);
+            let count = systems.len() as i32;
+            let rows: Vec<SystemInfo> = systems
+                .into_iter()
+                .map(|s| SystemInfo {
+                    id: s.id,
+                    name: s.name,
+                    category: s.category,
+                })
+                .collect();
+            model.as_mut().begin_reset_model();
+            model.as_mut().rust_mut().systems = rows;
+            model.as_mut().rust_mut().count = count;
+            model.as_mut().end_reset_model();
+            model.as_mut().count_changed();
         }
-
-        global_runtime().spawn(async move {
-            while catalog_rx.changed().await.is_ok() {
-                if let Some(data) = catalog_rx.borrow_and_update().clone() {
-                    *catalog_arc.write().unwrap() = Some(data);
-                }
-                let _ = qt_thread.queue(move |mut model| {
-                    let cat = model.rust().current_category.to_string();
-                    if !cat.is_empty() {
-                        let systems = model
-                            .rust()
-                            .catalog
-                            .read()
-                            .unwrap()
-                            .as_ref()
-                            .map(|c| c.systems_by_category(&cat))
-                            .unwrap_or_default();
-                        let count = systems.len() as i32;
-                        let rows: Vec<SystemInfo> = systems
-                            .into_iter()
-                            .map(|s| SystemInfo {
-                                id: s.id,
-                                name: s.name,
-                                category: s.category,
-                            })
-                            .collect();
-                        model.as_mut().begin_reset_model();
-                        model.as_mut().rust_mut().systems = rows;
-                        model.as_mut().rust_mut().count = count;
-                        model.as_mut().end_reset_model();
-                        model.as_mut().count_changed();
-                    }
-                });
-            }
-        });
+        // Refresh the shared catalog cache that `set_category` reads
+        // so subsequent category switches see the latest data.
+        *model.rust().catalog.write().unwrap() = Some(data);
+    }
+    let qerr = QString::from(err.as_str());
+    if model.error_message != qerr {
+        model.as_mut().set_error_message(qerr);
     }
 }
 
