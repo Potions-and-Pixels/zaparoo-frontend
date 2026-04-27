@@ -18,6 +18,9 @@ just test                 # ctest + cargo nextest
 just lint                 # clang-format, clang-tidy, qmllint, rustfmt, clippy, cargo-deny
 ```
 
+The MiSTer ARM32 path uses the official Docker Buildx toolchain image and does
+not need Qt, CMake, or Rust installed on the host.
+
 `just test` and `just lint` need `cargo-nextest` and `cargo-deny`:
 
 ```bash
