@@ -26,7 +26,7 @@ Item {
     // active screen back to SystemsScreen (one peer up the back-stack;
     // a second Escape from there pops to Hub).
     signal requestSystemsScreen()
-    signal requestGameCardWrite(int index)
+    signal requestContextMenu(int index, var anchorRect)
 
     // Emitted when the user accepts a directory or root entry — Main.qml
     // pushes the level onto GamesState and drives the model into the new
@@ -56,6 +56,14 @@ Item {
                 Browse.GamesModel.path_at(games.gamesGrid.currentIndex))
     }
 
+    function _focusIndex(index: int): void {
+        if (index < 0 || index >= games.gamesGrid.itemCount)
+            return
+        games.gamesGrid.currentIndex = index
+        Browse.GamesState.set_selected_at_top(
+            Browse.GamesModel.path_at(games.gamesGrid.currentIndex))
+    }
+
     // Mirrors ScreenStateOverlay's `state` ternary so accept routing and
     // the in-screen overlay agree on which state we're in.
     function _state(): string {
@@ -72,16 +80,6 @@ Item {
     // Drives folder-aware cancel routing.
     function _atFolderLevel(): bool {
         return Browse.GamesState.path_stack.length > 1
-    }
-
-    // True when the highlighted row is launchable (not a directory or
-    // root). Read by MainLayout to suppress the [TAB] FLASH CARD cue
-    // while a folder is highlighted, since `write_card` no-ops there.
-    readonly property bool currentEntryWritable: {
-        if (gamesGrid.itemCount === 0)
-            return false
-        const t = Browse.GamesModel.entry_type_at(gamesGrid.currentIndex)
-        return t !== "directory" && t !== "root"
     }
 
     function handleAction(action: string): void {
@@ -146,12 +144,10 @@ Item {
         } else if (action === "write_card") {
             if (games.gamesGrid.itemCount > 0) {
                 const idx = games.gamesGrid.currentIndex
-                const entryType = Browse.GamesModel.entry_type_at(idx)
-                if (entryType !== "directory" && entryType !== "root") {
-                    Browse.GamesState.set_selected_at_top(
-                        Browse.GamesModel.path_at(idx))
-                    games.requestGameCardWrite(idx)
-                }
+                Browse.GamesState.set_selected_at_top(
+                    Browse.GamesModel.path_at(idx))
+                games.requestContextMenu(
+                    idx, games.gamesGrid.currentCellRectIn(games))
             }
         } else if (action === "cancel") {
             if (games._atFolderLevel())
@@ -222,6 +218,11 @@ Item {
         columnsOverride: Sizing.gamesGridColumns
         rowsOverride: Sizing.gamesGridRows
         onLoadMoreRequested: Browse.GamesModel.fetch_more()
+        onItemHovered: (index) => games._focusIndex(index)
+        onItemClicked: (index) => {
+            games._focusIndex(index)
+            games.handleAction("accept")
+        }
     }
 
     // Active game caption — single big line just under the grid. Same

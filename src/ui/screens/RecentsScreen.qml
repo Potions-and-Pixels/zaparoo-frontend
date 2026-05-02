@@ -67,6 +67,13 @@ Item {
         Browse.RecentsState.selected_path = path
     }
 
+    function _focusIndex(index: int): void {
+        if (index < 0 || index >= recents.recentsGrid.itemCount)
+            return
+        recents.recentsGrid.currentIndex = index
+        recents._persistFocus()
+    }
+
     function _state(): string {
         if (Browse.RecentsModel.loading)
             return "loading"
@@ -149,6 +156,11 @@ Item {
         rowsOverride: Sizing.gamesGridRows
         onLoadMoreRequested: Browse.RecentsModel.fetch_more()
         onCurrentIndexChanged: recents._persistFocus()
+        onItemHovered: (index) => recents._focusIndex(index)
+        onItemClicked: (index) => {
+            recents._focusIndex(index)
+            recents.handleAction("accept")
+        }
     }
 
     ActiveLabel {

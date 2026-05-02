@@ -18,7 +18,7 @@ import Zaparoo.Browse as Browse
 // Systems screen — paged grid driven by `Browse.SystemsModel`. Pure
 // input dispatcher: emits `requestAccept(systemId)` on Accept (with
 // "" payload to signal Empty/Error retry intent),
-// `requestSystemCardWrite(index)` on the card-write action, and
+// `requestContextMenu(index, anchorRect)` on the context-menu action, and
 // `requestHubScreen()` on Escape. Cross-screen orchestration (model
 // fills, transition overlay, screen flip) lives in Main.qml;
 // `transitioning` is written by the router so the grid hides during
@@ -31,7 +31,7 @@ Item {
 
     signal requestAccept(systemId: string)
     signal requestHubScreen()
-    signal requestSystemCardWrite(int index)
+    signal requestContextMenu(int index, var anchorRect)
 
     // Move selection by (dx, dy) and commit the new system id on
     // success. Returns the moveSelection result; row/column moves wrap
@@ -56,6 +56,14 @@ Item {
             return true
         }
         return false
+    }
+
+    function _focusIndex(index: int): void {
+        if (index < 0 || index >= systems.systemsGrid.itemCount)
+            return
+        systems.systemsGrid.currentIndex = index
+        Browse.SystemsState.system_id =
+            Browse.SystemsModel.system_id_at(systems.systemsGrid.currentIndex)
     }
 
     // Mirrors ScreenStateOverlay's `state` ternary so accept routing and
@@ -110,9 +118,11 @@ Item {
             systems.requestAccept(chosen)
         } else if (action === "write_card") {
             if (systems.systemsGrid.itemCount > 0) {
+                const idx = systems.systemsGrid.currentIndex
                 Browse.SystemsState.system_id =
-                    Browse.SystemsModel.system_id_at(systems.systemsGrid.currentIndex)
-                systems.requestSystemCardWrite(systems.systemsGrid.currentIndex)
+                    Browse.SystemsModel.system_id_at(idx)
+                systems.requestContextMenu(
+                    idx, systems.systemsGrid.currentCellRectIn(systems))
             }
         } else if (action === "cancel") {
             systems.requestHubScreen()
@@ -168,6 +178,11 @@ Item {
         anchors.bottomMargin: Sizing.pctH(15)
         model: Browse.SystemsModel
         delegate: Tile {}
+        onItemHovered: (index) => systems._focusIndex(index)
+        onItemClicked: (index) => {
+            systems._focusIndex(index)
+            systems.handleAction("accept")
+        }
 
         // Hide the tiles while the router holds us here on a forward
         // transition (Systems → Games) so the centred "Loading…" cue

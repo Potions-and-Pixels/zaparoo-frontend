@@ -81,10 +81,36 @@ pub struct RecentsState {
 /// Per-launcher Settings selections. `resolution` is `"WxH"` (e.g.
 /// `"1920x1080"`); empty means "no Settings override" and the value
 /// from `[mister.video_*]` in `launcher.toml` is left in place.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// `language` mirrors `[general].language` in `launcher.toml` so the UI
+/// settings snapshot stays coherent with the config-backed startup path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SettingsState {
     pub resolution: String,
+    pub language: String,
+    #[serde(default = "default_button_layout")]
+    pub button_layout: String,
+    #[serde(default = "default_mouse_enabled")]
+    pub mouse_enabled: bool,
+}
+
+impl Default for SettingsState {
+    fn default() -> Self {
+        Self {
+            resolution: String::new(),
+            language: String::new(),
+            button_layout: default_button_layout(),
+            mouse_enabled: default_mouse_enabled(),
+        }
+    }
+}
+
+fn default_button_layout() -> String {
+    "nintendo".into()
+}
+
+fn default_mouse_enabled() -> bool {
+    true
 }
 
 pub fn load() -> PersistedState {
@@ -208,6 +234,9 @@ mod tests {
             },
             settings: SettingsState {
                 resolution: "1920x1080".into(),
+                language: "it_IT".into(),
+                button_layout: "xbox".into(),
+                mouse_enabled: false,
             },
         };
         save_to(&path, &original);
@@ -287,6 +316,18 @@ mod tests {
         assert_eq!(state.games, GamesState::default());
         assert_eq!(state.recents, RecentsState::default());
         assert_eq!(state.settings, SettingsState::default());
+    }
+
+    #[test]
+    fn missing_settings_fields_default_to_current_behavior() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.toml");
+        std::fs::write(&path, "[settings]\nresolution = \"1920x1080\"\n").expect("write");
+        let state = load_from(&path);
+        assert_eq!(state.settings.resolution, "1920x1080");
+        assert_eq!(state.settings.language, "");
+        assert_eq!(state.settings.button_layout, "nintendo");
+        assert!(state.settings.mouse_enabled);
     }
 
     #[test]

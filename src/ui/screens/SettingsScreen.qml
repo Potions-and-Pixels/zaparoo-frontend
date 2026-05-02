@@ -15,11 +15,11 @@ import Zaparoo.Browse as Browse
 // method-level finality, suppress the compiler category file-wide.
 // qmllint disable compiler
 
-// Settings screen — gamepad-driven vertical form. First (and for now
-// only) field is a Resolution picker, which is MiSTer-only — the
-// underlying `vmode` command lives on MiSTer's Linux framebuffer. On
-// other runtimes the form shows a placeholder until something
-// cross-platform exists.
+// Settings screen — gamepad-driven vertical form. Resolution is MiSTer-only
+// because the underlying `vmode` command lives on MiSTer's Linux framebuffer.
+// Button layout is cross-platform and selects the resource directory for
+// help-bar button glyphs. Mouse support is cross-platform and controls
+// cursor visibility plus mouse hit targets.
 //
 // Pure input dispatcher: emits `requestHubScreen()` on Escape; left/
 // right cycle the focused field's value via the model singleton.
@@ -40,10 +40,9 @@ Item {
     // (rather than a Repeater of typed children) makes adding fields
     // a one-line edit and keeps the navigation logic uniform.
     //
-    // `available` is the picker's option list (curated, short — three
-    // entries for resolution); `currentValue` is the binding the field
-    // displays; `onCycle(direction)` advances the picker and writes
-    // through the model setter, which persists + applies at runtime.
+    // Field-specific helpers below provide option lists, display labels,
+    // and model setters. This keeps the Repeater delegate presentational
+    // while handleAction remains a simple input dispatcher.
     readonly property var fields: {
         const out = []
         if (Browse.Settings.is_mister) {
@@ -52,10 +51,24 @@ Item {
                 label: qsTr("Resolution")
             })
         }
+        out.push({
+            id: "language",
+            label: qsTr("Language")
+        })
+        out.push({
+            id: "buttonLayout",
+            label: qsTr("Button layout")
+        })
+        out.push({
+            id: "mouseEnabled",
+            label: qsTr("Mouse support")
+        })
         return out
     }
 
     readonly property int fieldCount: settings.fields.length
+    readonly property bool focusedFieldIsMouse:
+        settings.fieldCount > 0 && settings.fields[settings.currentIndex].id === "mouseEnabled"
 
     property int currentIndex: 0
 
@@ -97,12 +110,92 @@ Item {
         Browse.Settings.set_resolution(list[next])
     }
 
+    function _buttonLayoutList(): list<string> {
+        const raw = Browse.Settings.available_button_layouts
+        return raw === undefined || raw === null ? [] : raw
+    }
+
+    function _languageList(): list<string> {
+        const raw = Browse.Settings.available_languages
+        return raw === undefined || raw === null ? [] : raw
+    }
+
+    function _languageDisplay(value: string): string {
+        if (value === "en")
+            return qsTr("English")
+        if (value === "it_IT")
+            return qsTr("Italian")
+        return qsTr("Auto")
+    }
+
+    function _currentLanguageIndex(): int {
+        const list = settings._languageList()
+        const cur = Browse.Settings.current_language
+        for (let i = 0; i < list.length; i++)
+            if (list[i] === cur)
+                return i
+        return -1
+    }
+
+    function _cycleLanguage(direction: int): void {
+        const list = settings._languageList()
+        if (list.length === 0)
+            return
+        let idx = settings._currentLanguageIndex()
+        if (idx < 0)
+            idx = direction > 0 ? -1 : 0
+        const next = ((idx + direction) % list.length + list.length) % list.length
+        Browse.Settings.set_language(list[next])
+    }
+
+    function _buttonLayoutDisplay(value: string): string {
+        if (value === "xbox")
+            return qsTr("Xbox")
+        if (value === "sony")
+            return qsTr("Sony")
+        return qsTr("Nintendo")
+    }
+
+    function _currentButtonLayoutIndex(): int {
+        const list = settings._buttonLayoutList()
+        const cur = Browse.Settings.current_button_layout
+        for (let i = 0; i < list.length; i++)
+            if (list[i] === cur)
+                return i
+        return -1
+    }
+
+    function _cycleButtonLayout(direction: int): void {
+        const list = settings._buttonLayoutList()
+        if (list.length === 0)
+            return
+        let idx = settings._currentButtonLayoutIndex()
+        if (idx < 0)
+            idx = direction > 0 ? -1 : 0
+        const next = ((idx + direction) % list.length + list.length) % list.length
+        Browse.Settings.set_button_layout(list[next])
+    }
+
+    function _setMouseEnabled(direction: int): void {
+        Browse.Settings.set_mouse_enabled(direction > 0)
+    }
+
+    function _toggleMouseEnabled(): void {
+        Browse.Settings.set_mouse_enabled(!Browse.Settings.current_mouse_enabled)
+    }
+
     function _cycleFocused(direction: int): void {
         if (settings.fieldCount === 0)
             return
         const id = settings.fields[settings.currentIndex].id
         if (id === "resolution")
             settings._cycleResolution(direction)
+        else if (id === "language")
+            settings._cycleLanguage(direction)
+        else if (id === "buttonLayout")
+            settings._cycleButtonLayout(direction)
+        else if (id === "mouseEnabled")
+            settings._setMouseEnabled(direction)
     }
 
     function handleAction(action: string): void {
@@ -116,13 +209,13 @@ Item {
             settings._cycleFocused(-1)
         } else if (action === "right") {
             settings._cycleFocused(1)
+        } else if (action === "accept") {
+            if (settings.fieldCount > 0
+                && settings.fields[settings.currentIndex].id === "mouseEnabled")
+                settings._toggleMouseEnabled()
         } else if (action === "cancel") {
             settings.requestHubScreen()
         }
-        // Accept is intentionally a no-op — left/right is the only way
-        // to change a value, matching the rest of the launcher's
-        // gamepad vocabulary (Accept always advances *into* something,
-        // never edits in place).
     }
 
     // ── Visual tree ───────────────────────────────────────────────────────────
@@ -166,13 +259,37 @@ Item {
                 label: modelData.label
                 value: modelData.id === "resolution"
                        ? settings._resolutionDisplay(Browse.Settings.current_resolution)
+                       : modelData.id === "language"
+                       ? settings._languageDisplay(Browse.Settings.current_language)
+                       : modelData.id === "buttonLayout"
+                       ? settings._buttonLayoutDisplay(Browse.Settings.current_button_layout)
                        : ""
-                // Resolution wraps modulo, so both arrows always apply
-                // when there's at least one curated entry.
-                canCyclePrev: modelData.id === "resolution"
-                              && settings._resolutionList().length > 0
-                canCycleNext: modelData.id === "resolution"
-                              && settings._resolutionList().length > 0
+                control: modelData.id === "mouseEnabled" ? "toggle" : "value"
+                checked: Browse.Settings.current_mouse_enabled
+                // Pickers wrap modulo, so both arrows apply when the
+                // focused field has a populated option list.
+                canCyclePrev: (modelData.id === "resolution"
+                               && settings._resolutionList().length > 0)
+                              || (modelData.id === "language"
+                                  && settings._languageList().length > 1)
+                              || (modelData.id === "buttonLayout"
+                                  && settings._buttonLayoutList().length > 1)
+                              || (modelData.id === "mouseEnabled"
+                                  && Browse.Settings.current_mouse_enabled)
+                canCycleNext: (modelData.id === "resolution"
+                               && settings._resolutionList().length > 0)
+                              || (modelData.id === "language"
+                                  && settings._languageList().length > 1)
+                              || (modelData.id === "buttonLayout"
+                                  && settings._buttonLayoutList().length > 1)
+                              || (modelData.id === "mouseEnabled"
+                                  && !Browse.Settings.current_mouse_enabled)
+                onHovered: settings.currentIndex = index
+                onClicked: {
+                    settings.currentIndex = index
+                    if (modelData.id === "mouseEnabled")
+                        settings._toggleMouseEnabled()
+                }
             }
         }
     }

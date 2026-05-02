@@ -48,6 +48,12 @@ ApplicationWindow {
     visibility: root.fullScreen ? Window.FullScreen : Window.Windowed
     title: qsTr("Zaparoo Launcher")
 
+    Binding {
+        target: Resources
+        property: "buttonLayout"
+        value: Browse.Settings.current_button_layout
+    }
+
     // Screen plumbing exposed for Main.qml's orchestration. Anything
     // inside the screens (categories row, systems/games grids) is
     // reached via root.hubScreen.* / root.systemsScreen.* /
@@ -57,9 +63,22 @@ ApplicationWindow {
     property alias gamesScreen: gamesScreen
     property alias recentsScreen: recentsScreen
     property alias settingsScreen: settingsScreen
+    property alias contextMenu: contextMenu
 
     property bool cardWriteModalVisible: false
     property bool cardWriteFailed: false
+    property bool qrCodeModalVisible: false
+    property bool contextMenuVisible: false
+    property rect contextMenuAnchor: Qt.rect(0, 0, 0, 0)
+    readonly property var contextMenuEntries: [
+        qsTr("Set as favorite"),
+        qsTr("Write to NFC token"),
+        qsTr("QR code to NFC"),
+        qsTr("Launch")
+    ]
+
+    signal contextMenuAccepted(int index)
+    signal contextMenuCloseRequested()
 
     // Forward-transition state owned by Main.qml. "" while idle;
     // "systems" or "games" while waiting on a model fill before
@@ -94,6 +113,7 @@ ApplicationWindow {
         : (Browse.RecentsModel.count === 0 ? "empty" : "ready"))
 
     signal cancelCardWriteRequested()
+    signal closeQrCodeRequested()
 
     // Two-way sync between root.activeScreen and ScreenManager.activeScreen.
     // Binding-breaking assignments (tests setting root.activeScreen = "games")
@@ -235,6 +255,23 @@ ApplicationWindow {
                ? qsTr("Writing failed")
                : qsTr("Put a writable card near the reader")
         onCancelRequested: root.cancelCardWriteRequested()
+    }
+
+    ContextMenu {
+        id: contextMenu
+
+        open: root.contextMenuVisible
+        anchorRect: root.contextMenuAnchor
+        entries: root.contextMenuEntries
+        onAccepted: index => root.contextMenuAccepted(index)
+        onCloseRequested: root.contextMenuCloseRequested()
+    }
+
+    QrCodeModal {
+        id: qrCodeModal
+
+        anchors.fill: parent
+        open: root.qrCodeModalVisible
     }
 
     // ── Top-right HUD ─────────────────────────────────────────────────────────
@@ -396,9 +433,8 @@ ApplicationWindow {
         // they run on top of the input gate.
         //
         // Each entry resolves to a button glyph (Dpad / ButtonA /
-        // ButtonB / ButtonX) plus a label. The button names are the
-        // file basenames under resources/images/icons/ — see
-        // Resources.iconUrl() for the qrc rule.
+        // ButtonB / ButtonX) plus a label. The button names are routed
+        // through Resources.iconUrl(), which owns the qrc path rules.
         //
         // Label vocabulary is deliberately minimal: D-pad is always
         // "Move"; A is "Open" for both drill-downs and launches (the
@@ -406,8 +442,15 @@ ApplicationWindow {
         // verb doesn't need to repeat that); B is "Back" except on
         // the Hub root, where it's "Quit". Sentence case throughout.
         readonly property var helpEntries: {
+            if (root.contextMenuVisible)
+                return [
+                    { button: "ButtonA", label: qsTr("Select") },
+                    { button: "ButtonB", label: qsTr("Close") }
+                ];
             if (root.cardWriteModalVisible)
                 return [{ button: "ButtonB", label: qsTr("Cancel") }];
+            if (root.qrCodeModalVisible)
+                return [{ button: "ButtonB", label: qsTr("Close") }];
             if (root.pendingTransition !== "")
                 return [];
             if (root.activeScreen === root.screenHub) {
@@ -435,7 +478,7 @@ ApplicationWindow {
                         row.push({ button: "ButtonL", label: qsTr("Prev page") },
                                  { button: "ButtonR", label: qsTr("Next page") });
                     row.push({ button: "ButtonA", label: qsTr("Open") },
-                             { button: "ButtonX", label: qsTr("Flash card") },
+                             { button: "ButtonX", label: qsTr("Menu") },
                              { button: "ButtonB", label: qsTr("Back") });
                     return row;
                 }
@@ -467,8 +510,7 @@ ApplicationWindow {
             if (root.activeScreen === root.screenSettings) {
                 let row = [];
                 // Up/Down moves between fields; only useful when there
-                // are 2+ fields. Today MiSTer ships one (Resolution),
-                // so this entry is omitted on the current platform.
+                // are 2+ fields.
                 if (root.settingsScreen.fieldCount > 1) {
                     row.push({
                         buttons: ["DpadUp", "DpadDown"],
@@ -476,14 +518,15 @@ ApplicationWindow {
                     });
                 }
                 // Left/Right cycles the focused field's value. Skip
-                // the cue when there are no fields (desktop has no
-                // settings to change today).
+                // the cue when there are no fields.
                 if (root.settingsScreen.fieldCount > 0) {
                     row.push({
                         buttons: ["DpadLeft", "DpadRight"],
                         label: qsTr("Change")
                     });
                 }
+                if (root.settingsScreen.focusedFieldIsMouse)
+                    row.push({ button: "ButtonA", label: qsTr("Toggle") });
                 row.push({ button: "ButtonB", label: qsTr("Back") });
                 return row;
             }
@@ -498,12 +541,8 @@ ApplicationWindow {
                 if (pages > 1)
                     row.push({ button: "ButtonL", label: qsTr("Prev page") },
                              { button: "ButtonR", label: qsTr("Next page") });
-                row.push({ button: "ButtonA", label: qsTr("Open") });
-                // Drop the Flash card cue on directory/root rows —
-                // write_card no-ops there, so advertising the bind
-                // would mislead.
-                if (root.gamesScreen.currentEntryWritable)
-                    row.push({ button: "ButtonX", label: qsTr("Flash card") });
+                row.push({ button: "ButtonA", label: qsTr("Open") },
+                         { button: "ButtonX", label: qsTr("Menu") });
                 row.push({ button: "ButtonB", label: qsTr("Back") });
                 return row;
             }
@@ -563,5 +602,15 @@ ApplicationWindow {
                 }
             }
         }
+    }
+
+    MouseArea {
+        anchors.fill: parent
+        z: 10000
+        visible: !Browse.Settings.current_mouse_enabled
+        enabled: visible
+        hoverEnabled: true
+        acceptedButtons: Qt.AllButtons
+        cursorShape: Qt.BlankCursor
     }
 }

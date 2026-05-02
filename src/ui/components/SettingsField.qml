@@ -22,12 +22,17 @@ Item {
 
     required property string label
     required property string value
+    property string control: "value"
+    property bool checked: false
     property bool isFocused: false
     // True on either edge when the value can advance further. Drives
     // arrow visibility so the user sees a hint that left/right does
     // nothing at the ends of a list.
     property bool canCyclePrev: true
     property bool canCycleNext: true
+
+    signal hovered()
+    signal clicked()
 
     implicitHeight: Sizing.pctH(8)
 
@@ -56,8 +61,9 @@ Item {
 
     // Right-side value cluster: `<`  value  `>`. The arrow glyphs are
     // plain Text — keeping it dependency-free; the gamepad button glyphs
-    // under resources/images/icons/ are reserved for the help bar.
+    // are reserved for the help bar.
     Row {
+        visible: root.control === "value"
         anchors.right: parent.right
         anchors.rightMargin: Sizing.pctW(3)
         anchors.verticalCenter: parent.verticalCenter
@@ -91,5 +97,42 @@ Item {
             font.pixelSize: Sizing.fontSize(3.0)
             renderType: Text.NativeRendering
         }
+    }
+
+    Item {
+        id: toggle
+
+        visible: root.control === "toggle"
+        anchors.right: parent.right
+        anchors.rightMargin: Sizing.pctW(3)
+        anchors.verticalCenter: parent.verticalCenter
+        width: Sizing.pctW(8)
+        height: Sizing.pctH(3.8)
+
+        Rectangle {
+            anchors.fill: parent
+            radius: height / 2
+            color: root.checked ? Theme.accent : Theme.borderMid
+            border.color: root.isFocused ? Theme.textPrimary : Theme.borderSubtle
+            border.width: root.isFocused ? Sizing.pctH(0.25) : 1
+        }
+
+        Rectangle {
+            width: toggle.height - Sizing.pctH(0.9)
+            height: width
+            radius: width / 2
+            x: root.checked ? toggle.width - width - Sizing.pctH(0.45) : Sizing.pctH(0.45)
+            anchors.verticalCenter: parent.verticalCenter
+            color: Theme.textPrimary
+        }
+    }
+
+    MouseArea {
+        anchors.fill: parent
+        hoverEnabled: true
+        acceptedButtons: Qt.LeftButton
+
+        onEntered: root.hovered()
+        onClicked: root.clicked()
     }
 }

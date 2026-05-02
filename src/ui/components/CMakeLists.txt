@@ -10,9 +10,11 @@ qt_add_qml_module(
     VERSION 1.0
     QML_FILES
         ActiveLabel.qml
+        ContextMenu.qml
         LoadingIndicator.qml
         Modal.qml
         PagedGrid.qml
+        QrCodeModal.qml
         ScreenStateOverlay.qml
         SettingsField.qml
         StatusIcon.qml

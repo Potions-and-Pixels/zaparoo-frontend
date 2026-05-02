@@ -48,6 +48,11 @@ Item {
     // whether the model has more data — that is a model concern, kept
     // out of this component so it stays generic.
     signal loadMoreRequested()
+    // Mouse entry points. Screens own persistence and activation side
+    // effects, so the grid only updates its focused index and reports the
+    // row the pointer targeted.
+    signal itemHovered(int index)
+    signal itemClicked(int index)
 
     // Per-instance shape overrides. -1 means "use the global Sizing
     // default" — Systems screen leaves these alone so the systems grid
@@ -88,6 +93,19 @@ Item {
 
     function setCurrentIndexImmediate(idx: int): void {
         root.currentIndex = idx
+    }
+
+    function currentCellRectIn(target: Item): rect {
+        if (root.itemCount <= 0)
+            return Qt.rect(0, 0, 0, 0)
+        const local = root.currentIndex % root.pageSize
+        const row = Math.floor(local / root.columns)
+        const col = local % root.columns
+        const p = root.mapToItem(
+            target,
+            root.sideInset + col * (root.cellWidth + root.cellSpacingX),
+            root.topInset + row * (root.cellHeight + root.cellSpacingY))
+        return Qt.rect(p.x, p.y, root.cellWidth, root.cellHeight)
     }
 
     // Jump the selection by `delta` whole pages. Wraps in both
@@ -291,6 +309,25 @@ Item {
                     isFocused: root.focused
                     name: cellItem.name
                     coverKey: cellItem.coverKey
+                }
+
+                MouseArea {
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    acceptedButtons: Qt.LeftButton
+                    enabled: cellItem.visible
+
+                    onEntered: {
+                        if (root.currentIndex !== cellItem.index)
+                            root.currentIndex = cellItem.index
+                        root.itemHovered(cellItem.index)
+                    }
+
+                    onClicked: {
+                        if (root.currentIndex !== cellItem.index)
+                            root.currentIndex = cellItem.index
+                        root.itemClicked(cellItem.index)
+                    }
                 }
             }
         }
