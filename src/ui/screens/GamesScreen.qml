@@ -178,7 +178,7 @@ Item {
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.top: parent.top
-        anchors.topMargin: Sizing.pctH(9)
+        anchors.topMargin: Sizing.pctH(11)
         height: Sizing.pctH(7)
         title: {
             const sid = Browse.GamesModel.current_system_id
@@ -206,17 +206,21 @@ Item {
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.top: topStrip.bottom
-        anchors.topMargin: Sizing.pctH(2)
         anchors.bottom: parent.bottom
         anchors.bottomMargin: Sizing.pctH(15)
         model: Browse.GamesModel
-        delegate: Tile {}
+        delegate: Tile { showCaption: true }
         // Cover-art tiles run taller than systems logos, so a 5x3
         // layout starves vertical space. Games gets its own
         // gamesGridColumns/Rows in Sizing — 5x2 on desktop, narrower
         // branches at low resolutions match the systems grid logic.
         columnsOverride: Sizing.gamesGridColumns
         rowsOverride: Sizing.gamesGridRows
+        // Stable scroll-thumb sizing while `fetch_more` grows the loaded
+        // slice: feed PagedGrid the dataset's true total entry count
+        // (same expression the top strip uses for `totalPages`).
+        totalItemsOverride: Browse.GamesModel.dir_count
+                            + Browse.GamesModel.total_files
         onLoadMoreRequested: Browse.GamesModel.fetch_more()
         onItemHovered: (index) => games._focusIndex(index)
         onItemClicked: (index) => {
@@ -234,23 +238,10 @@ Item {
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.top: gamesGrid.bottom
-        anchors.topMargin: Sizing.pctH(1)
         height: Sizing.pctH(7)
         text: gamesGrid.itemCount > 0
               ? Browse.GamesModel.name_at(gamesGrid.currentIndex)
               : ""
-    }
-
-    // "Loading more…" cue, parked on the left edge of the active-label
-    // band so the focused-entry name and the pagination cue read as a
-    // single bottom strip. Hidden until a fetch is in flight.
-    LoadingIndicator {
-        anchors.left: parent.left
-        anchors.leftMargin: Sizing.pctW(5)
-        anchors.verticalCenter: activeLabel.verticalCenter
-        visible: Browse.GamesModel.loading_more
-        z: 1
-        text: qsTr("Loading more…")
     }
 
     ScreenStateOverlay {
@@ -261,5 +252,6 @@ Item {
         errorMessage: Browse.GamesModel.error_message ?? ""
         count: Browse.GamesModel.count
         emptyText: qsTr("No games in this system")
+        loadingText: qsTr("Loading games…")
     }
 }

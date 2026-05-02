@@ -57,6 +57,24 @@ Item {
     signal requestRecentsScreen()
     signal requestSettingsScreen()
 
+    // Vertically center the (categories row + actions row + activeLabel)
+    // block in the band between the logo bottom (pctH(9)) and the help
+    // bar top (hub.height - pctH(6)). `_blockHeight` mirrors the
+    // anchor chain below: each row is `cellHeight + 2*verticalPadding`,
+    // the gap between them collapses the focus-bleed padding (see
+    // `actionsRow.anchors.topMargin`), and the label sits pctH(3) below
+    // the actions row at pctH(7) tall.
+    readonly property int _blockHeight:
+        2 * (categoriesRow.cellHeight + 2 * categoriesRow.verticalPadding)
+        + (categoriesRow.spacing
+           - categoriesRow.verticalPadding
+           - actionsRow.verticalPadding)
+        + Sizing.pctH(3)
+        + Sizing.pctH(7)
+    readonly property int _blockY:
+        Math.round((Sizing.pctH(9) + hub.height - Sizing.pctH(6)
+                    - hub._blockHeight) / 2)
+
     // Static action-row data. Three fixed entries; order matches
     // left-to-right reading. The `qsTr()` calls live directly in this
     // binding so a `LanguageChange` event re-evaluates `actionEntries`
@@ -274,9 +292,10 @@ Item {
                 ? Math.floor((width - 2 * sideInset - (n - 1) * spacing) / n)
                 : 0
         readonly property int cellWidth: Math.min(maxCellWidth, rawCellWidth)
-        // Square cell with a hair of breathing room top and bottom
-        // for the focused tile's 1.06× scale bleed.
-        readonly property int cellHeight: Sizing.pctH(22) + Sizing.pctH(2)
+        // Square cells (1:1) for the main menu. The focused tile's
+        // 1.06× scale bleed is absorbed by `verticalPadding` on the
+        // row Item, not by inflating the cell.
+        readonly property int cellHeight: cellWidth
         readonly property int totalRowWidth:
             n > 0 ? n * cellWidth + (n - 1) * spacing : 0
         readonly property int rowOriginX: (width - totalRowWidth) / 2
@@ -288,9 +307,10 @@ Item {
         anchors.horizontalCenter: parent.horizontalCenter
         width: parent.width
         height: cellHeight + 2 * verticalPadding
-        // Sits high enough that the second row + activeLabel stay
-        // clear of the help bar at the bottom.
-        y: Sizing.pctH(14)
+        // Vertically centered with actionsRow + activeLabel as one
+        // block in the band between the logo and the help bar. See
+        // `_blockHeight` / `_blockY` on the hub root for the math.
+        y: hub._blockY
 
         // Hide the tiles while the router holds us here on a forward
         // transition so the centred "Loading…" cue (painted from
