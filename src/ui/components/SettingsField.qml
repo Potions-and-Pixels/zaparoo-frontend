@@ -30,9 +30,23 @@ Item {
     // nothing at the ends of a list.
     property bool canCyclePrev: true
     property bool canCycleNext: true
+    // For `control: "action"` — short live-state string painted on the
+    // right ("In progress", "Paused", or "" when idle). The screen
+    // owns the binding; the field treats it as a plain caption.
+    property string actionStatus: ""
 
     signal hovered()
     signal clicked()
+    // Emitted when the action-control row receives an accept press.
+    // The screen wires this to the matching invokable (start/cancel
+    // index, start/cancel scrape) and gates by `actionStatus`.
+    signal accepted()
+
+    // Item.enabled (built-in) gates the MouseArea below; the dimmed
+    // opacity here gives a matching visual cue. Setting `enabled: false`
+    // on the row makes Accept a no-op (the index/scrape pair use this
+    // when one of the two is in flight — Core serialises them).
+    opacity: enabled ? 1.0 : 0.4
 
     implicitHeight: Sizing.pctH(8)
 
@@ -127,12 +141,38 @@ Item {
         }
     }
 
+    // Right-side caption for `control: "action"`. No `< >` arrows, no
+    // toggle pill — just a single muted-when-idle string showing the
+    // current operation state. Empty `actionStatus` collapses to no
+    // text, matching the visual quietness of an idle row.
+    Text {
+        visible: root.control === "action"
+        anchors.right: parent.right
+        anchors.rightMargin: Sizing.pctW(3)
+        anchors.verticalCenter: parent.verticalCenter
+        text: root.actionStatus
+        color: Theme.textPrimary
+        font.family: Theme.fontUi
+        font.pixelSize: Sizing.fontSize(2.4)
+        renderType: Text.NativeRendering
+    }
+
     MouseArea {
         anchors.fill: parent
         hoverEnabled: true
         acceptedButtons: Qt.LeftButton
 
         onEntered: root.hovered()
-        onClicked: root.clicked()
+        // Action rows fire `accepted()` (the screen runs start/cancel
+        // there); every other control fires `clicked()` (the screen
+        // moves focus and toggles a value). Emitting both for action
+        // rows used to make `onClicked` and `onAccepted` race over
+        // the same press.
+        onClicked: {
+            if (root.control === "action")
+                root.accepted();
+            else
+                root.clicked();
+        }
     }
 }
