@@ -207,14 +207,6 @@ MainLayout {
         Browse.AppState.active_screen = screen
     }
 
-    // True when Hub drilled straight into Games via the MiSTer
-    // Arcade-bypass shortcut, so cancel-from-Games returns directly
-    // to Hub rather than the Systems screen the user never saw. Set
-    // by `_navigateFromHub` on the Arcade branch, cleared by
-    // `_navigateFromSystems` (normal drill-down) and by the games'
-    // onRequestSystemsScreen handler after routing.
-    property bool _gamesEnteredFromHub: false
-
     // Single-shot callback slots fired by the loadingChanged
     // listeners below. Only one transition is in flight at a time
     // (input gate guarantees this), so two scalars are enough.
@@ -346,7 +338,6 @@ MainLayout {
                 Browse.GamesState.system_id = systemId
                 root.pendingTransition = "games"
                 root._ensureSystem(systemId, function() {
-                    root._gamesEnteredFromHub = true
                     root._completeTransition(root.screenGames)
                 })
             } else {
@@ -384,8 +375,10 @@ MainLayout {
     }
 
     // Systems Accept routing. Pin destination to Games, fill the
-    // chosen system, then flip. Sets _gamesEnteredFromHub=false so
-    // the back path lands on Systems (the normal drill).
+    // chosen system, then flip. The Games→back routing decision is
+    // re-evaluated live from current state at B-press time (see
+    // gamesScreen.onRequestSystemsScreen below) so this path needs
+    // no per-transition flag.
     function _navigateFromSystems(systemId: string): void {
         Browse.SystemsState.system_id = systemId
         // Setting system_id on GamesState resets path_stack/selected_at_level
@@ -395,7 +388,6 @@ MainLayout {
         Browse.GamesState.system_id = systemId
         root.pendingTransition = "games"
         root._ensureSystem(systemId, function() {
-            root._gamesEnteredFromHub = false
             root._completeTransition(root.screenGames)
         })
     }
@@ -484,13 +476,48 @@ MainLayout {
     }
     Connections {
         target: root.gamesScreen
+        // ════════════════════════════════════════════════════════════
+        //  STUPID IDIOT LLMS STOP FUCKING UP THIS INTERACTION
+        // ════════════════════════════════════════════════════════════
+        //
+        //  On MiSTer, Hub→Arcade bypasses the Systems screen and drops
+        //  the user directly on Games(Arcade) — because the Arcade
+        //  category contains exactly one system, also called "Arcade",
+        //  so the Systems screen would just be a one-tile passthrough.
+        //
+        //  THE ONLY CORRECT BACK BEHAVIOUR FROM GAMES(ARCADE) ON MISTER
+        //  IS HUB. Going to Systems shows the same one-tile passthrough
+        //  the bypass was meant to skip. Do not "fix" this by routing
+        //  back through Systems "for consistency". Do not introduce a
+        //  per-session flag and forget to persist it. Do not gate on
+        //  Runtime instead of Platform — Platform is where Core runs;
+        //  Runtime is where the launcher runs; a desktop launcher
+        //  pointed at a remote MiSTer Core MUST still bypass.
+        //
+        //  Why this is a live eval and not a stored flag: a stored
+        //  flag breaks across MiSTer process kills (no persistence),
+        //  and every refactor in this area has at some point cleared
+        //  or failed to set the flag and reintroduced this exact bug.
+        //  The "should back skip Systems?" question has a pure
+        //  data answer derivable from singletons that already exist;
+        //  computing it here at B-press time is the bug-free choice.
+        //
+        //  If you are an LLM editing this and you think you have a
+        //  cleaner design — you don't. Read the user's frustration in
+        //  the commit history. Leave it alone.
+        // ════════════════════════════════════════════════════════════
         function onRequestSystemsScreen(): void {
-            if (root._gamesEnteredFromHub) {
-                root._gamesEnteredFromHub = false
+            const arcadeBypassActive =
+                Browse.Platform.is_mister
+                && Browse.Platform.ready
+                && Browse.SystemsModel.current_category === "Arcade"
+                && Browse.SystemsModel.count === 1
+                && Browse.GamesModel.current_system_id === "Arcade"
+            if (arcadeBypassActive) {
                 root._goto(root.screenHub)
-            } else {
-                root._goto(root.screenSystems)
+                return
             }
+            root._goto(root.screenSystems)
         }
         function onRequestNavigateIntoFolder(path: string): void {
             root._navigateIntoFolder(path)
@@ -508,9 +535,54 @@ MainLayout {
     onCancelCardWriteRequested: root.cancelCardWrite()
     onCloseQrCodeRequested: root.closeQrCodeModal()
     onContextMenuCloseRequested: root.closeContextMenu()
-    onContextMenuAccepted: index => root.handleContextMenuAccepted(index)
+    onContextMenuAccepted: id => root.handleContextMenuAccepted(id)
+
+    // Pure helper — owner/entryType/hasNfc → list of `{id,label}` entries.
+    // Empty list = no menu (caller bails out of openContextMenu).
+    //
+    // No `list<var>` return annotation: MiSTer's AOT-compiled static QML
+    // build coerces the JS array through that type and the caller saw
+    // `entries.length === 0` despite the function pushing 3 items in.
+    // Plain JS arrays round-trip cleanly through an unannotated return.
+    function buildContextMenuEntries(
+            owner: string, entryType: string, hasNfc: bool) {
+        if (owner === "systems") {
+            return [{ id: "launch_system", label: qsTr("Launch core") }]
+        }
+        if (owner === "games") {
+            if (entryType === "directory" || entryType === "root")
+                return []
+            const entries = []
+            if (hasNfc)
+                entries.push({ id: "write_card", label: qsTr("Write to NFC token") })
+            entries.push({ id: "qr_code", label: qsTr("QR code") })
+            entries.push({ id: "launch_game", label: qsTr("Launch game") })
+            return entries
+        }
+        return []
+    }
+
+    // Pure helper — wrap a zapscript in the zaparoo.app deep-link template.
+    // The QR code points the scanning device at this URL; the web app
+    // hands the scanned zapscript back to a Core/launcher pairing.
+    function _buildQrPayload(zapscript: string): string {
+        return "https://zaparoo.app/write?v=" + encodeURIComponent(zapscript)
+    }
 
     function openContextMenu(owner: string, index: int, anchorRect): void {
+        if (index < 0)
+            return
+        let entryType = ""
+        if (owner === "games") {
+            if (index >= Browse.GamesModel.count)
+                return
+            entryType = Browse.GamesModel.entry_type_at(index)
+        }
+        const entries = root.buildContextMenuEntries(
+            owner, entryType, Browse.SystemStatus.has_nfc)
+        if (entries.length === 0)
+            return
+        root.contextMenuEntries = entries
         root.contextMenuOwner = owner
         root.contextMenuIndex = index
         root.contextMenuAnchor = anchorRect
@@ -523,30 +595,23 @@ MainLayout {
         root.contextMenuVisible = false
         root.contextMenuOwner = ""
         root.contextMenuIndex = -1
+        root.contextMenuEntries = []
         if (ScreenManager.topModal === root.modalContextMenu)
             ScreenManager.popModal()
     }
 
-    function handleContextMenuAccepted(index: int): void {
+    function handleContextMenuAccepted(id: string): void {
         const owner = root.contextMenuOwner
         const targetIndex = root.contextMenuIndex
         root.closeContextMenu()
         if (targetIndex < 0)
             return
 
-        if (index === 0) {
-            return
-        } else if (index === 2) {
-            const text = owner === "systems"
-                ? Browse.SystemsModel.launch_text_at(targetIndex)
-                : owner === "games"
-                    ? Browse.GamesModel.launch_text_at(targetIndex)
-                    : ""
-            if (text !== "") {
-                Browse.QrCode.generate(text)
-                root.openQrCodeModal()
-            }
-        } else if (index === 1) {
+        if (id === "launch_system") {
+            Browse.SystemsModel.launch_at(targetIndex)
+        } else if (id === "launch_game") {
+            Browse.GamesModel.launch_at(targetIndex)
+        } else if (id === "write_card") {
             if (owner === "systems") {
                 root.beginCardWrite("systems")
                 Browse.SystemsModel.write_card_at(targetIndex)
@@ -554,11 +619,16 @@ MainLayout {
                 root.beginCardWrite("games")
                 Browse.GamesModel.write_card_at(targetIndex)
             }
-        } else if (index === 3) {
-            if (owner === "systems")
-                Browse.SystemsModel.launch_at(targetIndex)
-            else if (owner === "games")
-                Browse.GamesModel.launch_at(targetIndex)
+        } else if (id === "qr_code") {
+            const text = owner === "systems"
+                ? Browse.SystemsModel.launch_text_at(targetIndex)
+                : owner === "games"
+                    ? Browse.GamesModel.launch_text_at(targetIndex)
+                    : ""
+            if (text !== "") {
+                Browse.QrCode.generate(root._buildQrPayload(text))
+                root.openQrCodeModal()
+            }
         }
     }
 
@@ -575,20 +645,25 @@ MainLayout {
     }
 
     // First-run modal lifecycle. Push exactly once per session, the
-    // moment we see an authoritative MediaStatus snapshot (`seeded ===
-    // true`) reporting an empty mediadb (`exists === false`) on a
-    // ready Core link. The `seeded` gate is critical: the singleton's
-    // initial Default state has `exists: false`, so without it we'd
-    // fire the modal on cold launch before the watch channel has
-    // received a single notification.
+    // moment the catalog resolves Ready and reports zero systems
+    // (`CategoriesModel.loaded === true && count === 0`). 0 visible
+    // categories implies a 0-system response from `media.systems` — a
+    // mediadb that's missing or never indexed — and the launcher has
+    // no UI to render past the hub. The `loaded` gate is critical:
+    // the singleton's Default state has `count: 0` before the catalog
+    // fetch lands, so without it we'd fire the modal on cold launch
+    // before Core has answered. Gating on the catalog instead of
+    // MediaStatus.exists/seeded avoids the case where Core reports
+    // `database.exists: true` for an empty file — there the catalog
+    // is the authoritative "are there games to show?" signal.
     function _maybeOpenFirstRunIndex(): void {
         if (root._firstRunIndexShown)
             return
         if (Browse.AppStatus.connection_state !== 2 /* READY */)
             return
-        if (!Browse.MediaStatus.seeded)
+        if (!Browse.CategoriesModel.loaded)
             return
-        if (Browse.MediaStatus.exists)
+        if (Browse.CategoriesModel.count > 0)
             return
         root._firstRunIndexShown = true
         root.firstRunIndexModalVisible = true
@@ -622,11 +697,11 @@ MainLayout {
     }
 
     Connections {
-        target: Browse.MediaStatus
-        function onSeededChanged(): void {
+        target: Browse.CategoriesModel
+        function onLoadedChanged(): void {
             root._maybeOpenFirstRunIndex()
         }
-        function onExistsChanged(): void {
+        function onCountChanged(): void {
             root._maybeOpenFirstRunIndex()
         }
     }
@@ -728,13 +803,67 @@ MainLayout {
         }
     }
 
-    // Thin boundary shim kept for back-compat with tst_navigation.qml.
-    // Delegates to handleAction so the state machine has a single entry
-    // point regardless of input source.
-    function handleKey(key): void {
+    // Hold-to-repeat for dpad directions. Qt's OS-level auto-repeat is
+    // dropped (see Keys.onPressed below) because it bursts unpredictably
+    // on heavy UI loads and isn't tunable on MiSTer's framebuffer build.
+    // Instead, on a real press of one of the four dpad actions we start
+    // an initial-delay timer; on its first fire we hand over to a steady
+    // tick. Both fire `handleAction(heldAction)`, which means the existing
+    // transition gate, modal routing, and screen dispatch all apply
+    // unchanged — repeats land on whichever screen / modal is currently
+    // active, just like fresh presses.
+    readonly property int _repeatInitialMs: 350
+    readonly property int _repeatTickMs: 90
+    property string _heldAction: ""
+    property int _heldKey: 0
+    // Aliased so tst_navigation.qml can observe the repeat state machine
+    // — child Timer ids are file-scoped and aren't reachable otherwise.
+    property alias _repeatPending: repeatInitial.running
+    property alias _repeatTicking: repeatTick.running
+
+    function _stopRepeat(): void {
+        repeatInitial.stop()
+        repeatTick.stop()
+        root._heldAction = ""
+        root._heldKey = 0
+    }
+
+    function _isRepeatableAction(action: string): bool {
+        return action === "up" || action === "down"
+            || action === "left" || action === "right"
+    }
+
+    // State-machine half of handleKey: records the held key/action and
+    // arms the initial-delay timer. Pulled out of handleKey so unit
+    // tests can drive the repeat state machine without also routing
+    // through handleAction → real screens. No-op for non-dpad actions.
+    function _armRepeat(action: string, key: int): void {
+        if (!root._isRepeatableAction(action))
+            return
+        root._heldAction = action
+        root._heldKey = key
+        repeatTick.stop()
+        repeatInitial.restart()
+    }
+
+    // Press handler. Single entry point for both Keys.onPressed and the
+    // existing tst_navigation.qml harness (which can't drive Keys events
+    // on offscreen windows reliably). Fires the action immediately, then
+    // arms the dpad-repeat state machine.
+    function handleKey(key: int): void {
         const action = Browse.Input.action_for_key(key)
-        if (action !== "")
-            root.handleAction(action)
+        if (action === "")
+            return
+        root.handleAction(action)
+        root._armRepeat(action, key)
+    }
+
+    // Release handler. Only the key that started the repeat cancels it;
+    // a release of any other key in flight (a chord, an unrelated press
+    // mid-hold) is ignored.
+    function handleKeyRelease(key: int): void {
+        if (root._heldAction !== "" && key === root._heldKey)
+            root._stopRepeat()
     }
 
     Timer {
@@ -744,17 +873,57 @@ MainLayout {
         onTriggered: root.hideCardWriteModal()
     }
 
+    Timer {
+        id: repeatInitial
+        interval: root._repeatInitialMs
+        repeat: false
+        onTriggered: {
+            if (root._heldAction === "")
+                return
+            root.handleAction(root._heldAction)
+            repeatTick.start()
+        }
+    }
+
+    Timer {
+        id: repeatTick
+        interval: root._repeatTickMs
+        repeat: true
+        onTriggered: {
+            if (root._heldAction === "") {
+                repeatTick.stop()
+                return
+            }
+            root.handleAction(root._heldAction)
+        }
+    }
+
+    // Cancel a stuck repeat if the window loses focus mid-hold; without
+    // this, a missed Keys.onReleased (alt-tab, modal grab, compositor
+    // quirk) would leave the timer ticking forever. `root.active` is
+    // ApplicationWindow's own active property.
+    onActiveChanged: {
+        if (!root.active)
+            root._stopRepeat()
+    }
+
     Item {
         focus: true
         // Drop auto-repeated key events. A held Escape — or a brief
         // stuck press while the main thread is blocked on a model
         // reset — would otherwise queue a burst of `cancel` actions
         // that walk back through games → systems → hub → quit on
-        // a single press. Real intent only.
+        // a single press. Our own controlled repeat (above) takes
+        // over for dpad directions only.
         Keys.onPressed: event => {
             if (event.isAutoRepeat)
                 return
             root.handleKey(event.key)
+        }
+        Keys.onReleased: event => {
+            if (event.isAutoRepeat)
+                return
+            root.handleKeyRelease(event.key)
         }
     }
 

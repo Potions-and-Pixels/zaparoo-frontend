@@ -158,10 +158,14 @@ Item {
         } else if (action === "write_card") {
             if (games.gamesGrid.itemCount > 0) {
                 const idx = games.gamesGrid.currentIndex
+                // Folders/roots have no menu — open=Accept, X is a no-op.
+                const entryType = Browse.GamesModel.entry_type_at(idx)
+                if (entryType === "directory" || entryType === "root")
+                    return
                 Browse.GamesState.set_selected_at_top(
                     Browse.GamesModel.path_at(idx))
-                games.requestContextMenu(
-                    idx, games.gamesGrid.currentCellRectIn(games))
+                const rect = games.gamesGrid.currentCellRectIn(games)
+                games.requestContextMenu(idx, rect)
             }
         } else if (action === "cancel") {
             if (games._atFolderLevel())
