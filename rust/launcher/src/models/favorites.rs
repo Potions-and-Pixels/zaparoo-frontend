@@ -2,25 +2,24 @@
 // Copyright (c) 2026 Wizzo Pty Ltd and the Zaparoo Project contributors.
 // SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0
 //
-// `Browse.RecentsModel` — flat list of recently-played media, surfaced
-// from Core's `media.history` endpoint.
+// `Browse.FavoritesModel` — flat list of favorite media, surfaced
+// from Core's `media.search` endpoint.
 //
 // Two paths into the model:
 //
-//   * `bind_to_endpoint!` seeds page 1 from `MediaHistoryEndpoint` so
-//     a screen flip into Recents has data on the first paint when the
-//     resource is already `Ready`. The fixed args (`limit = 25`, no
-//     `systems` filter) match what the UI requests; if a future filter
-//     is added, switch to a per-arg pattern like `GamesModel`.
+//   * `bind_to_endpoint!` seeds page 1 from `MediaFavoritesEndpoint` so
+//     a screen flip into Favorites has data on the first paint when the
+//     resource is already `Ready`. The fixed args (`maxResults = 25`)
+//     match what the UI requests.
 //
 //   * `fetch_more()` — cursor-driven follow-ups bypass the cache and
-//     call `Client::media_history` directly, just like games. The
+//     call `Client::media_search` directly, just like games. The
 //     model owns the cursor, the in-flight `loading_more` debounce,
 //     and the seq ticket that disarms stale callbacks.
 //
-// History is flat (no folder navigation, no auto-nav) so this model
+// Search is flat (no folder navigation, no auto-nav) so this model
 // stays a fraction of the size of `GamesModel`. Card-write isn't wired
-// here yet — recents launches by `run`-ing the entry's launcher route.
+// here yet — favorites launches by `run`-ing the entry's ZapScript.
 
 use crate::media_image_cache::{global_media_image_cache, MediaImageCache, MediaKey};
 use crate::models::{global_runtime, global_store};
@@ -37,10 +36,13 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 use zaparoo_core::client::ClientError;
-use zaparoo_core::endpoints::media_history::{HistoryArgs, MediaHistoryEndpoint};
+use zaparoo_core::endpoints::media_favorites::{FavoritesArgs, MediaFavoritesEndpoint};
+use zaparoo_core::endpoints::media_tags_update::MediaTagsUpdateMutation;
+use zaparoo_core::endpoints::readers_write::ReadersWriteMutation;
 use zaparoo_core::endpoints::run::RunMutation;
 use zaparoo_core::media_types::{
-    MediaHistoryEntry, MediaHistoryParams, MediaHistoryResult, RunParams,
+    MediaItem, MediaSearchParams, MediaSearchResult, MediaTagsUpdateParams, ReadersWriteParams,
+    RunParams, TagInfo,
 };
 use zaparoo_core::remote_resource::ResourceStatus;
 
@@ -48,25 +50,34 @@ const NAME_ROLE: i32 = 256 + 1;
 const PATH_ROLE: i32 = 256 + 2;
 const SYSTEM_ID_ROLE: i32 = 256 + 3;
 const COVER_KEY_ROLE: i32 = 256 + 4;
-const LAUNCHER_ID_ROLE: i32 = 256 + 5;
+const ZAP_SCRIPT_ROLE: i32 = 256 + 5;
 const FAVORITE_ROLE: i32 = 256 + 6;
 
 // Page size for the initial load and every cursor follow-up. Core caps
-// `limit` at 100; history rows are tiny (one tile + one caption per row)
-// so 25 fills several screens of the recents grid without stressing the
-// over-the-wire payload. Bumping this only saves a round trip — it
-// doesn't change the UI cap.
+// `maxResults` at 100; search rows are tiny (one tile + one caption per
+// row) so 25 fills several screens of the favorites grid without
+// stressing the over-the-wire payload.
 const PAGE_SIZE: u32 = 25;
 
 #[derive(Default)]
-pub struct RecentsModelRust {
-    entries: Vec<MediaHistoryEntry>,
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "the bools are independent qproperties surfaced to QML; collapsing them \
+              into an enum would force the QML side to read a single state property \
+              and re-derive each flag locally, which is exactly the work the bridge \
+              avoids"
+)]
+pub struct FavoritesModelRust {
+    entries: Vec<MediaItem>,
     count: i32,
     loading: bool,
     loading_more: bool,
     error_message: QString,
     has_next_page: bool,
     next_cursor: Option<String>,
+    card_write_pending: bool,
+    card_write_error: QString,
+    card_write_seq: Arc<AtomicU64>,
     // Bumped whenever the cursor chain is reset by an initial
     // `apply_state` so any in-flight `fetch_more` callback can detect
     // its append no longer belongs to the current chain.
@@ -120,35 +131,52 @@ pub mod ffi {
         #[qproperty(bool, loading_more)]
         #[qproperty(QString, error_message)]
         #[qproperty(bool, has_next_page)]
-        type RecentsModel = super::RecentsModelRust;
+        #[qproperty(bool, card_write_pending)]
+        #[qproperty(QString, card_write_error)]
+        type FavoritesModel = super::FavoritesModelRust;
 
         #[qinvokable]
-        fn fetch_more(self: Pin<&mut RecentsModel>);
+        fn fetch_more(self: Pin<&mut FavoritesModel>);
 
         #[qinvokable]
-        fn launch_at(self: Pin<&mut RecentsModel>, index: i32);
+        fn launch_at(self: Pin<&mut FavoritesModel>, index: i32);
 
         #[qinvokable]
-        fn name_at(self: &RecentsModel, index: i32) -> QString;
+        fn launch_text_at(self: &FavoritesModel, index: i32) -> QString;
 
         #[qinvokable]
-        fn path_at(self: &RecentsModel, index: i32) -> QString;
+        fn write_card_at(self: Pin<&mut FavoritesModel>, index: i32);
 
         #[qinvokable]
-        fn index_for_path(self: &RecentsModel, path: &QString) -> i32;
+        fn toggle_favorite_at(self: Pin<&mut FavoritesModel>, index: i32);
+
+        #[qinvokable]
+        fn is_favorite_at(self: &FavoritesModel, index: i32) -> bool;
+
+        #[qinvokable]
+        fn cancel_card_write(self: Pin<&mut FavoritesModel>);
+
+        #[qinvokable]
+        fn name_at(self: &FavoritesModel, index: i32) -> QString;
+
+        #[qinvokable]
+        fn path_at(self: &FavoritesModel, index: i32) -> QString;
+
+        #[qinvokable]
+        fn index_for_path(self: &FavoritesModel, path: &QString) -> i32;
 
         #[inherit]
         #[cxx_name = "beginResetModel"]
-        fn begin_reset_model(self: Pin<&mut RecentsModel>);
+        fn begin_reset_model(self: Pin<&mut FavoritesModel>);
 
         #[inherit]
         #[cxx_name = "endResetModel"]
-        fn end_reset_model(self: Pin<&mut RecentsModel>);
+        fn end_reset_model(self: Pin<&mut FavoritesModel>);
 
         #[inherit]
         #[cxx_name = "beginInsertRows"]
         fn begin_insert_rows(
-            self: Pin<&mut RecentsModel>,
+            self: Pin<&mut FavoritesModel>,
             parent: &QModelIndex,
             first: i32,
             last: i32,
@@ -156,7 +184,7 @@ pub mod ffi {
 
         #[inherit]
         #[cxx_name = "endInsertRows"]
-        fn end_insert_rows(self: Pin<&mut RecentsModel>);
+        fn end_insert_rows(self: Pin<&mut FavoritesModel>);
 
         // Qt signal bound as a callable so the cover-cache bridge can
         // invoke it directly from the Qt thread when an async cover
@@ -164,33 +192,34 @@ pub mod ffi {
         #[inherit]
         #[cxx_name = "dataChanged"]
         fn data_changed(
-            self: Pin<&mut RecentsModel>,
+            self: Pin<&mut FavoritesModel>,
             top_left: &QModelIndex,
             bottom_right: &QModelIndex,
             roles: &QList_i32,
         );
 
         #[cxx_name = "rowCount"]
-        fn row_count(self: &RecentsModel, parent: &QModelIndex) -> i32;
-        fn data(self: &RecentsModel, index: &QModelIndex, role: i32) -> QVariant;
+        fn row_count(self: &FavoritesModel, parent: &QModelIndex) -> i32;
+        fn data(self: &FavoritesModel, index: &QModelIndex, role: i32) -> QVariant;
         #[cxx_name = "roleNames"]
-        fn role_names(self: &RecentsModel) -> QHash_i32_QByteArray;
+        fn role_names(self: &FavoritesModel) -> QHash_i32_QByteArray;
 
         // Materialise a `QModelIndex` for `(row, column)` so the cover-
         // cache bridge can target individual rows in `dataChanged`.
         // Forwarded to the QAbstractListModel implementation.
         #[inherit]
-        fn index(self: &RecentsModel, row: i32, column: i32, parent: &QModelIndex) -> QModelIndex;
+        fn index(self: &FavoritesModel, row: i32, column: i32, parent: &QModelIndex)
+            -> QModelIndex;
     }
 
-    impl cxx_qt::Threading for RecentsModel {}
-    impl cxx_qt::Initialize for RecentsModel {}
+    impl cxx_qt::Threading for FavoritesModel {}
+    impl cxx_qt::Initialize for FavoritesModel {}
 }
 
 crate::bind_to_endpoint! {
-    for ffi::RecentsModel,
-    endpoint = MediaHistoryEndpoint,
-    args = HistoryArgs::new(Vec::new(), PAGE_SIZE),
+    for ffi::FavoritesModel,
+    endpoint = MediaFavoritesEndpoint,
+    args = FavoritesArgs::new(PAGE_SIZE),
     select = project,
     apply = apply_state,
 }
@@ -198,16 +227,16 @@ crate::bind_to_endpoint! {
 /// Snapshot of a single page that `apply_state` can write onto the
 /// model. Carried by value so the closure is `Send + 'static` for the
 /// `qt_thread` queue.
-type PageSnapshot = (Vec<MediaHistoryEntry>, bool, Option<String>);
+type PageSnapshot = (Vec<MediaItem>, bool, Option<String>);
 
 /// Project the resource status onto an `(Option<PageSnapshot>, error)`
 /// tuple. `Idle`/`Loading` map to the same `(None, "")` shape so the
 /// apply path can decide on its own whether to show the spinner.
-fn project(status: &ResourceStatus<MediaHistoryResult>) -> (Option<PageSnapshot>, String) {
+fn project(status: &ResourceStatus<MediaSearchResult>) -> (Option<PageSnapshot>, String) {
     match status {
         ResourceStatus::Ready(data) => (
             Some((
-                data.entries.clone(),
+                data.results.clone(),
                 data.has_next_page(),
                 data.next_cursor(),
             )),
@@ -219,7 +248,7 @@ fn project(status: &ResourceStatus<MediaHistoryResult>) -> (Option<PageSnapshot>
 }
 
 fn apply_state(
-    mut model: Pin<&mut ffi::RecentsModel>,
+    mut model: Pin<&mut ffi::FavoritesModel>,
     (data, err): (Option<PageSnapshot>, String),
 ) {
     if let Some((entries, has_next_page, next_cursor)) = data {
@@ -227,7 +256,7 @@ fn apply_state(
         // any in-flight `fetch_more` sees a stale ticket and bails.
         model.as_mut().rust_mut().seq.fetch_add(1, Ordering::SeqCst);
         model.as_mut().ensure_cover_subscription();
-        enqueue_recents_covers(&entries);
+        enqueue_favorites_covers(&entries);
         let count = i32::try_from(entries.len()).unwrap_or(i32::MAX);
         model.as_mut().begin_reset_model();
         model.as_mut().rust_mut().entries = entries;
@@ -254,7 +283,7 @@ fn apply_state(
             model.as_mut().fetch_more();
         }
     } else if err.is_empty() {
-        // Pending (Idle/Loading): show the spinner; don't touch entries.
+        // Pending (Idle/Loading): show the spinner; don't touch results.
         // Disarm pagination so a grid scroll during a refetch doesn't
         // fire `fetch_more` against a stale cursor — `has_next_page`
         // is re-set when Ready lands. Bump `seq` and null `next_cursor`
@@ -292,7 +321,7 @@ fn apply_state(
     }
 }
 
-impl ffi::RecentsModel {
+impl ffi::FavoritesModel {
     fn row_count(&self, parent: &QModelIndex) -> i32 {
         if parent.is_valid() {
             0
@@ -307,12 +336,12 @@ impl ffi::RecentsModel {
         }
         let entry = &self.entries[index.row() as usize];
         match role {
-            NAME_ROLE => QVariant::from(&QString::from(entry.media_name.as_str())),
-            PATH_ROLE => QVariant::from(&QString::from(entry.media_path.as_str())),
-            SYSTEM_ID_ROLE => QVariant::from(&QString::from(entry.system_id.as_str())),
+            NAME_ROLE => QVariant::from(&QString::from(entry.name.as_str())),
+            PATH_ROLE => QVariant::from(&QString::from(entry.path.as_str())),
+            SYSTEM_ID_ROLE => QVariant::from(&QString::from(entry.system.id.as_str())),
             COVER_KEY_ROLE => QVariant::from(&QString::from(cover_key_for(entry).as_str())),
-            LAUNCHER_ID_ROLE => QVariant::from(&QString::from(entry.launcher_id.as_str())),
-            FAVORITE_ROLE => QVariant::from(&0_i32),
+            ZAP_SCRIPT_ROLE => QVariant::from(&QString::from(entry.zap_script.as_str())),
+            FAVORITE_ROLE => QVariant::from(&favorite_role_value(&entry.tags)),
             _ => QVariant::default(),
         }
     }
@@ -323,7 +352,7 @@ impl ffi::RecentsModel {
         h.insert(PATH_ROLE, QByteArray::from("path"));
         h.insert(SYSTEM_ID_ROLE, QByteArray::from("systemId"));
         h.insert(COVER_KEY_ROLE, QByteArray::from("coverKey"));
-        h.insert(LAUNCHER_ID_ROLE, QByteArray::from("launcherId"));
+        h.insert(ZAP_SCRIPT_ROLE, QByteArray::from("zapScript"));
         h.insert(FAVORITE_ROLE, QByteArray::from("favorite"));
         h
     }
@@ -342,10 +371,11 @@ impl ffi::RecentsModel {
         global_runtime().spawn(async move {
             let result = store
                 .client()
-                .media_history(MediaHistoryParams {
-                    limit: Some(PAGE_SIZE),
+                .media_search(MediaSearchParams {
+                    max_results: Some(PAGE_SIZE),
                     cursor,
-                    systems: Vec::new(),
+                    tags: vec!["user:favorite".into()],
+                    ..MediaSearchParams::default()
                 })
                 .await;
             let _ = qt_thread.queue(move |model| {
@@ -366,7 +396,7 @@ impl ffi::RecentsModel {
         if text.is_empty() {
             return;
         }
-        let name = entry.media_name.clone();
+        let name = entry.name.clone();
         let store = global_store();
         global_runtime().spawn(async move {
             if let Err(e) = store.run_mutation::<RunMutation>(RunParams { text }).await {
@@ -375,18 +405,125 @@ impl ffi::RecentsModel {
         });
     }
 
+    fn launch_text_at(&self, index: i32) -> QString {
+        if index < 0 || index >= self.count {
+            return QString::default();
+        }
+        QString::from(self.entries[index as usize].zap_script.as_str())
+    }
+
+    fn write_card_at(mut self: Pin<&mut Self>, index: i32) {
+        if index < 0 || index >= self.count {
+            self.as_mut()
+                .set_card_write_error(QString::from("invalid selection"));
+            self.as_mut().set_card_write_pending(false);
+            return;
+        }
+        let entry = &self.entries[index as usize];
+        if entry.zap_script.is_empty() {
+            self.as_mut()
+                .set_card_write_error(QString::from("missing zap script"));
+            self.as_mut().set_card_write_pending(false);
+            return;
+        }
+        let text = entry.zap_script.clone();
+        let name = entry.name.clone();
+        let store = global_store();
+        let seq = self.rust().card_write_seq.clone();
+        let ticket = seq.fetch_add(1, Ordering::SeqCst) + 1;
+        self.as_mut().set_card_write_error(QString::default());
+        self.as_mut().set_card_write_pending(true);
+        let qt_thread = self.qt_thread();
+        global_runtime().spawn(async move {
+            let result = store
+                .run_mutation::<ReadersWriteMutation>(ReadersWriteParams { text })
+                .await;
+            let _ = qt_thread.queue(move |mut model| {
+                if seq.load(Ordering::SeqCst) != ticket {
+                    return;
+                }
+                let error = match result {
+                    Ok(()) => QString::default(),
+                    Err(e) => {
+                        warn!("card write failed for {name}: {}", e.message);
+                        QString::from(e.message.as_str())
+                    }
+                };
+                model.as_mut().set_card_write_error(error);
+                model.as_mut().set_card_write_pending(false);
+            });
+        });
+    }
+
+    fn toggle_favorite_at(self: Pin<&mut Self>, index: i32) {
+        if index < 0 || index >= self.count {
+            return;
+        }
+        let entry = &self.entries[index as usize];
+        let Some(params) = favorite_params_for_entry(entry, !has_favorite_tag(&entry.tags)) else {
+            warn!(
+                "favorite update skipped: missing media identity for {}",
+                entry.name
+            );
+            return;
+        };
+        let name = entry.name.clone();
+        let media_id = entry.media_id;
+        let system_id = entry.system.id.clone();
+        let path = entry.path.clone();
+        let store = global_store();
+        let qt_thread = self.qt_thread();
+        global_runtime().spawn(async move {
+            match store.run_mutation::<MediaTagsUpdateMutation>(params).await {
+                Ok(result) => {
+                    let _ = qt_thread.queue(move |mut model| {
+                        apply_favorite_tags(
+                            model.as_mut(),
+                            index,
+                            media_id,
+                            &system_id,
+                            &path,
+                            result.tags,
+                        );
+                    });
+                }
+                Err(e) => warn!("favorite update failed for {name}: {}", e.message),
+            }
+        });
+    }
+
+    fn is_favorite_at(&self, index: i32) -> bool {
+        if index < 0 || index >= self.count {
+            return false;
+        }
+        has_favorite_tag(&self.entries[index as usize].tags)
+    }
+
+    fn cancel_card_write(mut self: Pin<&mut Self>) {
+        self.as_mut()
+            .rust()
+            .card_write_seq
+            .fetch_add(1, Ordering::SeqCst);
+        if !self.card_write_error.is_empty() {
+            self.as_mut().set_card_write_error(QString::default());
+        }
+        if self.card_write_pending {
+            self.as_mut().set_card_write_pending(false);
+        }
+    }
+
     fn name_at(&self, index: i32) -> QString {
         if index < 0 || index >= self.count {
             return QString::default();
         }
-        QString::from(self.entries[index as usize].media_name.as_str())
+        QString::from(self.entries[index as usize].name.as_str())
     }
 
     fn path_at(&self, index: i32) -> QString {
         if index < 0 || index >= self.count {
             return QString::default();
         }
-        QString::from(self.entries[index as usize].media_path.as_str())
+        QString::from(self.entries[index as usize].path.as_str())
     }
 
     fn index_for_path(&self, path: &QString) -> i32 {
@@ -425,14 +562,14 @@ impl ffi::RecentsModel {
     }
 }
 
-/// Resolve the cover URL key for a recents row. Mirrors `GamesModel`'s
+/// Resolve the cover URL key for a favorites row. Mirrors `GamesModel`'s
 /// path: when the in-memory cache has bytes for `(systemId, mediaPath)`
 /// we hand back the `media-image/<encoded>` key the
 /// `QQuickImageProvider` resolves to RAM bytes; otherwise we enqueue a
 /// fetch (carrying the optional `mediaId` hint) and fall back to the
 /// system logo as a nicer placeholder than the generic file glyph.
-fn cover_key_for(entry: &MediaHistoryEntry) -> String {
-    if entry.system_id.is_empty() {
+fn cover_key_for(entry: &MediaItem) -> String {
+    if entry.system.id.is_empty() {
         return "icons/File".to_string();
     }
     let media_key = media_key_for(entry);
@@ -453,32 +590,86 @@ fn cover_key_for(entry: &MediaHistoryEntry) -> String {
     cover_key_for_with(entry, media_key.as_ref(), cached)
 }
 
-/// Build the canonical `(systemId, mediaPath)` identifier for a history
+/// Build the canonical `(systemId, mediaPath)` identifier for a search
 /// row. Returns `None` for rows without enough info to key on.
-fn media_key_for(entry: &MediaHistoryEntry) -> Option<MediaKey> {
-    if entry.system_id.is_empty() || entry.media_path.is_empty() {
+fn media_key_for(entry: &MediaItem) -> Option<MediaKey> {
+    if entry.system.id.is_empty() || entry.path.is_empty() {
         return None;
     }
-    Some(MediaKey::new(
-        entry.system_id.clone(),
-        entry.media_path.clone(),
-    ))
+    Some(MediaKey::new(entry.system.id.clone(), entry.path.clone()))
+}
+
+fn has_favorite_tag(tags: &[TagInfo]) -> bool {
+    tags.iter()
+        .any(|tag| tag.tag_type == "user" && tag.tag == "favorite")
+}
+
+fn favorite_role_value(tags: &[TagInfo]) -> i32 {
+    i32::from(has_favorite_tag(tags))
+}
+
+fn favorite_params_for_entry(entry: &MediaItem, add: bool) -> Option<MediaTagsUpdateParams> {
+    let mut params = MediaTagsUpdateParams::default();
+    if add {
+        params.add.push("user:favorite".to_string());
+    } else {
+        params.remove.push("user:favorite".to_string());
+    }
+    if let Some(media_id) = entry.media_id {
+        params.media_id = Some(media_id);
+        return Some(params);
+    }
+
+    if entry.system.id.is_empty() || entry.path.is_empty() {
+        return None;
+    }
+    params.system.clone_from(&entry.system.id);
+    params.path.clone_from(&entry.path);
+    Some(params)
+}
+
+fn apply_favorite_tags(
+    mut model: Pin<&mut ffi::FavoritesModel>,
+    index: i32,
+    media_id: Option<i64>,
+    system_id: &str,
+    path: &str,
+    tags: Vec<TagInfo>,
+) {
+    if index < 0 || index >= model.count {
+        return;
+    }
+    let entry = &model.entries[index as usize];
+    let same_entry = if media_id.is_some() {
+        entry.media_id == media_id
+    } else {
+        entry.system.id == system_id && entry.path == path
+    };
+    if !same_entry {
+        return;
+    }
+    model.as_mut().rust_mut().entries[index as usize].tags = tags;
+    let mut roles = QList::<i32>::default();
+    roles.append(FAVORITE_ROLE);
+    let parent = QModelIndex::default();
+    let idx = model.index(index, 0, &parent);
+    model.as_mut().data_changed(&idx, &idx, &roles);
 }
 
 /// Pure helper for `cover_key_for`. Split out so tests can drive the
 /// branches (cached, uncached, unattributed) without spinning up the
 /// global cover cache and its tokio runtime.
-fn cover_key_for_with(entry: &MediaHistoryEntry, key: Option<&MediaKey>, cached: bool) -> String {
-    if entry.system_id.is_empty() {
+fn cover_key_for_with(entry: &MediaItem, key: Option<&MediaKey>, cached: bool) -> String {
+    if entry.system.id.is_empty() {
         return "icons/File".to_string();
     }
     match key {
         Some(k) if cached => MediaImageCache::image_key_for(k),
-        _ => format!("systems/{}", entry.system_id),
+        _ => format!("systems/{}", entry.system.id),
     }
 }
 
-/// Schedule a cover fetch for every history row with a non-empty
+/// Schedule a cover fetch for every search row with a non-empty
 /// `(systemId, mediaPath)`. `MediaImageCache::enqueue_with_media_id`
 /// is idempotent — already-cached, already-pending, or negatively-
 /// memoised keys are dropped — so spamming this from `apply_state` /
@@ -487,9 +678,9 @@ fn cover_key_for_with(entry: &MediaHistoryEntry, key: Option<&MediaKey>, cached:
 /// Iterates `entries` in reverse so the LIFO fetch queue drains in
 /// visual order: the last entry pushed is `entries[0]`, which the
 /// driver pops first. Forward iteration starves the top of the page.
-fn enqueue_recents_covers(entries: &[MediaHistoryEntry]) {
+fn enqueue_favorites_covers(results: &[MediaItem]) {
     let cache = global_media_image_cache();
-    for entry in entries.iter().rev() {
+    for entry in results.iter().rev() {
         if let Some(key) = media_key_for(entry) {
             cache.enqueue_with_media_id(key, entry.media_id);
         }
@@ -498,19 +689,19 @@ fn enqueue_recents_covers(entries: &[MediaHistoryEntry]) {
 
 /// Emit `dataChanged(coverKey)` for every row whose entry's
 /// `(systemId, mediaPath)` matches `key`. Cheap walk of the current
-/// `entries` vec — recents pages top out at a few hundred rows after
+/// `entries` vec — favorites pages top out at a few hundred rows after
 /// look-ahead, and the bridge runs only when the cover-cache fetch
 /// driver delivers a result.
 ///
 /// Also drains `pending_first_paint_keys`: each cover landing during
 /// the gate's hold ticks the set down, and emptying the set releases
 /// the gate so the screen-flip overlay clears.
-fn notify_cover_update(mut model: Pin<&mut ffi::RecentsModel>, key: &MediaKey) {
+fn notify_cover_update(mut model: Pin<&mut ffi::FavoritesModel>, key: &MediaKey) {
     let rows: Vec<i32> = model
         .entries
         .iter()
         .enumerate()
-        .filter(|(_, e)| e.media_path == *key.path && e.system_id == *key.system_id)
+        .filter(|(_, e)| e.path == *key.path && e.system.id == *key.system_id)
         .filter_map(|(i, _)| i32::try_from(i).ok())
         .collect();
     if !rows.is_empty() {
@@ -537,7 +728,7 @@ fn notify_cover_update(mut model: Pin<&mut ffi::RecentsModel>, key: &MediaKey) {
         }
         // Bytes are cached, but QML's `MediaImageProvider` still has to
         // decode them. The hidden cover pre-warmer in
-        // `RecentsScreen.qml` dispatches all N requests at once and the
+        // `FavoritesScreen.qml` dispatches all N requests at once and the
         // provider's 4-worker pool decodes them in ~75–150 ms; without
         // this settle window the gate flips `loading=false` before the
         // last few decodes complete and the grid materialises with
@@ -545,19 +736,19 @@ fn notify_cover_update(mut model: Pin<&mut ffi::RecentsModel>, key: &MediaKey) {
         // the same hand-off in `games.rs::notify_cover_update`. Same
         // seq-ticket guard as the safety timer so a model reset
         // cancels the pending release.
-        info!("recents: cover gate bytes settled — entering decode-settle window");
+        info!("favorites: cover gate bytes settled — entering decode-settle window");
         let seq = model.rust().cover_gate_seq.clone();
         let ticket = seq.fetch_add(1, Ordering::SeqCst) + 1;
         let qt_thread = model.qt_thread();
         let handle = global_runtime().spawn(async move {
             tokio::time::sleep(Duration::from_millis(200)).await;
-            let _ = qt_thread.queue(move |mut model: Pin<&mut ffi::RecentsModel>| {
+            let _ = qt_thread.queue(move |mut model: Pin<&mut ffi::FavoritesModel>| {
                 if seq.load(Ordering::SeqCst) != ticket {
                     return;
                 }
                 model.as_mut().rust_mut().cover_gate_timer = None;
                 if model.loading {
-                    info!("recents: cover gate released after decode-settle window");
+                    info!("favorites: cover gate released after decode-settle window");
                     model.as_mut().set_loading(false);
                 }
             });
@@ -572,7 +763,7 @@ fn notify_cover_update(mut model: Pin<&mut ffi::RecentsModel>, key: &MediaKey) {
 /// are all excluded. Pure helper so the gate's binning logic is unit-
 /// testable without spinning up the global cache + tokio runtime.
 fn compute_unresolved_keys<F, G>(
-    entries: &[MediaHistoryEntry],
+    entries: &[MediaItem],
     is_cached: F,
     is_negative: G,
 ) -> HashSet<MediaKey>
@@ -590,14 +781,14 @@ where
 /// Decide whether to hold `loading=true` until the page's covers are
 /// cached, or release immediately. Called once per Ready `apply_state`.
 ///
-/// - If every history row's cover is already cached or negatively-
+/// - If every search row's cover is already cached or negatively-
 ///   memoised, set loading=false right now — the screen-flip overlay
 ///   clears.
 /// - Otherwise, store the unresolved set on the model, arm a 3 s
 ///   safety timer, and leave loading=true. `notify_cover_update` will
 ///   drain the set as covers land; whichever happens first (set
 ///   empties or timer fires) releases the gate.
-fn arm_cover_gate(mut model: Pin<&mut ffi::RecentsModel>) {
+fn arm_cover_gate(mut model: Pin<&mut ffi::FavoritesModel>) {
     if let Some(handle) = model.as_mut().rust_mut().cover_gate_timer.take() {
         handle.abort();
     }
@@ -616,7 +807,7 @@ fn arm_cover_gate(mut model: Pin<&mut ffi::RecentsModel>) {
     }
     info!(
         pending = unresolved.len(),
-        "recents: arm cover gate (holding loading until covers cached)"
+        "favorites: arm cover gate (holding loading until covers cached)"
     );
     model.as_mut().rust_mut().pending_first_paint_keys = unresolved;
     let seq = model.rust().cover_gate_seq.clone();
@@ -637,7 +828,7 @@ fn arm_cover_gate(mut model: Pin<&mut ffi::RecentsModel>) {
 /// Tear down any active cover gate. Used by Pending/Errored apply paths
 /// to invalidate an in-flight timer's queued callback (via the seq
 /// bump) before the next Ready installs a fresh one.
-fn disarm_cover_gate(mut model: Pin<&mut ffi::RecentsModel>) {
+fn disarm_cover_gate(mut model: Pin<&mut ffi::FavoritesModel>) {
     if let Some(handle) = model.as_mut().rust_mut().cover_gate_timer.take() {
         handle.abort();
     }
@@ -648,9 +839,9 @@ fn disarm_cover_gate(mut model: Pin<&mut ffi::RecentsModel>) {
 /// Force-release the cover gate from the safety timer. Called only via
 /// the timer's queued callback after a seq-match check; the
 /// notify-driven release path lives inline in `notify_cover_update`.
-fn release_cover_gate_after_timeout(mut model: Pin<&mut ffi::RecentsModel>) {
+fn release_cover_gate_after_timeout(mut model: Pin<&mut ffi::FavoritesModel>) {
     let pending = model.pending_first_paint_keys.len();
-    info!(pending, "recents: cover gate timed out, releasing");
+    info!(pending, "favorites: cover gate timed out, releasing");
     model.as_mut().rust_mut().pending_first_paint_keys.clear();
     model.as_mut().rust_mut().cover_gate_timer = None;
     if model.loading {
@@ -658,40 +849,26 @@ fn release_cover_gate_after_timeout(mut model: Pin<&mut ffi::RecentsModel>) {
     }
 }
 
-/// Build the `text` payload sent to Core's `run` for a history entry.
-/// History entries don't carry a synthesised `zap_script` (Core surfaces
-/// only the raw fields), so compose `**launch:<path>` from the row's
-/// `mediaPath`, with `?launcher=<id>` appended when `launcherId` is known
-/// so Core picks the same launcher the entry originally ran under. An
-/// empty path yields an empty string, suppressing the run entirely —
-/// `**launch.system:<id>` would just boot the core without a game.
-fn launch_text_for(entry: &MediaHistoryEntry) -> String {
-    if entry.media_path.is_empty() {
-        return String::new();
-    }
-    if entry.launcher_id.is_empty() {
-        format!("**launch:{}", entry.media_path)
-    } else {
-        format!(
-            "**launch:{}?launcher={}",
-            entry.media_path, entry.launcher_id
-        )
-    }
+/// Build the `text` payload sent to Core's `run` for a search entry.
+/// Search entries carry a Core-built `ZapScript` command, so use it
+/// directly and suppress the run when it is empty.
+fn launch_text_for(entry: &MediaItem) -> String {
+    entry.zap_script.clone()
 }
 
-fn position_of_path(entries: &[MediaHistoryEntry], needle: &str) -> i32 {
+fn position_of_path(entries: &[MediaItem], needle: &str) -> i32 {
     if needle.is_empty() {
         return -1;
     }
     entries
         .iter()
-        .position(|e| e.media_path == needle)
+        .position(|e| e.path == needle)
         .map_or(-1, |i| i as i32)
 }
 
 fn apply_append_page(
-    mut model: Pin<&mut ffi::RecentsModel>,
-    result: Result<MediaHistoryResult, ClientError>,
+    mut model: Pin<&mut ffi::FavoritesModel>,
+    result: Result<MediaSearchResult, ClientError>,
     expected_prev_cursor: Option<&str>,
 ) {
     if model.next_cursor.as_deref() != expected_prev_cursor {
@@ -704,14 +881,14 @@ fn apply_append_page(
         Ok(result) => {
             let has_next_page = result.has_next_page();
             let next_cursor = result.next_cursor();
-            let new_count = i32::try_from(result.entries.len()).unwrap_or(i32::MAX - model.count);
-            enqueue_recents_covers(&result.entries);
+            let new_count = i32::try_from(result.results.len()).unwrap_or(i32::MAX - model.count);
+            enqueue_favorites_covers(&result.results);
             if new_count > 0 {
                 let first = model.count;
                 let last = first.saturating_add(new_count).saturating_sub(1);
                 let parent = QModelIndex::default();
                 model.as_mut().begin_insert_rows(&parent, first, last);
-                model.as_mut().rust_mut().entries.extend(result.entries);
+                model.as_mut().rust_mut().entries.extend(result.results);
                 model.as_mut().rust_mut().count = first.saturating_add(new_count);
                 model.as_mut().end_insert_rows();
                 model.as_mut().count_changed();
@@ -721,230 +898,11 @@ fn apply_append_page(
             model.as_mut().set_loading_more(false);
         }
         Err(e) => {
-            warn!("media.history follow-up page failed: {}", e.message);
+            warn!("media.search follow-up page failed: {}", e.message);
             model
                 .as_mut()
                 .set_error_message(QString::from(e.message.as_str()));
             model.as_mut().set_loading_more(false);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #![allow(
-        clippy::expect_used,
-        clippy::unwrap_used,
-        clippy::panic,
-        reason = "tests should fail-fast on unexpected errors"
-    )]
-
-    use super::{
-        compute_unresolved_keys, cover_key_for_with, launch_text_for, media_key_for,
-        position_of_path, project,
-    };
-    use crate::media_image_cache::{MediaImageCache, MediaKey};
-    use std::collections::HashSet;
-    use zaparoo_core::media_types::{MediaHistoryEntry, MediaHistoryResult, Pagination};
-    use zaparoo_core::remote_resource::ResourceStatus;
-
-    fn entry(name: &str, path: &str, system_id: &str, launcher_id: &str) -> MediaHistoryEntry {
-        MediaHistoryEntry {
-            media_name: name.into(),
-            media_path: path.into(),
-            system_id: system_id.into(),
-            launcher_id: launcher_id.into(),
-            ..MediaHistoryEntry::default()
-        }
-    }
-
-    #[test]
-    fn cover_key_uses_system_logo_when_uncached() {
-        let e = entry("smb", "/p/smb", "NES", "NES");
-        let key = media_key_for(&e).expect("media has key");
-        assert_eq!(cover_key_for_with(&e, Some(&key), false), "systems/NES",);
-    }
-
-    #[test]
-    fn cover_key_returns_media_image_key_when_cached() {
-        let e = entry("smb", "/p/smb", "NES", "NES");
-        let key = media_key_for(&e).expect("media has key");
-        let expected = MediaImageCache::image_key_for(&key);
-        assert_eq!(cover_key_for_with(&e, Some(&key), true), expected);
-        assert!(expected.starts_with("media-image/"));
-    }
-
-    #[test]
-    fn cover_key_falls_back_to_file_glyph_when_system_missing() {
-        let e = entry("orphan", "/p/orphan", "", "");
-        assert_eq!(cover_key_for_with(&e, None, false), "icons/File");
-    }
-
-    #[test]
-    fn media_key_for_skips_rows_without_path_or_system() {
-        let pathless = entry("ghost", "", "NES", "NES");
-        assert!(media_key_for(&pathless).is_none());
-        let unattributed = entry("ghost", "/p", "", "");
-        assert!(media_key_for(&unattributed).is_none());
-        let key =
-            media_key_for(&entry("smb", "/p/smb", "NES", "NES")).expect("complete entry has key");
-        assert_eq!(key.system_id.as_ref(), "NES");
-        assert_eq!(key.path.as_ref(), "/p/smb");
-    }
-
-    #[test]
-    fn launch_text_uses_launch_with_launcher_override_when_known() {
-        let e = entry("smb", "/p/smb.nes", "NES", "NES");
-        assert_eq!(launch_text_for(&e), "**launch:/p/smb.nes?launcher=NES");
-    }
-
-    #[test]
-    fn launch_text_falls_back_to_bare_launch_when_launcher_missing() {
-        let e = entry("smb", "/p/smb.nes", "NES", "");
-        assert_eq!(launch_text_for(&e), "**launch:/p/smb.nes");
-    }
-
-    #[test]
-    fn launch_text_is_empty_when_path_missing_and_launcher_present() {
-        // A history row with a launcher id but no path is malformed —
-        // `**launch:?launcher=NES` would just confuse Core. Empty here
-        // suppresses the run entirely.
-        let e = entry("ghost", "", "NES", "NES");
-        assert_eq!(launch_text_for(&e), "");
-    }
-
-    #[test]
-    fn position_of_path_returns_index_on_match() {
-        let entries = vec![
-            entry("smb", "/p/smb", "NES", "NES"),
-            entry("zelda", "/p/zelda", "NES", "NES"),
-        ];
-        assert_eq!(position_of_path(&entries, "/p/zelda"), 1);
-    }
-
-    #[test]
-    fn position_of_path_empty_needle_returns_minus_one() {
-        let entries = vec![entry("smb", "/p/smb", "NES", "NES")];
-        assert_eq!(position_of_path(&entries, ""), -1);
-    }
-
-    #[test]
-    fn position_of_path_missing_returns_minus_one() {
-        let entries = vec![entry("smb", "/p/smb", "NES", "NES")];
-        assert_eq!(position_of_path(&entries, "/missing"), -1);
-    }
-
-    #[test]
-    fn project_idle_yields_empty_pending() {
-        let (page, err) = project(&ResourceStatus::Idle);
-        assert!(page.is_none());
-        assert!(err.is_empty());
-    }
-
-    #[test]
-    fn project_loading_yields_empty_pending() {
-        let (page, err) = project(&ResourceStatus::Loading);
-        assert!(page.is_none());
-        assert!(err.is_empty());
-    }
-
-    #[test]
-    fn project_ready_carries_entries_and_pagination() {
-        let result = MediaHistoryResult {
-            entries: vec![entry("smb", "/p/smb", "NES", "NES")],
-            pagination: Some(Pagination {
-                has_next_page: true,
-                page_size: 25,
-                next_cursor: Some("cursor-2".into()),
-            }),
-        };
-        let (page, err) = project(&ResourceStatus::Ready(result));
-        assert!(err.is_empty());
-        let (entries, has_next, cursor) = page.expect("ready snapshot");
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].media_path, "/p/smb");
-        assert!(has_next);
-        assert_eq!(cursor.as_deref(), Some("cursor-2"));
-    }
-
-    #[test]
-    fn project_ready_without_pagination_disarms_next_page() {
-        // Core docs say pagination is omitted when no entries are
-        // returned. The projection must surface that as `has_next_page
-        // = false` so the model disarms `fetch_more` instead of looping
-        // on a stale cursor.
-        let result = MediaHistoryResult::default();
-        let (page, err) = project(&ResourceStatus::Ready(result));
-        assert!(err.is_empty());
-        let (entries, has_next, cursor) = page.expect("ready snapshot");
-        assert!(entries.is_empty());
-        assert!(!has_next);
-        assert!(cursor.is_none());
-    }
-
-    #[test]
-    fn project_errored_carries_message_with_no_snapshot() {
-        let (page, err) = project(&ResourceStatus::Errored {
-            message: "rpc kaboom".into(),
-            retrying: true,
-        });
-        assert!(page.is_none());
-        assert_eq!(err, "rpc kaboom");
-    }
-
-    #[test]
-    fn compute_unresolved_keys_empty_entries_returns_empty() {
-        let unresolved = compute_unresolved_keys(&[], |_| false, |_| false);
-        assert!(unresolved.is_empty());
-    }
-
-    #[test]
-    fn compute_unresolved_keys_all_cached_returns_empty() {
-        let entries = vec![
-            entry("smb", "/p/smb", "NES", "NES"),
-            entry("zelda", "/p/zelda", "NES", "NES"),
-        ];
-        let unresolved = compute_unresolved_keys(&entries, |_| true, |_| false);
-        assert!(unresolved.is_empty());
-    }
-
-    #[test]
-    fn compute_unresolved_keys_mixed_returns_only_uncached() {
-        let cached_path = "/p/smb";
-        let entries = vec![
-            entry("smb", cached_path, "NES", "NES"),
-            entry("zelda", "/p/zelda", "NES", "NES"),
-        ];
-        let unresolved =
-            compute_unresolved_keys(&entries, |k| k.path.as_ref() == cached_path, |_| false);
-        let expected: HashSet<MediaKey> = [MediaKey::new("NES", "/p/zelda")].into_iter().collect();
-        assert_eq!(unresolved, expected);
-    }
-
-    #[test]
-    fn compute_unresolved_keys_excludes_negative_memo() {
-        let negative_path = "/p/no-image";
-        let entries = vec![
-            entry("smb", "/p/smb", "NES", "NES"),
-            entry("orphan", negative_path, "NES", "NES"),
-        ];
-        let unresolved =
-            compute_unresolved_keys(&entries, |_| false, |k| k.path.as_ref() == negative_path);
-        let expected: HashSet<MediaKey> = [MediaKey::new("NES", "/p/smb")].into_iter().collect();
-        assert_eq!(unresolved, expected);
-    }
-
-    #[test]
-    fn compute_unresolved_keys_skips_unattributed_rows() {
-        // Rows without a system id or path never key into the cache —
-        // gate must not wait on them.
-        let entries = vec![
-            entry("smb", "/p/smb", "NES", "NES"),
-            entry("orphan", "", "NES", "NES"),
-            entry("ghost", "/p/ghost", "", ""),
-        ];
-        let unresolved = compute_unresolved_keys(&entries, |_| false, |_| false);
-        let expected: HashSet<MediaKey> = [MediaKey::new("NES", "/p/smb")].into_iter().collect();
-        assert_eq!(unresolved, expected);
     }
 }

@@ -62,6 +62,8 @@ Item {
     // row the pointer targeted.
     signal itemHovered(int index)
     signal itemClicked(int index)
+    signal itemRightClicked(int index)
+    signal emptyRightClicked()
 
     // Per-instance shape overrides. -1 means "use the global Sizing
     // default" — Systems screen leaves these alone so the systems grid
@@ -328,6 +330,13 @@ Item {
 
     clip: true
 
+    MouseArea {
+        anchors.fill: parent
+        hoverEnabled: true
+        acceptedButtons: Qt.RightButton
+        onClicked: root.emptyRightClicked()
+    }
+
     Item {
         id: track
 
@@ -351,6 +360,7 @@ Item {
                 // embedded PNG from the key or shows the procedural
                 // fallback with `name` rendered large.
                 required property string coverKey
+                required property int favorite
 
                 readonly property int cellPage: Math.floor(index / root.pageSize)
                 readonly property int cellLocal: index % root.pageSize
@@ -427,12 +437,14 @@ Item {
                     isFocused: root.focused
                     name: cellItem.name
                     coverKey: cellItem._gatedCoverKey
+                    favorite: cellItem.favorite
                 }
 
                 MouseArea {
                     anchors.fill: parent
                     hoverEnabled: true
-                    acceptedButtons: Qt.LeftButton
+                    acceptedButtons: Qt.LeftButton | Qt.RightButton
+                    cursorShape: Qt.PointingHandCursor
                     enabled: cellItem.visible
 
                     onEntered: {
@@ -441,10 +453,13 @@ Item {
                         root.itemHovered(cellItem.index)
                     }
 
-                    onClicked: {
+                    onClicked: (mouse) => {
                         if (root.currentIndex !== cellItem.index)
                             root.currentIndex = cellItem.index
-                        root.itemClicked(cellItem.index)
+                        if (mouse.button === Qt.RightButton)
+                            root.itemRightClicked(cellItem.index)
+                        else
+                            root.itemClicked(cellItem.index)
                     }
                 }
             }

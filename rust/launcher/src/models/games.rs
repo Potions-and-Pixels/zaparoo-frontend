@@ -46,10 +46,12 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use zaparoo_core::client::ClientError;
 use zaparoo_core::endpoints::media_browse::{BrowseArgs, MediaBrowseEndpoint};
+use zaparoo_core::endpoints::media_tags_update::MediaTagsUpdateMutation;
 use zaparoo_core::endpoints::readers_write::ReadersWriteMutation;
 use zaparoo_core::endpoints::run::RunMutation;
 use zaparoo_core::media_types::{
-    BrowseEntry, MediaBrowseParams, MediaBrowseResult, ReadersWriteParams, RunParams,
+    BrowseEntry, MediaBrowseParams, MediaBrowseResult, MediaTagsUpdateParams, ReadersWriteParams,
+    RunParams, TagInfo,
 };
 use zaparoo_core::platform::{self, Platform};
 use zaparoo_core::remote_resource::ResourceStatus;
@@ -67,6 +69,7 @@ const SYSTEM_ID_ROLE: i32 = 256 + 4;
 const COVER_KEY_ROLE: i32 = 256 + 5;
 const ENTRY_TYPE_ROLE: i32 = 256 + 6;
 const FILE_COUNT_ROLE: i32 = 256 + 7;
+const FAVORITE_ROLE: i32 = 256 + 8;
 
 // Default API page size before QML binds the model's `page_size` to the
 // grid's `pageSize`. 15 = 5 columns × 3 rows, the desktop default. The
@@ -229,6 +232,12 @@ pub mod ffi {
         fn write_card_at(self: Pin<&mut GamesModel>, index: i32);
 
         #[qinvokable]
+        fn toggle_favorite_at(self: Pin<&mut GamesModel>, index: i32);
+
+        #[qinvokable]
+        fn is_favorite_at(self: &GamesModel, index: i32) -> bool;
+
+        #[qinvokable]
         fn cancel_card_write(self: Pin<&mut GamesModel>);
 
         #[qinvokable]
@@ -314,6 +323,7 @@ impl ffi::GamesModel {
             COVER_KEY_ROLE => QVariant::from(&QString::from(cover_key_for(entry).as_str())),
             ENTRY_TYPE_ROLE => QVariant::from(&QString::from(entry.entry_type.as_str())),
             FILE_COUNT_ROLE => QVariant::from(&i32::try_from(entry.file_count).unwrap_or(i32::MAX)),
+            FAVORITE_ROLE => QVariant::from(&favorite_role_value(&entry.tags)),
             _ => QVariant::default(),
         }
     }
@@ -327,6 +337,7 @@ impl ffi::GamesModel {
         h.insert(COVER_KEY_ROLE, QByteArray::from("coverKey"));
         h.insert(ENTRY_TYPE_ROLE, QByteArray::from("entryType"));
         h.insert(FILE_COUNT_ROLE, QByteArray::from("fileCount"));
+        h.insert(FAVORITE_ROLE, QByteArray::from("favorite"));
         h
     }
 
@@ -477,6 +488,53 @@ impl ffi::GamesModel {
                 model.as_mut().set_card_write_pending(false);
             });
         });
+    }
+
+    fn toggle_favorite_at(self: Pin<&mut Self>, index: i32) {
+        if index < 0 || index >= self.count {
+            return;
+        }
+        let entry = &self.entries[index as usize];
+        if entry.is_folder() {
+            return;
+        }
+        let Some(params) = favorite_params_for_entry(entry, !has_favorite_tag(&entry.tags)) else {
+            warn!(
+                "favorite update skipped: missing media identity for {}",
+                entry.name
+            );
+            return;
+        };
+        let name = entry.name.clone();
+        let media_id = entry.media_id;
+        let system_id = entry_system_id(entry);
+        let path = entry.path.clone();
+        let store = global_store();
+        let qt_thread = self.qt_thread();
+        global_runtime().spawn(async move {
+            match store.run_mutation::<MediaTagsUpdateMutation>(params).await {
+                Ok(result) => {
+                    let _ = qt_thread.queue(move |mut model| {
+                        apply_favorite_tags(
+                            model.as_mut(),
+                            index,
+                            media_id,
+                            &system_id,
+                            &path,
+                            result.tags,
+                        );
+                    });
+                }
+                Err(e) => warn!("favorite update failed for {name}: {}", e.message),
+            }
+        });
+    }
+
+    fn is_favorite_at(&self, index: i32) -> bool {
+        if index < 0 || index >= self.count {
+            return false;
+        }
+        has_favorite_tag(&self.entries[index as usize].tags)
     }
 
     fn cancel_card_write(mut self: Pin<&mut Self>) {
@@ -697,6 +755,64 @@ fn media_key_for(entry: &BrowseEntry) -> Option<MediaKey> {
         return None;
     }
     Some(MediaKey::new(system_id, entry.path.clone()))
+}
+
+fn has_favorite_tag(tags: &[TagInfo]) -> bool {
+    tags.iter()
+        .any(|tag| tag.tag_type == "user" && tag.tag == "favorite")
+}
+
+fn favorite_role_value(tags: &[TagInfo]) -> i32 {
+    i32::from(has_favorite_tag(tags))
+}
+
+fn favorite_params_for_entry(entry: &BrowseEntry, add: bool) -> Option<MediaTagsUpdateParams> {
+    let mut params = MediaTagsUpdateParams::default();
+    if add {
+        params.add.push("user:favorite".to_string());
+    } else {
+        params.remove.push("user:favorite".to_string());
+    }
+    if let Some(media_id) = entry.media_id {
+        params.media_id = Some(media_id);
+        return Some(params);
+    }
+
+    let system = entry_system_id(entry);
+    if system.is_empty() || entry.path.is_empty() {
+        return None;
+    }
+    params.system = system;
+    params.path.clone_from(&entry.path);
+    Some(params)
+}
+
+fn apply_favorite_tags(
+    mut model: Pin<&mut ffi::GamesModel>,
+    index: i32,
+    media_id: Option<i64>,
+    system_id: &str,
+    path: &str,
+    tags: Vec<TagInfo>,
+) {
+    if index < 0 || index >= model.count {
+        return;
+    }
+    let entry = &model.entries[index as usize];
+    let same_entry = if media_id.is_some() {
+        entry.media_id == media_id
+    } else {
+        entry_system_id(entry) == system_id && entry.path == path
+    };
+    if !same_entry {
+        return;
+    }
+    model.as_mut().rust_mut().entries[index as usize].tags = tags;
+    let mut roles = QList::<i32>::default();
+    roles.append(FAVORITE_ROLE);
+    let parent = QModelIndex::default();
+    let idx = model.index(index, 0, &parent);
+    model.as_mut().data_changed(&idx, &idx, &roles);
 }
 
 /// Pure helper for `cover_key_for`. Split out so tests can drive the
