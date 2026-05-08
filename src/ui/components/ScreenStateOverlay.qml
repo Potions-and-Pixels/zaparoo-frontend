@@ -34,7 +34,8 @@ Item {
     visible: overlay.viewState !== "ready"
 
     Column {
-        anchors.centerIn: parent
+        x: Sizing.center(parent.width, width)
+        y: Sizing.center(parent.height, height)
         spacing: Sizing.pctH(0.6)
 
         // Loading state shares the LoadingIndicator with the global
@@ -76,7 +77,7 @@ Item {
             color: Theme.textPrimary
             wrapMode: Text.WordWrap
             horizontalAlignment: Text.AlignHCenter
-            width: overlay.width * 0.7
+            width: Sizing.px(overlay.width * 0.7)
             renderType: Text.NativeRendering
         }
     }

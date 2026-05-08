@@ -345,7 +345,7 @@ Item {
         // row Item, not by inflating the cell.
         readonly property int cellHeight: cellWidth
         readonly property int totalRowWidth: n > 0 ? n * cellWidth + (n - 1) * spacing : 0
-        readonly property int rowOriginX: (width - totalRowWidth) / 2
+        readonly property int rowOriginX: Sizing.center(width, totalRowWidth)
 
         // Symmetric padding contains the focused tile's 1.06× scale
         // bleed inside the row's own bounds.
@@ -433,7 +433,7 @@ Item {
         readonly property int verticalPadding: categoriesRow.verticalPadding
         readonly property int n: hub.actionEntries.length
         readonly property int totalRowWidth: n > 0 ? n * cellWidth + (n - 1) * spacing : 0
-        readonly property int rowOriginX: (width - totalRowWidth) / 2
+        readonly property int rowOriginX: Sizing.center(width, totalRowWidth)
 
         anchors.horizontalCenter: parent.horizontalCenter
         anchors.top: categoriesRow.bottom
@@ -527,7 +527,8 @@ Item {
     // window where count===0 surfaces as "No categories" is acceptable
     // per the "Loading is brief" locked decision in MVP_PLAN.md.
     ScreenStateOverlay {
-        anchors.centerIn: categoriesRow
+        x: categoriesRow.x + Sizing.center(categoriesRow.width, width)
+        y: categoriesRow.y + Sizing.center(categoriesRow.height, height)
         width: categoriesRow.width
         height: categoriesRow.height
         loading: false

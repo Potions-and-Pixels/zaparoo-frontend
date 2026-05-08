@@ -59,9 +59,12 @@ endif()
 # qt_add_executable (not add_executable) so that Qt's CMake sets up the target with all the
 # properties needed by qt_import_qml_plugins.
 qt_add_executable(
-    launcher "${CMAKE_SOURCE_DIR}/src/app/main.cpp"
+    launcher
+    "${CMAKE_SOURCE_DIR}/src/app/main.cpp"
     "${CMAKE_SOURCE_DIR}/src/app/media_image_provider.h"
     "${CMAKE_SOURCE_DIR}/src/app/media_image_provider.cpp"
+    "${CMAKE_SOURCE_DIR}/src/app/native_video_writer.h"
+    "${CMAKE_SOURCE_DIR}/src/app/native_video_writer.cpp"
 )
 target_include_directories(
     launcher

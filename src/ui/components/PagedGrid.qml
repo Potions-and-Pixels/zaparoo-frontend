@@ -724,7 +724,7 @@ Item {
             // when `totalPageCount` is large.
             readonly property int _minThumbHeight: Sizing.pctH(4)
             readonly property int _thumbHeight: Math.max(_minThumbHeight, Math.round(scrollRegion.height / root.totalPageCount))
-            readonly property real _thumbY: root.totalPageCount <= 1 ? 0 : (root.currentPage / (root.totalPageCount - 1)) * (scrollRegion.height - _thumbHeight)
+            readonly property int _thumbY: root.totalPageCount <= 1 ? 0 : Sizing.px((root.currentPage / (root.totalPageCount - 1)) * (scrollRegion.height - _thumbHeight))
 
             Rectangle {
                 id: scrollThumb
@@ -733,7 +733,7 @@ Item {
                 anchors.horizontalCenter: parent.horizontalCenter
                 y: scrollRegion._thumbY
                 color: Theme.textPrimary
-                radius: width / 2
+                radius: Sizing.half(width)
             }
         }
     }

@@ -7,6 +7,8 @@ import QtQuick
 // Project-wide color and font constants.
 // Never hardcode colors or font families inline — use these instead.
 QtObject {
+    property bool crtNativePath: false
+
     // Backgrounds
     readonly property color bgDeep: "#0f0f23"
     readonly property color bgMid: "#252550"
@@ -32,6 +34,6 @@ QtObject {
     // Accent — static warm amber used for selection highlights.
     readonly property color accent: "#FFB347"
     // Fonts
-    readonly property string fontUi: "Atkinson Hyperlegible"
-    readonly property string fontMono: "monospace"
+    readonly property string fontUi: crtNativePath ? "Bongo-8 Mono" : "Atkinson Hyperlegible"
+    readonly property string fontMono: crtNativePath ? "Bongo-8 Mono" : "monospace"
 }

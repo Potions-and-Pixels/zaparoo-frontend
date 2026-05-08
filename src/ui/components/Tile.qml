@@ -83,9 +83,13 @@ Item {
     // bottom edge, separated from the cover by `_captionGap`.
     readonly property int _padding: Sizing.pctH(2)
     readonly property int _outlineGap: Sizing.pctH(0.4)
-    readonly property int _outlineWidth: Sizing.pctH(0.6)
+    readonly property int _outlineWidth: Sizing.stroke(Sizing.pctH(0.6))
     readonly property int _captionHeight: Sizing.pctH(5.5)
     readonly property int _captionGap: Sizing.pctH(0.4)
+    readonly property int _captionTextSize: Sizing.fontSize(2.2)
+    readonly property int _captionTextMaxWidth: Math.max(0, root.width - 2 * Sizing.cornerRadius)
+    readonly property int _captionTextWidth: Math.min(root._captionTextMaxWidth, Sizing.px(captionMetrics.advanceWidth))
+
     readonly property bool _focusedSelection: root.delegateIsSelected && root.delegateIsFocused
     // `coverKey` is the relative path under `resources/images/` without
     // extension — `systems/snes`, `categories/Consoles`, etc. The model
@@ -141,7 +145,7 @@ Item {
         anchors.fill: parent
         anchors.margins: root._outlineGap
         color: Theme.textPrimary
-        radius: Sizing.cornerRadius - root._outlineGap
+        radius: Math.max(0, Sizing.cornerRadius - root._outlineGap)
         antialiasing: true
         visible: root._focusedSelection
     }
@@ -204,7 +208,8 @@ Item {
     Image {
         id: loadingGlyph
 
-        anchors.centerIn: cover
+        x: cover.x + Sizing.center(cover.width, width)
+        y: cover.y + Sizing.center(cover.height, height)
         width: Sizing.pctH(10)
         height: Sizing.pctH(10)
         source: Resources.iconUrl("Loading")
@@ -214,8 +219,8 @@ Item {
         // taller than ~240 px. Pinning sourceSize to the rendered
         // dimensions makes the SVG renderer rasterise at target size
         // — same pattern StatusIcon.qml and LoadingIndicator.qml use.
-        sourceSize.width: width
-        sourceSize.height: height
+        sourceSize.width: Sizing.px(width)
+        sourceSize.height: Sizing.px(height)
         fillMode: Image.PreserveAspectFit
         smooth: true
         asynchronous: false
@@ -227,13 +232,13 @@ Item {
 
         anchors.left: parent.left
         anchors.top: parent.top
-        anchors.leftMargin: parent.width / 12
-        anchors.topMargin: parent.width / 12
-        width: parent.width / 6
+        anchors.leftMargin: Sizing.px(parent.width / 12)
+        anchors.topMargin: Sizing.px(parent.width / 12)
+        width: Sizing.px(parent.width / 6)
         height: width
         source: Resources.iconUrl("Heart")
-        sourceSize.width: width
-        sourceSize.height: height
+        sourceSize.width: Sizing.px(width)
+        sourceSize.height: Sizing.px(height)
         fillMode: Image.PreserveAspectFit
         smooth: true
         asynchronous: false
@@ -265,6 +270,15 @@ Item {
         clip: true
     }
 
+    // Bottom caption strip (caption mode only). Single line, ellipsised
+    // when long. The Text item itself is centered on an integer x and
+    // the glyph run is left-aligned inside it; `Text.AlignHCenter` can
+    // place bitmap glyphs on a half-pixel when the tile width and text
+    // width have opposite parity, which softens Bongo in CRT mode.
+    // Tints to `textPrimary` on the focused tile so the selection reads
+    // at a glance even when the focus outline ring is outside the eye's
+    // centre — matches the procedural fallback's focus tint above.
+    //
     // The strip sits flush at the card's bottom edge so the title
     // visually owns the bottom of the tile rather than hovering above
     // a band of card padding. Horizontal margins clear `cornerRadius`
@@ -275,27 +289,29 @@ Item {
     // ring's inner mask zone (which extends `_outlineGap +
     // _outlineWidth` from the bottom edge), so the text background
     // remains surfaceCard even on a focused tile.
+    TextMetrics {
+        id: captionMetrics
+
+        text: root.delegateName
+        font.family: Theme.fontUi
+        font.pixelSize: root._captionTextSize
+    }
+
     Text {
         id: caption
 
-        height: root._captionHeight
+        x: Sizing.center(parent.width, width)
+        y: parent.height - root._captionHeight + Sizing.center(root._captionHeight, height)
+        width: root._captionTextWidth
+        height: root._captionTextSize
         visible: root.showCaption
         text: root.delegateName
         font.family: Theme.fontUi
-        font.pixelSize: Sizing.fontSize(2.2)
+        font.pixelSize: root._captionTextSize
         color: root._focusedSelection ? Theme.textPrimary : Theme.textLabel
         elide: Text.ElideRight
-        horizontalAlignment: Text.AlignHCenter
+        horizontalAlignment: Text.AlignLeft
         verticalAlignment: Text.AlignVCenter
         renderType: Text.NativeRendering
-
-        anchors {
-            left: parent.left
-            right: parent.right
-            bottom: parent.bottom
-            leftMargin: Sizing.cornerRadius
-            rightMargin: Sizing.cornerRadius
-            bottomMargin: 0
-        }
     }
 }
