@@ -83,6 +83,20 @@ const BROWSE_LAYOUTS: &[&str] = &["grid", "list"];
 const DEFAULT_BROWSE_LAYOUT: &str = "grid";
 const BUTTON_LAYOUTS: &[&str] = &["a", "b", "c", "d"];
 const DEFAULT_BUTTON_LAYOUT: &str = "a";
+// Screensaver idle-timeout choices. Values are seconds as ASCII
+// strings, with the `"off"` sentinel meaning "never activate".
+// Default of 5 minutes matches typical TV/console screensavers and
+// is long enough that idle browsing does not trip it.
+const SCREENSAVER_TIMEOUTS: &[&str] = &["off", "60", "120", "300", "600", "900", "1800"];
+const DEFAULT_SCREENSAVER_TIMEOUT: &str = "300";
+
+// Debug-only QA shortcut so the activation path can be exercised
+// without waiting for the production timer. Only appears in debug
+// builds; release builds drop both the picker entry and the
+// normalization branch so a stray persisted "1" rounds back to the
+// safe default.
+#[cfg(debug_assertions)]
+const SCREENSAVER_TIMEOUTS_DEBUG: &[&str] = &["1"];
 
 #[derive(Default)]
 pub struct SettingsRust {
@@ -97,6 +111,8 @@ pub struct SettingsRust {
     current_button_layout: QString,
     current_mouse_enabled: bool,
     current_debug_logging: bool,
+    available_screensaver_timeouts: QStringList,
+    current_screensaver_timeout: QString,
 }
 
 #[cxx_qt::bridge]
@@ -123,6 +139,8 @@ pub mod ffi {
         #[qproperty(QString, current_button_layout, READ, WRITE = set_button_layout, NOTIFY)]
         #[qproperty(bool, current_mouse_enabled, READ, WRITE = set_mouse_enabled, NOTIFY)]
         #[qproperty(bool, current_debug_logging, READ, WRITE = set_debug_logging, NOTIFY)]
+        #[qproperty(QStringList, available_screensaver_timeouts, READ, CONSTANT)]
+        #[qproperty(QString, current_screensaver_timeout, READ, WRITE = set_screensaver_timeout, NOTIFY)]
         type Settings = super::SettingsRust;
 
         #[qinvokable]
@@ -142,6 +160,9 @@ pub mod ffi {
 
         #[qinvokable]
         fn set_debug_logging(self: Pin<&mut Settings>, value: bool);
+
+        #[qinvokable]
+        fn set_screensaver_timeout(self: Pin<&mut Settings>, value: QString);
     }
 
     impl cxx_qt::Initialize for Settings {}
@@ -173,6 +194,9 @@ impl Initialize for ffi::Settings {
             QString::from(merged.button_layout.as_str());
         self.as_mut().rust_mut().current_mouse_enabled = merged.mouse_enabled;
         self.as_mut().rust_mut().current_debug_logging = merged.debug_logging;
+        self.as_mut().rust_mut().available_screensaver_timeouts = screensaver_timeouts();
+        self.as_mut().rust_mut().current_screensaver_timeout =
+            QString::from(merged.screensaver_timeout.as_str());
     }
 }
 
@@ -262,6 +286,21 @@ impl ffi::Settings {
         self.as_mut().rust_mut().current_debug_logging = value;
         self.as_mut().current_debug_logging_changed();
     }
+
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "cxx-qt qinvokable signature requires QString by value"
+    )]
+    fn set_screensaver_timeout(mut self: Pin<&mut Self>, value: QString) {
+        let value_str = normalize_screensaver_timeout(&value.to_string()).to_string();
+        if self.current_screensaver_timeout.to_string() == value_str {
+            return;
+        }
+        let snapshot = persist_settings(|s| s.screensaver_timeout.clone_from(&value_str));
+        mirror_settings_to_config(&config_file_path(), &snapshot.settings);
+        self.as_mut().rust_mut().current_screensaver_timeout = QString::from(value_str.as_str());
+        self.as_mut().current_screensaver_timeout_changed();
+    }
 }
 
 fn persist_settings<F: FnOnce(&mut SettingsState)>(mutator: F) -> persist::PersistedState {
@@ -292,6 +331,7 @@ fn mirror_settings_to_config(config_path: &std::path::Path, settings: &SettingsS
         settings.button_layout.as_str(),
         settings.mouse_enabled,
         settings.debug_logging,
+        settings.screensaver_timeout.as_str(),
     ) {
         warn!(
             "could not save settings mirror to {}: {e}",
@@ -327,6 +367,14 @@ fn merge_settings(snapshot: &SettingsState, config: &Config) -> SettingsState {
         // Config wins so launcher.toml is the durable source of truth on
         // MiSTer (state.toml lives on tmpfs).
         debug_logging: config.debug_logging,
+        screensaver_timeout: normalize_screensaver_timeout(
+            config
+                .settings
+                .screensaver_timeout
+                .as_deref()
+                .unwrap_or(snapshot.screensaver_timeout.as_str()),
+        )
+        .to_string(),
     }
 }
 
@@ -362,6 +410,18 @@ fn languages() -> QStringList {
     list
 }
 
+fn screensaver_timeouts() -> QStringList {
+    let mut list = QStringList::default();
+    #[cfg(debug_assertions)]
+    for value in SCREENSAVER_TIMEOUTS_DEBUG {
+        list.append(QString::from(*value));
+    }
+    for value in SCREENSAVER_TIMEOUTS {
+        list.append(QString::from(*value));
+    }
+    list
+}
+
 fn normalize_language(value: &str) -> &str {
     let trimmed = value.trim();
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
@@ -381,6 +441,23 @@ fn normalize_browse_layout(value: &str) -> &'static str {
         .copied()
         .find(|layout| *layout == trimmed)
         .unwrap_or(DEFAULT_BROWSE_LAYOUT)
+}
+
+fn normalize_screensaver_timeout(value: &str) -> &'static str {
+    let trimmed = value.trim();
+    #[cfg(debug_assertions)]
+    if let Some(found) = SCREENSAVER_TIMEOUTS_DEBUG
+        .iter()
+        .copied()
+        .find(|v| *v == trimmed)
+    {
+        return found;
+    }
+    SCREENSAVER_TIMEOUTS
+        .iter()
+        .copied()
+        .find(|v| *v == trimmed)
+        .unwrap_or(DEFAULT_SCREENSAVER_TIMEOUT)
 }
 
 fn normalize_button_layout(value: &str) -> &'static str {

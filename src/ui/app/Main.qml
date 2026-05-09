@@ -558,6 +558,11 @@ MainLayout {
     function _completeTransition(screen: string): void {
         root.pendingTransition = "";
         root._goto(screen);
+        // Restart the idle countdown so the screensaver gate (which
+        // skips activation while a transition is in flight) does not
+        // leave the timer dead after the gate opens. No-op when the
+        // screensaver setting is "off".
+        root._resetIdle();
     }
 
     Connections {
@@ -996,6 +1001,8 @@ MainLayout {
             Browse.Settings.set_button_layout(selectedId)
         else if (fieldId === "resolution")
             Browse.Settings.set_resolution(selectedId)
+        else if (fieldId === "screensaverTimeout")
+            Browse.Settings.set_screensaver_timeout(selectedId)
         root.closeListPickerModal()
     }
     onListPickerCloseRequested: root.closeListPickerModal()
@@ -1021,6 +1028,11 @@ MainLayout {
             // hub is paintable. _maybeOpenCommercialNotice early-returns
             // until bootComplete is true, so this is the natural edge.
             root._maybeOpenCommercialNotice();
+            // The screensaver gate also early-returns until bootComplete
+            // — restart the idle countdown so the timer fires again on
+            // the post-boot quiet period. No-op when the setting is
+            // "off".
+            root._resetIdle();
         }
     }
 
@@ -1088,6 +1100,12 @@ MainLayout {
     // codes via Browse.Input.action_for_key) and directly from tests.
     // Dispatches to the top modal if any, otherwise the active screen.
     function handleAction(action: string): void {
+        // Screensaver eats the first input cleanly: dismiss the
+        // overlay and DO NOT forward the press anywhere. The next
+        // press goes through the normal routing below.
+        if (root._maybeDismissScreensaver())
+            return;
+        root._resetIdle();
         // Input gate. While a forward transition is in flight, swallow
         // every press so a user mashing buttons during the loading
         // wait can't queue a second transition or kick a half-cancel
@@ -1202,11 +1220,122 @@ MainLayout {
     // on offscreen windows reliably). Fires the action immediately, then
     // arms the dpad-repeat state machine.
     function handleKey(key: int): void {
+        // Screensaver swallows raw key events ahead of the action map,
+        // so the dismissing key is never armed for repeat.
+        if (root._maybeDismissScreensaver())
+            return;
         const action = Browse.Input.action_for_key(key);
         if (action === "")
             return;
         root.handleAction(action);
         root._armRepeat(action, key);
+    }
+
+    // Screen-burn protection. After `_idleScreensaverMs` of input
+    // silence (key, gamepad, mouse motion or click) the launcher
+    // captures the live scene with an 80%-black scrim baked in once
+    // and bounces a copy of the brand mark across the window. Any
+    // further input dismisses the overlay; the dismissing press is
+    // eaten so the user does not accidentally navigate. The active
+    // flag is in-memory only; the timeout itself is persisted
+    // through `Browse.Settings.current_screensaver_timeout` (values
+    // are seconds as strings, with "off" disabling the feature).
+    readonly property int _idleScreensaverMs: {
+        const v = Browse.Settings.current_screensaver_timeout;
+        if (!v || v === "off")
+            return 0;
+        const n = parseInt(v, 10);
+        return Number.isFinite(n) && n > 0 ? n * 1000 : 0;
+    }
+
+    on_IdleScreensaverMsChanged: {
+        idleTimer.stop();
+        if (root._idleScreensaverMs <= 0) {
+            // Switching to "off" while the screensaver is up should
+            // tear it down right away — leaving the user staring at a
+            // bouncing logo after they explicitly disabled the feature
+            // would be confusing.
+            if (screensaverOverlay.armed)
+                screensaverOverlay.deactivate();
+            return;
+        }
+        idleTimer.start();
+    }
+
+    function _resetIdle(): void {
+        if (root._idleScreensaverMs <= 0) {
+            idleTimer.stop();
+            return;
+        }
+        idleTimer.restart();
+    }
+
+    function _maybeDismissScreensaver(): bool {
+        if (!screensaverOverlay.armed)
+            return false;
+        screensaverOverlay.deactivate();
+        // A held key dismissed mid-repeat would otherwise keep ticking
+        // against an empty target screen.
+        root._stopRepeat();
+        idleTimer.restart();
+        return true;
+    }
+
+    function _activateScreensaver(): void {
+        if (screensaverOverlay.armed)
+            return;
+        // Skip while the cold-launch curtain is up or a forward
+        // transition is in flight: the BootOverlay and the transition
+        // "Loading…" cue are not screen-burn targets, and a screensaver
+        // arm during them would race the user-visible animation.
+        // `_maybeCompleteBoot` and `_completeTransition` call
+        // `_resetIdle()` so the countdown restarts cleanly the moment
+        // the gate clears.
+        if (!root.bootComplete || root.pendingTransition !== "")
+            return;
+        const lg = root.headerBar.logoItem;
+        if (!lg)
+            return;
+        const pt = lg.mapToItem(root.scene, 0, 0);
+        // PreserveAspectFit means the painted region is narrower than
+        // the Image item; using painted{Width,Height} starts the copy
+        // flush with the visible logo rather than the Image's full
+        // bounding box.
+        const w = lg.paintedWidth > 0 ? lg.paintedWidth : lg.width;
+        const h = lg.paintedHeight > 0 ? lg.paintedHeight : lg.height;
+        screensaverOverlay.activate("qrc:/qt/qml/Zaparoo/App/resources/images/logo.png", Qt.rect(pt.x, pt.y, w, h));
+    }
+
+    Timer {
+        id: idleTimer
+        interval: root._idleScreensaverMs > 0 ? root._idleScreensaverMs : 60000
+        repeat: false
+        running: root._idleScreensaverMs > 0
+        onTriggered: root._activateScreensaver()
+    }
+
+    Connections {
+        target: screensaverOverlay
+        function onUserDismissed(): void {
+            root._maybeDismissScreensaver();
+        }
+    }
+
+    // Mouse-motion idle reset. `Qt.NoButton` lets click and release
+    // events fall through to the screensaver overlay's own MouseArea
+    // (when armed) or to whatever clickable sits underneath in normal
+    // operation. `hoverEnabled: true` is what gets us positionChanged
+    // on bare cursor moves without a button being pressed.
+    MouseArea {
+        anchors.fill: parent
+        z: 9001
+        hoverEnabled: true
+        acceptedButtons: Qt.NoButton
+        onPositionChanged: {
+            if (root._maybeDismissScreensaver())
+                return;
+            root._resetIdle();
+        }
     }
 
     // Release handler. Only the key that started the repeat cancels it;
