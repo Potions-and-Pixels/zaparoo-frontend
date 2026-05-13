@@ -40,6 +40,8 @@ MainLayout {
     readonly property string modalLogUpload: "log_upload"
     readonly property string modalQuitConfirm: "quit_confirm"
     readonly property string modalListPicker: "list_picker"
+    readonly property string modalSettingNeedsRestart: "restart_confirm"
+
     // One-shot session flag: the first-run modal is shown at most
     // once per launcher process, even if the WS link drops and the
     // mediadb-empty condition would otherwise be satisfied again.
@@ -963,6 +965,9 @@ MainLayout {
     onCloseQuitConfirmRequested: root.closeQuitConfirmModal()
     onQuitConfirmAccepted: Qt.quit()
 
+    onAcceptRestart: root.restartApp()
+    onCancelRestart: root.closeSettingNeedsRestartModal()
+
     // List-picker lifecycle. Settings screens emit requestListPicker
     // with a fieldId that round-trips through the modal so the accept
     // handler can dispatch the chosen id back to the matching
@@ -987,6 +992,22 @@ MainLayout {
             ScreenManager.popModal();
     }
 
+    function openSettingNeedsRestartModal(): void {
+        root.settingNeedsRestartModalVisible = true;
+        if (ScreenManager.topModal !== root.modalSettingNeedsRestart)
+            ScreenManager.pushModal(root.modalSettingNeedsRestart);
+    }
+
+    function closeSettingNeedsRestartModal(): void {
+        root.settingNeedsRestartModalVisible = false;
+        if (ScreenManager.topModal === root.modalSettingNeedsRestart)
+            ScreenManager.popModal();
+    }
+
+    function restartApp() {
+        Qt.exit(1000);
+    }
+
     onListPickerAccepted: (fieldId, selectedId) => {
         if (fieldId === "language")
             Browse.Settings.set_language(selectedId);
@@ -994,9 +1015,11 @@ MainLayout {
             Browse.Settings.set_browse_layout(selectedId);
         else if (fieldId === "buttonLayout")
             Browse.Settings.set_button_layout(selectedId);
-        else if (fieldId === "resolution")
+        else if (fieldId === "resolution") {
             Browse.Settings.set_resolution(selectedId);
-        else if (fieldId === "screensaverTimeout")
+            root.closeListPickerModal();
+            root.openSettingNeedsRestartModal();
+        } else if (fieldId === "screensaverTimeout")
             Browse.Settings.set_screensaver_timeout(selectedId);
         root.closeListPickerModal();
     }
@@ -1135,6 +1158,8 @@ MainLayout {
                 root.logUploadModal.handleAction(action);
             } else if (ScreenManager.topModal === root.modalQuitConfirm) {
                 root.quitConfirmModal.handleAction(action);
+            } else if (ScreenManager.topModal === root.modalSettingNeedsRestart) {
+                root.settingNeedsRestartModal.handleAction(action);
             } else if (ScreenManager.topModal === root.modalListPicker) {
                 root.listPickerModal.handleAction(action);
             }
@@ -1485,6 +1510,7 @@ MainLayout {
             // so there's no framebuffer to scrub there. Gate on
             // is_mister to keep the desktop dev-loop free of cosmetic
             // flashes when toggling resolutions for testing.
+            // Edit: not needed anymore with reboot after res change
             if (Browse.Settings.is_mister)
                 root._forceFullRepaint();
         }

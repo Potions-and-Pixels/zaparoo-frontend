@@ -208,6 +208,7 @@ ApplicationWindow {
     property alias firstRunIndexModal: firstRunIndexModal
     property alias logUploadModal: logUploadModal
     property alias quitConfirmModal: quitConfirmModal
+    property alias settingNeedsRestartModal: settingNeedsRestartModal
     property alias listPickerModal: listPickerModal
     property alias headerBar: headerBar
     property alias screensaverOverlay: screensaverOverlay
@@ -226,6 +227,7 @@ ApplicationWindow {
     property bool logUploadModalVisible: false
     property bool quitConfirmModalVisible: false
     property bool listPickerModalVisible: false
+    property bool settingNeedsRestartModalVisible: false
     // Round-trip state for the list picker. The router writes these
     // when opening the modal (Settings emits requestListPicker with
     // fieldId so the accept handler can dispatch back to the right
@@ -291,6 +293,8 @@ ApplicationWindow {
     signal quitConfirmAccepted
     signal listPickerAccepted(string fieldId, string selectedId)
     signal listPickerCloseRequested(string fieldId)
+    signal acceptRestart
+    signal cancelRestart
 
     // Two-way sync between root.activeScreen and ScreenManager.activeScreen.
     // Binding-breaking assignments (tests setting root.activeScreen = "games")
@@ -518,6 +522,19 @@ ApplicationWindow {
             onCancelRequested: root.cancelCardWriteRequested()
         }
 
+        // ── Setting restart prompt modal ────────────────────────────────────────────────────
+
+        Modal {
+            id: settingNeedsRestartModal
+
+            open: root.settingNeedsRestartModalVisible
+            kind: "confirm"
+            title: qsTr("Quit and restart Zaparoo Launcher?")
+            body: qsTr("In order to apply this setting we need to restart the launcher.")
+            onConfirmed: root.acceptRestart()
+            onCancelRequested: root.cancelRestart()
+        }
+
         ContextMenu {
             id: contextMenu
 
@@ -720,22 +737,7 @@ ApplicationWindow {
                             label: qsTr("I understand")
                         }
                     ];
-                if (root.quitConfirmModalVisible)
-                    return [
-                        {
-                            button: "Dpad",
-                            label: qsTr("Move")
-                        },
-                        {
-                            button: "ButtonA",
-                            label: qsTr("Select")
-                        },
-                        {
-                            button: "ButtonB",
-                            label: qsTr("Cancel")
-                        }
-                    ];
-                if (root.listPickerModalVisible)
+                if (root.quitConfirmModalVisible || root.settingNeedsRestartModalVisible || root.listPickerModalVisible)
                     return [
                         {
                             button: "Dpad",

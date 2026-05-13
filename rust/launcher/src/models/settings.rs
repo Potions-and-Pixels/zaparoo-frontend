@@ -211,13 +211,15 @@ impl ffi::Settings {
         let value_str = value.to_string();
         // Persist before `vmode` so a runtime fault mid-switch still
         // leaves the session/state snapshot coherent for the next run.
-        persist_settings(|s| s.resolution.clone_from(&value_str));
+        let snapshot = persist_settings(|s| s.resolution.clone_from(&value_str));
+        mirror_settings_to_config(&config_file_path(), &snapshot.settings);
         // Apply the framebuffer change *before* notifying QML. `vmode`
         // swaps the linuxfb mode in place and leaves stale pixels in
         // any region Qt's dirty tracker doesn't already know about; the
         // QML side hooks `current_resolution_changed` to scrub them
         // with a one-frame full-screen repaint, which only works if
         // vmode has already finished by the time the signal fires.
+        // Runtime disabled code:
         if let Some((w, h)) = mister_runtime::parse_resolution(&value_str) {
             mister_runtime::run_vmode(w, h);
         }
