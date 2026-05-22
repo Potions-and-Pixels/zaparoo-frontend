@@ -34,6 +34,7 @@ MainLayout {
 
     readonly property string modalCardWrite: "card_write"
     readonly property string modalContextMenu: "context_menu"
+    readonly property string modalGameInfo: "game_info"
     readonly property string modalQrCode: "qr_code"
     readonly property string modalCommercialNotice: "commercial_notice"
     readonly property string modalFirstRunIndex: "first_run_index"
@@ -704,6 +705,7 @@ MainLayout {
     onActiveCardWritePendingChanged: root.handleCardWriteStatus()
     onActiveCardWriteErrorChanged: root.handleCardWriteStatus()
     onCancelCardWriteRequested: root.cancelCardWrite()
+    onCloseGameInfoRequested: root.closeGameInfoModal()
     onCloseQrCodeRequested: root.closeQrCodeModal()
     onContextMenuCloseRequested: root.handleContextMenuCloseRequested()
     onContextMenuAccepted: id => root.handleContextMenuAccepted(id)
@@ -769,12 +771,11 @@ MainLayout {
         if (owner === "games" || owner === "favorites") {
             if (entryType === "directory" || entryType === "root")
                 return [];
-            const entries = [
-                {
-                    id: "toggle_favorite",
-                    label: isFavorite ? qsTr("Remove from favorites") : qsTr("Add to favorites")
-                }
-            ];
+            const entries = [];
+            entries.push({
+                id: "toggle_favorite",
+                label: isFavorite ? qsTr("Remove from favorites") : qsTr("Add to favorites")
+            });
             if (hasNfc)
                 entries.push({
                     id: "write_card",
@@ -940,6 +941,8 @@ MainLayout {
                 Browse.GamesModel.toggle_favorite_at(targetIndex);
             else if (owner === "favorites")
                 Browse.FavoritesModel.toggle_favorite_at(targetIndex);
+        } else if (id === "more_info") {
+            root.openGameInfo(owner, targetIndex);
         } else if (id === "write_card") {
             if (owner === "systems") {
                 root.beginCardWrite("systems");
@@ -960,6 +963,38 @@ MainLayout {
         } else if (id === "discover_unavailable" || id === "discover_loading") {
             return;
         }
+    }
+
+    function openGameInfo(owner: string, index: int): void {
+        let systemId = "";
+        let path = "";
+        let title = "";
+        if (owner === "games") {
+            systemId = Browse.GamesModel.system_id_at(index);
+            path = Browse.GamesModel.path_at(index);
+            title = Browse.GamesModel.name_at(index);
+        } else if (owner === "favorites") {
+            systemId = Browse.FavoritesModel.system_id_at(index);
+            path = Browse.FavoritesModel.path_at(index);
+            title = Browse.FavoritesModel.name_at(index);
+        } else if (owner === "recents") {
+            systemId = Browse.RecentsModel.system_id_at(index);
+            path = Browse.RecentsModel.path_at(index);
+            title = Browse.RecentsModel.name_at(index);
+        }
+        if (systemId === "" || path === "")
+            return;
+        Browse.GameInfo.load(systemId, path, title);
+        root.gameInfoModalVisible = true;
+        if (ScreenManager.topModal !== root.modalGameInfo)
+            ScreenManager.pushModal(root.modalGameInfo);
+    }
+
+    function closeGameInfoModal(): void {
+        root.gameInfoModalVisible = false;
+        Browse.GameInfo.clear();
+        if (ScreenManager.topModal === root.modalGameInfo)
+            ScreenManager.popModal();
     }
 
     function openQrCodeModal(): void {
@@ -1300,6 +1335,8 @@ MainLayout {
                 root.cancelCardWrite();
             } else if (ScreenManager.topModal === root.modalQrCode && action === "cancel") {
                 root.closeQrCodeModal();
+            } else if (ScreenManager.topModal === root.modalGameInfo) {
+                root.gameInfoModal.handleAction(action);
             } else if (ScreenManager.topModal === root.modalContextMenu) {
                 root.contextMenu.handleAction(action);
             } else if (ScreenManager.topModal === root.modalFirstRunIndex) {

@@ -425,6 +425,13 @@ TestCase {
     // qmllint enable compiler
     }
 
+    function test_context_menu_recents_omits_more_info(): void {
+        // qmllint disable compiler
+        const entries = main.buildContextMenuEntries("recents", "", false, false);
+        compare(_idsOf(entries), ["launch_game"]);
+    // qmllint enable compiler
+    }
+
     function test_context_menu_games_favorite_label_toggles(): void {
         // qmllint disable compiler
         const addEntries = main.buildContextMenuEntries("games", "media", false, false);

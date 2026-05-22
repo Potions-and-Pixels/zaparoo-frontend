@@ -39,6 +39,7 @@ Item {
     readonly property bool _listLayout: Browse.Settings.current_browse_layout === "list"
     readonly property bool _crtGridLayout: Theme.crtNativePath && !systems._listLayout
     readonly property var _tileLayout: systems._crtGridLayout ? BrowseLayouts.crtTile : BrowseLayouts.defaultTile
+    readonly property int _listOverlayBottomMargin: Sizing.pctH(6) + systems._tileLayout.activeLabelBottomMargin + systems._tileLayout.activeLabelHeight
 
     signal requestAccept(systemId: string)
     signal requestHubScreen
@@ -148,7 +149,7 @@ Item {
             if (systems.systemsGrid.itemCount > 0) {
                 const idx = systems.systemsGrid.currentIndex;
                 Browse.SystemsState.system_id = Browse.SystemsModel.system_id_at(idx);
-                systems.requestContextMenu(idx, systems._listLayout ? systemsList.currentCellRectIn(systems) : systems.systemsGrid.currentCellRectIn(systems));
+                systems.requestContextMenu(idx, systems._listLayout ? listCard.currentCellRectIn(systems) : systems.systemsGrid.currentCellRectIn(systems));
             }
         } else if (action === "cancel") {
             systems.requestHubScreen();
@@ -181,23 +182,32 @@ Item {
         title: systems._tileLayout.showHeaderTitleInHeader ? "" : Browse.SystemsModel.current_category
         currentPage: systemsGrid.currentPage
         totalPages: systems._tileLayout.showBottomStatusRow ? 1 : Math.max(1, Math.ceil(Browse.SystemsModel.count / systemsGrid.pageSize))
-        totalText: systems._tileLayout.showBottomStatusRow ? "" : (Browse.SystemsModel.count > 0 ? qsTr("%1 systems").arg(Browse.SystemsModel.count) : "")
+        totalText: systems._listLayout || systems._tileLayout.showBottomStatusRow ? "" : (Browse.SystemsModel.count > 0 ? qsTr("%1 systems").arg(Browse.SystemsModel.count) : "")
+        rightTextOverride: {
+            if (!systems._listLayout || systemsGrid.itemCount <= 0)
+                return "";
+            return qsTr("%1 / %2").arg(systemsGrid.currentIndex + 1).arg(Math.max(1, Browse.SystemsModel.count));
+        }
         visible: !systems.transitioning && systems._tileLayout.showTopStrip
     }
 
-    BrowseList {
-        id: systemsList
+    BrowseListDetailView {
+        id: listCard
 
         visible: !systems.transitioning && systems._listLayout
         anchors.left: parent.left
         anchors.leftMargin: Sizing.pctW(5)
+        anchors.right: parent.right
+        anchors.rightMargin: Sizing.pctW(5)
         anchors.top: topStrip.bottom
         anchors.topMargin: Sizing.pctH(2)
         anchors.bottom: parent.bottom
         anchors.bottomMargin: Sizing.pctH(8)
-        width: Sizing.pctW(45)
         model: Browse.SystemsModel
         currentIndex: systemsGrid.currentIndex
+        detailTitle: listCard.currentName
+        detailCoverKey: listCard.currentCoverKey
+        detailTags: Browse.SystemsModel.count > 0 ? Browse.SystemsModel.detail_tags_at(systemsGrid.currentIndex) : ""
         onItemHovered: index => systems._focusIndex(index)
         onItemClicked: index => {
             systems._focusIndex(index);
@@ -209,18 +219,6 @@ Item {
         }
         onEmptyRightClicked: systems.handleAction("cancel")
         onPageWheelRequested: delta => systems.handleAction(delta > 0 ? "page_next" : "page_prev")
-    }
-
-    BrowseDetailPane {
-        visible: !systems.transitioning && systems._listLayout
-        anchors.left: systemsList.right
-        anchors.leftMargin: Sizing.pctW(5)
-        anchors.right: parent.right
-        anchors.rightMargin: Sizing.pctW(5)
-        anchors.top: systemsList.top
-        anchors.bottom: systemsList.bottom
-        title: systemsList.currentName
-        coverKey: systemsList.currentCoverKey
     }
 
     // Grid fills the safe zone between the top strip and the active
@@ -309,10 +307,10 @@ Item {
     }
 
     ScreenStateOverlay {
-        x: (systems._listLayout ? systemsList.x : systemsGrid.x) + Sizing.center(systems._listLayout ? systemsList.width : systemsGrid.width, width)
-        y: (systems._listLayout ? systemsList.y : systemsGrid.y) + Sizing.center(systems._listLayout ? systemsList.height : systemsGrid.height, height)
-        width: systems._listLayout ? systemsList.width : systemsGrid.width
-        height: systems._listLayout ? systemsList.height : systemsGrid.height
+        x: systems._listLayout ? 0 : systemsGrid.x
+        y: systems._listLayout ? listCard.y : systemsGrid.y
+        width: systems._listLayout ? systems.width : systemsGrid.width
+        height: systems._listLayout ? Math.max(0, systems.height - listCard.y - systems._listOverlayBottomMargin) : systemsGrid.height
         loading: Browse.SystemsModel.loading
         errorMessage: Browse.SystemsModel.error_message ?? ""
         count: Browse.SystemsModel.count

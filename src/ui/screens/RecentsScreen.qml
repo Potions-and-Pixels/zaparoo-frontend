@@ -38,6 +38,7 @@ Item {
     // hides while a modal (the context menu) is on top of the stack.
     property bool gridFocused: true
     readonly property bool _listLayout: Browse.Settings.current_browse_layout === "list"
+    readonly property int _listOverlayBottomMargin: Sizing.pctH(15)
 
     // True while either the cross-screen router is mid-flip
     // (`transitioning`) or the in-screen cover gate is holding
@@ -46,6 +47,7 @@ Item {
     // during cold-launch / model-reset, matching `GamesScreen.qml`.
     // Pagination uses a separate `loading_more` flag and is unaffected.
     readonly property bool _gateHide: recents.transitioning || Browse.RecentsModel.loading
+    property string _detailRequestKey: ""
 
     signal requestHubScreen
     signal requestContextMenu(int index, var anchorRect)
@@ -86,6 +88,31 @@ Item {
             return;
         recents.recentsGrid.currentIndex = index;
         recents._persistFocus();
+    }
+
+    function _selectedDetailKey(): string {
+        if (recents.recentsGrid.itemCount <= 0)
+            return "";
+        const idx = recentsGrid.currentIndex;
+        const systemId = Browse.RecentsModel.system_id_at(idx);
+        const path = Browse.RecentsModel.path_at(idx);
+        return systemId !== "" && path !== "" ? systemId + "\n" + path : "";
+    }
+
+    function _scheduleDetailLoad(): void {
+        if (!recents._listLayout)
+            return;
+        const key = recents._selectedDetailKey();
+        if (key === "" || key === recents._detailRequestKey)
+            return;
+        recents._detailRequestKey = key;
+        detailLoadDebounce.restart();
+    }
+
+    function _loadSelectedDetail(): void {
+        if (!recents._listLayout || recents.recentsGrid.itemCount <= 0)
+            return;
+        Browse.RecentsModel.load_detail_at(recentsGrid.currentIndex);
     }
 
     function _performLinearMove(delta: int): void {
@@ -158,7 +185,7 @@ Item {
             if (recents.recentsGrid.itemCount > 0) {
                 const idx = recents.recentsGrid.currentIndex;
                 recents._persistFocus();
-                const rect = recents._listLayout ? recentsList.currentCellRectIn(recents) : recents.recentsGrid.currentCellRectIn(recents);
+                const rect = recents._listLayout ? listCard.currentCellRectIn(recents) : recents.recentsGrid.currentCellRectIn(recents);
                 recents.requestContextMenu(idx, rect);
             }
         } else if (action === "cancel") {
@@ -167,6 +194,22 @@ Item {
     }
 
     // ── Visual tree ───────────────────────────────────────────────────────────
+
+    Timer {
+        id: detailLoadDebounce
+        interval: 220
+        repeat: false
+        onTriggered: recents._loadSelectedDetail()
+    }
+
+    Connections {
+        target: Browse.RecentsModel
+        function onCountChanged(): void {
+            if (Browse.RecentsModel.current_detail_tags === "")
+                recents._detailRequestKey = "";
+            recents._scheduleDetailLoad();
+        }
+    }
 
     // Top status strip — page counter, screen title, total entries.
     // The total badge reads `count` directly: history is a flat list,
@@ -183,41 +226,50 @@ Item {
         title: qsTr("Recently Played")
         currentPage: recentsGrid.currentPage
         totalPages: Math.max(1, Math.ceil(Browse.RecentsModel.count / recentsGrid.pageSize))
-        totalText: Browse.RecentsModel.count > 0 ? qsTr("%1 entries").arg(Browse.RecentsModel.count) : ""
+        totalText: recents._listLayout ? "" : (Browse.RecentsModel.count > 0 ? qsTr("%1 entries").arg(Browse.RecentsModel.count) : "")
+        rightTextOverride: {
+            if (!recents._listLayout || recentsGrid.itemCount <= 0)
+                return "";
+            return qsTr("%1 / %2").arg(recentsGrid.currentIndex + 1).arg(Math.max(1, Browse.RecentsModel.count));
+        }
     }
 
-    BrowseList {
-        id: recentsList
+    BrowseListDetailView {
+        id: listCard
 
         visible: !recents._gateHide && recents._listLayout
         anchors.left: parent.left
         anchors.leftMargin: Sizing.pctW(5)
+        anchors.right: parent.right
+        anchors.rightMargin: Sizing.pctW(5)
         anchors.top: topStrip.bottom
         anchors.topMargin: Sizing.pctH(2)
         anchors.bottom: parent.bottom
         anchors.bottomMargin: Sizing.pctH(8)
-        width: Sizing.pctW(45)
         model: Browse.RecentsModel
         currentIndex: recentsGrid.currentIndex
+        detailTitle: listCard.currentName
+        detailCoverKey: Browse.RecentsModel.current_detail_image_key !== "" ? Browse.RecentsModel.current_detail_image_key : listCard.currentCoverKey
+        detailTags: Browse.RecentsModel.current_detail_tags
         onItemHovered: index => recents._focusIndex(index)
         onItemClicked: index => {
             recents._focusIndex(index);
             recents.handleAction("accept");
         }
+        onItemRightClicked: index => {
+            recents._focusIndex(index);
+            recents.handleAction("write_card");
+        }
         onEmptyRightClicked: recents.handleAction("cancel")
         onPageWheelRequested: delta => recents.handleAction(delta > 0 ? "page_next" : "page_prev")
-    }
-
-    BrowseDetailPane {
-        visible: !recents._gateHide && recents._listLayout
-        anchors.left: recentsList.right
-        anchors.leftMargin: Sizing.pctW(5)
-        anchors.right: parent.right
-        anchors.rightMargin: Sizing.pctW(5)
-        anchors.top: recentsList.top
-        anchors.bottom: recentsList.bottom
-        title: recentsList.currentName
-        coverKey: recentsList.currentCoverKey
+        onVisibleChanged: {
+            if (visible)
+                recents._scheduleDetailLoad();
+            else {
+                recents._detailRequestKey = "";
+                Browse.RecentsModel.clear_current_detail();
+            }
+        }
     }
 
     PagedGrid {
@@ -242,7 +294,10 @@ Item {
         columnsOverride: Sizing.gamesGridColumns
         rowsOverride: Sizing.gamesGridRows
         onLoadMoreRequested: Browse.RecentsModel.fetch_more()
-        onCurrentIndexChanged: recents._persistFocus()
+        onCurrentIndexChanged: {
+            recents._persistFocus();
+            recents._scheduleDetailLoad();
+        }
         onItemHovered: index => recents._focusIndex(index)
         onItemClicked: index => {
             recents._focusIndex(index);
@@ -271,10 +326,10 @@ Item {
     }
 
     ScreenStateOverlay {
-        x: (recents._listLayout ? recentsList.x : recentsGrid.x) + Sizing.center(recents._listLayout ? recentsList.width : recentsGrid.width, width)
-        y: (recents._listLayout ? recentsList.y : recentsGrid.y) + Sizing.center(recents._listLayout ? recentsList.height : recentsGrid.height, height)
-        width: recents._listLayout ? recentsList.width : recentsGrid.width
-        height: recents._listLayout ? recentsList.height : recentsGrid.height
+        x: recents._listLayout ? 0 : recentsGrid.x
+        y: recents._listLayout ? listCard.y : recentsGrid.y
+        width: recents._listLayout ? recents.width : recentsGrid.width
+        height: recents._listLayout ? Math.max(0, recents.height - listCard.y - recents._listOverlayBottomMargin) : recentsGrid.height
         loading: Browse.RecentsModel.loading
         errorMessage: Browse.RecentsModel.error_message ?? ""
         count: Browse.RecentsModel.count

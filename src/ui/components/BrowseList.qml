@@ -16,12 +16,16 @@ Item {
     property int totalItemsOverride: -1
     property int targetVisibleRowCount: 0
     property bool showFileStem: false
+    property bool showChrome: true
     readonly property int itemCount: listView.count
     readonly property int totalItems: totalItemsOverride >= 0 ? totalItemsOverride : itemCount
+    readonly property int cardPaddingX: Sizing.pctW(2)
+    readonly property int cardPaddingY: Sizing.pctH(2)
     readonly property int rowSpacing: Sizing.pctH(0.7)
-    readonly property int rowHeight: targetVisibleRowCount > 0 ? Math.max(Sizing.pctH(3), Math.floor((height - (rowSpacing * (targetVisibleRowCount - 1))) / targetVisibleRowCount)) : Sizing.pctH(6)
+    readonly property int contentHeight: Math.max(0, height - (2 * cardPaddingY))
+    readonly property int rowHeight: targetVisibleRowCount > 0 ? Math.max(Sizing.pctH(3), Math.floor((contentHeight - (rowSpacing * (targetVisibleRowCount - 1))) / targetVisibleRowCount)) : Sizing.pctH(6)
     readonly property int rowStride: rowHeight + rowSpacing
-    readonly property int visibleRowCount: targetVisibleRowCount > 0 ? targetVisibleRowCount : Math.max(1, Math.floor((height + rowSpacing) / rowStride))
+    readonly property int visibleRowCount: targetVisibleRowCount > 0 ? targetVisibleRowCount : Math.max(1, Math.floor((contentHeight + rowSpacing) / rowStride))
     readonly property int _centerSlot: Math.max(0, Math.floor((visibleRowCount - 1) / 2))
     readonly property int _maxViewTopIndex: Math.max(0, itemCount - visibleRowCount)
     readonly property int _viewTopIndex: Math.max(0, Math.min(_maxViewTopIndex, currentIndex - _centerSlot))
@@ -56,6 +60,15 @@ Item {
 
     clip: true
 
+    Rectangle {
+        anchors.fill: parent
+        color: Theme.surfaceCard
+        border.width: Sizing.stroke(1)
+        border.color: Theme.borderMid
+        radius: Sizing.cornerRadius
+        visible: root.showChrome
+    }
+
     onItemCountChanged: {
         if (root.itemCount === 0) {
             root.currentName = "";
@@ -74,10 +87,13 @@ Item {
         id: listView
 
         anchors.left: parent.left
+        anchors.leftMargin: root.cardPaddingX
         anchors.top: parent.top
+        anchors.topMargin: root.cardPaddingY
         anchors.bottom: parent.bottom
+        anchors.bottomMargin: root.cardPaddingY
         anchors.right: parent.right
-        anchors.rightMargin: root.totalItems > root.visibleRowCount ? root._gutterWidth + root._gutterGap : 0
+        anchors.rightMargin: root.totalItems > root.visibleRowCount ? root._gutterWidth + root._gutterGap + root.cardPaddingX : root.cardPaddingX
         model: root.model
         currentIndex: root.currentIndex
         contentY: Math.min(root._targetContentY, Math.max(0, contentHeight - height))
@@ -116,10 +132,23 @@ Item {
                 restoreMode: Binding.RestoreNone
             }
 
-            Rectangle {
+            Item {
                 anchors.fill: parent
-                color: row.selected ? Theme.surfaceCard : "transparent"
-                radius: Math.max(0, Sizing.px(Sizing.cornerRadius / 3))
+                visible: row.selected
+
+                Rectangle {
+                    anchors.fill: parent
+                    color: Theme.selectionSurface
+                    radius: Sizing.cornerRadius
+                }
+
+                Rectangle {
+                    anchors.left: parent.left
+                    anchors.top: parent.top
+                    anchors.bottom: parent.bottom
+                    width: Sizing.cornerRadius
+                    color: Theme.selectionSurface
+                }
             }
 
             Rectangle {
@@ -127,7 +156,7 @@ Item {
                 anchors.top: parent.top
                 anchors.bottom: parent.bottom
                 width: Sizing.pctW(0.45)
-                color: Theme.textPrimary
+                color: Theme.accent
                 visible: row.selected
                 radius: Math.max(0, Sizing.px(width / 3))
             }
@@ -185,8 +214,11 @@ Item {
         id: scrollGutter
 
         anchors.right: parent.right
+        anchors.rightMargin: root.cardPaddingX
         anchors.top: parent.top
+        anchors.topMargin: root.cardPaddingY
         anchors.bottom: parent.bottom
+        anchors.bottomMargin: root.cardPaddingY
         width: root._gutterWidth
         visible: root.totalItems > root.visibleRowCount
 

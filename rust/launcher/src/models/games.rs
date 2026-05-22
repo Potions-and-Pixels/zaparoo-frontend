@@ -36,7 +36,7 @@ use cxx_qt::{CxxQtType, Threading};
 use cxx_qt_lib::{
     QByteArray, QHash, QHashPair_i32_QByteArray, QList, QModelIndex, QString, QVariant,
 };
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -50,8 +50,8 @@ use zaparoo_core::endpoints::media_tags_update::MediaTagsUpdateMutation;
 use zaparoo_core::endpoints::readers_write::ReadersWriteMutation;
 use zaparoo_core::endpoints::run::RunMutation;
 use zaparoo_core::media_types::{
-    BrowseEntry, MediaBrowseParams, MediaBrowseResult, MediaMeta, MediaMetaParams,
-    MediaTagsUpdateParams, ReadersWriteParams, RunParams, TagInfo,
+    BrowseEntry, MediaBrowseParams, MediaBrowseResult, MediaTagsUpdateParams, ReadersWriteParams,
+    RunParams, TagInfo,
 };
 use zaparoo_core::platform::{self, Platform};
 use zaparoo_core::remote_resource::ResourceStatus;
@@ -78,15 +78,6 @@ const FILE_STEM_ROLE: i32 = 256 + 10;
 // test harness sees this until it overrides explicitly. Server cap is
 // 1000; grid page sizes top out at ~30 so we stay well inside bounds.
 const DEFAULT_PAGE_SIZE: i32 = 15;
-const DETAIL_METADATA_CACHE_CAP: usize = 256;
-
-#[derive(Clone)]
-struct DetailMetadata {
-    description: String,
-    tags: String,
-    image_keys: Vec<MediaKey>,
-}
-
 // `media.browse` `max_results` for cursor follow-ups. Held separate
 // from `page_size` (which dictates grid layout, scroll-thumb sizing,
 // and the initial-page cover gate) so wire chunks can be larger than a
@@ -161,14 +152,14 @@ pub struct GamesModelRust {
     card_write_error: QString,
     current_description: QString,
     current_detail_tags: QString,
+    current_detail_loading: bool,
     current_detail_image_key: QString,
     current_detail_image_index: i32,
     current_detail_image_count: i32,
     current_detail_image_can_prev: bool,
     current_detail_image_can_next: bool,
+    cover_key_roles_enabled: bool,
     detail_image_keys: Vec<MediaKey>,
-    detail_metadata_cache: HashMap<MediaKey, DetailMetadata>,
-    detail_metadata_lru: VecDeque<MediaKey>,
     // Watcher for the current initial-page subscription. Aborted on
     // every path swap so the prior watcher stops enqueuing callbacks
     // for the old `BrowseArgs`. Callbacks already in the Qt queue are
@@ -263,14 +254,14 @@ impl Default for GamesModelRust {
             card_write_error: QString::default(),
             current_description: QString::default(),
             current_detail_tags: QString::default(),
+            current_detail_loading: false,
             current_detail_image_key: QString::default(),
             current_detail_image_index: 0,
             current_detail_image_count: 0,
             current_detail_image_can_prev: false,
             current_detail_image_can_next: false,
+            cover_key_roles_enabled: true,
             detail_image_keys: Vec::new(),
-            detail_metadata_cache: HashMap::new(),
-            detail_metadata_lru: VecDeque::new(),
             watcher: None,
             seq: Arc::new(AtomicU64::new(0)),
             auto_nav_eligible: false,
@@ -323,11 +314,13 @@ pub mod ffi {
         #[qproperty(QString, card_write_error)]
         #[qproperty(QString, current_description)]
         #[qproperty(QString, current_detail_tags)]
+        #[qproperty(bool, current_detail_loading)]
         #[qproperty(QString, current_detail_image_key)]
         #[qproperty(i32, current_detail_image_index)]
         #[qproperty(i32, current_detail_image_count)]
         #[qproperty(bool, current_detail_image_can_prev)]
         #[qproperty(bool, current_detail_image_can_next)]
+        #[qproperty(bool, cover_key_roles_enabled)]
         #[qproperty(i32, visible_first_row)]
         type GamesModel = super::GamesModelRust;
 
@@ -457,7 +450,12 @@ impl ffi::GamesModel {
             ZAP_SCRIPT_ROLE => QVariant::from(&QString::from(entry.zap_script.as_str())),
             SYSTEM_ID_ROLE => QVariant::from(&QString::from(entry_system_id(entry).as_str())),
             COVER_KEY_ROLE => QVariant::from(&QString::from(
-                cover_key_for(entry, u32::try_from(self.page_size.max(1)).unwrap_or(1)).as_str(),
+                if self.cover_key_roles_enabled {
+                    cover_key_for(entry, u32::try_from(self.page_size.max(1)).unwrap_or(1))
+                } else {
+                    cover_placeholder_for(entry)
+                }
+                .as_str(),
             )),
             ENTRY_TYPE_ROLE => QVariant::from(&QString::from(entry.entry_type.as_str())),
             FILE_COUNT_ROLE => QVariant::from(&i32::try_from(entry.file_count).unwrap_or(i32::MAX)),
@@ -750,85 +748,33 @@ impl ffi::GamesModel {
             .description_seq
             .fetch_add(1, Ordering::SeqCst);
         if index < 0 || index >= self.count {
+            self.as_mut().set_current_detail_loading(false);
             self.as_mut().set_current_description(QString::default());
             self.as_mut().set_current_detail_tags(QString::default());
             clear_detail_images(self.as_mut());
             return;
         }
+
         let entry = &self.entries[index as usize];
         if entry.is_folder() {
+            self.as_mut().set_current_detail_loading(false);
             self.as_mut().set_current_description(QString::default());
             self.as_mut().set_current_detail_tags(QString::default());
             clear_detail_images(self.as_mut());
             return;
         }
+
         let description = entry.description.clone();
-        let title = entry.name.clone();
-        let system = entry_system_id(entry);
-        let path = entry.path.clone();
-        let filename = file_stem_or_name(&path, &title);
-        if !description.is_empty() {
-            self.as_mut()
-                .set_current_description(QString::from(description.as_str()));
-        }
-        if system.is_empty() || path.is_empty() {
-            self.as_mut().set_current_description(QString::default());
-            self.as_mut().set_current_detail_tags(QString::default());
-            clear_detail_images(self.as_mut());
-            return;
-        }
-        let cache_key = MediaKey::new(system.clone(), path.clone());
-        if let Some(metadata) = detail_metadata_cache_hit(self.as_mut(), &cache_key) {
-            apply_detail_metadata(self.as_mut(), metadata);
-            return;
-        }
-        clear_detail_images(self.as_mut());
-        self.as_mut().set_current_detail_tags(QString::default());
-        if description.is_empty() {
-            self.as_mut().set_current_description(QString::default());
-        }
-        let fallback_description = description;
-        let seq = self.rust().description_seq.clone();
-        let ticket = seq.load(Ordering::SeqCst);
-        let store = global_store();
-        let qt_thread = self.qt_thread();
-        global_handle().spawn(async move {
-            let result = store
-                .client()
-                .media_meta(MediaMetaParams::for_media(system.clone(), path.clone()))
-                .await;
-            let _ = qt_thread.queue(move |mut model| {
-                if seq.load(Ordering::SeqCst) != ticket {
-                    return;
-                }
-                let metadata = match result {
-                    Ok(result) => {
-                        let meta_description = description_from_meta(&result.media);
-                        Some(DetailMetadata {
-                            description: if meta_description.is_empty() {
-                                fallback_description
-                            } else {
-                                meta_description
-                            },
-                            tags: detail_tags_from_meta(&result.media, &title, &filename),
-                            image_keys: detail_image_keys_from_meta(&result.media, &system, &path),
-                        })
-                    }
-                    Err(e) => {
-                        debug!("description fetch failed for {path}: {}", e.message);
-                        None
-                    }
-                };
-                if let Some(metadata) = metadata {
-                    cache_detail_metadata(model.as_mut(), cache_key, metadata.clone());
-                    apply_detail_metadata(model.as_mut(), metadata);
-                } else {
-                    model.as_mut().set_current_description(QString::default());
-                    model.as_mut().set_current_detail_tags(QString::default());
-                    clear_detail_images(model.as_mut());
-                }
-            });
-        });
+        let detail_tags = detail_tags_from_entry(entry);
+        let detail_image_key = media_key_for(entry);
+
+        self.as_mut().set_current_detail_loading(true);
+        self.as_mut()
+            .set_current_description(QString::from(description.as_str()));
+        self.as_mut()
+            .set_current_detail_tags(QString::from(detail_tags.as_str()));
+        set_detail_image_keys(self.as_mut(), detail_image_key);
+        self.as_mut().set_current_detail_loading(false);
     }
 
     fn clear_current_detail(mut self: Pin<&mut Self>) {
@@ -836,6 +782,7 @@ impl ffi::GamesModel {
             .rust_mut()
             .description_seq
             .fetch_add(1, Ordering::SeqCst);
+        self.as_mut().set_current_detail_loading(false);
         self.as_mut().set_current_description(QString::default());
         self.as_mut().set_current_detail_tags(QString::default());
         clear_detail_images(self);
@@ -936,6 +883,7 @@ impl ffi::GamesModel {
         self.as_mut().set_current_path(QString::from(path.as_str()));
         self.as_mut().set_loading(true);
         self.as_mut().set_error_message(QString::default());
+        self.as_mut().set_current_detail_loading(false);
         self.as_mut().set_current_description(QString::default());
         self.as_mut().set_current_detail_tags(QString::default());
         self.as_mut()
@@ -1042,68 +990,49 @@ fn entry_system_id(entry: &BrowseEntry) -> String {
     entry.system_ids.first().cloned().unwrap_or_default()
 }
 
-fn description_from_meta(meta: &MediaMeta) -> String {
-    meta.title
-        .properties
-        .get("property:description")
-        .or_else(|| meta.properties.get("property:description"))
-        .map(|property| property.text.trim().to_string())
-        .filter(|text| !text.is_empty())
-        .unwrap_or_default()
+fn detail_tags_from_entry(entry: &BrowseEntry) -> String {
+    detail_tags_from_tags(entry.tags.as_slice())
 }
 
-fn detail_tags_from_meta<'a>(
-    meta: &'a MediaMeta,
-    fallback_title: &'a str,
-    filename: &'a str,
-) -> String {
-    let source = if meta.title.tags.is_empty() {
-        meta.tags.as_slice()
-    } else {
-        meta.title.tags.as_slice()
-    };
-    let mut rows: Vec<(&str, &str)> = Vec::new();
-    let meta_title = meta.title.name.trim();
-    let title = if meta_title.is_empty() {
-        fallback_title.trim()
-    } else {
-        meta_title
-    };
-    if !title.is_empty() {
-        rows.push(("title", title));
-    }
-    let filename = filename.trim();
-    if !filename.is_empty() {
-        rows.push(("filename", filename));
-    }
-    for tag_type in ["genre", "year", "rating"] {
-        rows.extend(
-            source
-                .iter()
-                .filter(|tag| tag.tag_type == tag_type && !tag.tag.trim().is_empty())
-                .map(|tag| (tag.tag_type.as_str(), tag.tag.trim())),
-        );
-    }
-    rows.extend(
-        source
-            .iter()
-            .filter(|tag| {
-                !matches!(tag.tag_type.as_str(), "genre" | "year" | "rating")
-                    && !tag.tag_type.trim().is_empty()
-                    && !tag.tag.trim().is_empty()
-            })
-            .map(|tag| (tag.tag_type.as_str(), tag.tag.trim())),
-    );
+fn detail_tags_from_tags(source: &[TagInfo]) -> String {
+    let rows = [
+        (
+            "Year",
+            detail_value_for_aliases(source, &["year", "release date", "release_date"]),
+        ),
+        (
+            "Genre",
+            detail_value_for_aliases(source, &["genre", "gamegenre"]),
+        ),
+        ("Players", detail_value_for_aliases(source, &["players"])),
+        (
+            "Developer",
+            detail_value_for_aliases(source, &["developer"]),
+        ),
+        (
+            "Publisher",
+            detail_value_for_aliases(source, &["publisher"]),
+        ),
+        ("Rating", detail_value_for_aliases(source, &["rating"])),
+    ];
     rows.into_iter()
-        .map(|(tag_type, value)| {
-            let mut label = tag_type.to_string();
-            if let Some(first) = label.get_mut(0..1) {
-                first.make_ascii_uppercase();
-            }
-            format!("{label}\t{value}")
-        })
+        .map(|(label, value)| format!("{label}\t{value}"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn detail_value_for_aliases(source: &[TagInfo], aliases: &[&str]) -> String {
+    source
+        .iter()
+        .filter(|tag| {
+            aliases
+                .iter()
+                .any(|alias| tag.tag_type.eq_ignore_ascii_case(alias))
+                && !tag.tag.trim().is_empty()
+        })
+        .map(|tag| tag.tag.trim().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn file_stem_or_name(path: &str, name: &str) -> String {
@@ -1120,79 +1049,6 @@ fn file_stem_or_name(path: &str, name: &str) -> String {
     }
 }
 
-fn detail_metadata_cache_hit(
-    mut model: Pin<&mut ffi::GamesModel>,
-    key: &MediaKey,
-) -> Option<DetailMetadata> {
-    let mut rust = model.as_mut().rust_mut();
-    let metadata = rust.detail_metadata_cache.get(key).cloned();
-    if metadata.is_some() {
-        rust.detail_metadata_lru.retain(|cached| cached != key);
-        rust.detail_metadata_lru.push_back(key.clone());
-    }
-    metadata
-}
-
-fn cache_detail_metadata(
-    mut model: Pin<&mut ffi::GamesModel>,
-    key: MediaKey,
-    metadata: DetailMetadata,
-) {
-    let mut rust = model.as_mut().rust_mut();
-    if rust.detail_metadata_cache.contains_key(&key) {
-        rust.detail_metadata_lru.retain(|cached| cached != &key);
-        rust.detail_metadata_lru.push_back(key.clone());
-    } else {
-        rust.detail_metadata_lru.push_back(key.clone());
-    }
-    rust.detail_metadata_cache.insert(key, metadata);
-    while rust.detail_metadata_lru.len() > DETAIL_METADATA_CACHE_CAP {
-        if let Some(oldest) = rust.detail_metadata_lru.pop_front() {
-            rust.detail_metadata_cache.remove(&oldest);
-        }
-    }
-}
-
-fn apply_detail_metadata(mut model: Pin<&mut ffi::GamesModel>, metadata: DetailMetadata) {
-    model
-        .as_mut()
-        .set_current_description(QString::from(metadata.description.as_str()));
-    model
-        .as_mut()
-        .set_current_detail_tags(QString::from(metadata.tags.as_str()));
-    install_detail_images(model, metadata.image_keys);
-}
-
-fn image_type_from_property_key(key: &str) -> Option<String> {
-    let suffix = key.strip_prefix("property:image")?;
-    if suffix.is_empty() {
-        return Some("image".to_string());
-    }
-    Some(suffix.trim_start_matches('-').to_string()).filter(|image_type| !image_type.is_empty())
-}
-
-fn detail_image_keys_from_meta(meta: &MediaMeta, system: &str, path: &str) -> Vec<MediaKey> {
-    let mut types = BTreeSet::<String>::new();
-    for key in meta
-        .title
-        .properties
-        .keys()
-        .chain(meta.properties.keys())
-        .filter_map(|key| image_type_from_property_key(key))
-    {
-        types.insert(key);
-    }
-    let mut ordered = Vec::new();
-    if types.remove("image") {
-        ordered.push("image".to_string());
-    }
-    ordered.extend(types);
-    ordered
-        .into_iter()
-        .map(|image_type| MediaKey::with_image_type(system, path, image_type))
-        .collect()
-}
-
 fn clear_detail_images(mut model: Pin<&mut ffi::GamesModel>) {
     model.as_mut().rust_mut().detail_image_keys.clear();
     model
@@ -1204,9 +1060,17 @@ fn clear_detail_images(mut model: Pin<&mut ffi::GamesModel>) {
     model.as_mut().set_current_detail_image_can_next(false);
 }
 
-fn install_detail_images(mut model: Pin<&mut ffi::GamesModel>, keys: Vec<MediaKey>) {
-    model.as_mut().rust_mut().detail_image_keys = keys;
-    set_detail_image_index(model, 0);
+fn set_detail_image_keys(mut model: Pin<&mut ffi::GamesModel>, key: Option<MediaKey>) {
+    model.as_mut().rust_mut().detail_image_keys.clear();
+    if let Some(key) = key {
+        model.as_mut().rust_mut().detail_image_keys.push(key);
+    }
+    model.as_mut().set_current_detail_image_index(0);
+    let count = i32::try_from(model.detail_image_keys.len()).unwrap_or(i32::MAX);
+    model.as_mut().set_current_detail_image_count(count);
+    model.as_mut().set_current_detail_image_can_prev(false);
+    model.as_mut().set_current_detail_image_can_next(count > 1);
+    sync_current_detail_image_key_with_page_size(model, 1);
 }
 
 fn set_detail_image_index(mut model: Pin<&mut ffi::GamesModel>, index: i32) {
@@ -1227,7 +1091,15 @@ fn set_detail_image_index(mut model: Pin<&mut ffi::GamesModel>, index: i32) {
     sync_current_detail_image_key(model);
 }
 
-fn sync_current_detail_image_key(mut model: Pin<&mut ffi::GamesModel>) {
+fn sync_current_detail_image_key(model: Pin<&mut ffi::GamesModel>) {
+    let page_size = u32::try_from(model.page_size.max(1)).unwrap_or(1);
+    sync_current_detail_image_key_with_page_size(model, page_size);
+}
+
+fn sync_current_detail_image_key_with_page_size(
+    mut model: Pin<&mut ffi::GamesModel>,
+    page_size: u32,
+) {
     let index = model.current_detail_image_index;
     if index < 0 {
         model
@@ -1246,17 +1118,23 @@ fn sync_current_detail_image_key(mut model: Pin<&mut ffi::GamesModel>) {
         model.as_mut().set_current_detail_image_key(QString::from(
             MediaImageCache::image_key_for(&key).as_str(),
         ));
-    } else {
-        if !cache.is_negative(&key) {
-            cache.enqueue_with_media_id(
-                key,
-                None,
-                u32::try_from(model.page_size.max(1)).unwrap_or(1),
-            );
-        }
+    } else if cache.is_negative(&key) || cache.is_soft_no_image(&key) {
         model
             .as_mut()
             .set_current_detail_image_key(QString::default());
+    } else {
+        cache.enqueue_with_media_id(key, None, page_size.max(1));
+        model
+            .as_mut()
+            .set_current_detail_image_key(QString::from("icons/Loading"));
+    }
+}
+
+fn cover_placeholder_for(entry: &BrowseEntry) -> String {
+    if entry.is_folder() {
+        "icons/Folder".to_string()
+    } else {
+        "icons/File".to_string()
     }
 }
 
@@ -1268,7 +1146,10 @@ fn cover_key_for(entry: &BrowseEntry, page_size: u32) -> String {
     let cache = global_media_image_cache();
     let cached = media_key.as_ref().is_some_and(|k| cache.is_cached(k));
     let negative = media_key.as_ref().is_some_and(|k| cache.is_negative(k));
-    if !cached && !negative {
+    let soft_no_image = media_key
+        .as_ref()
+        .is_some_and(|k| cache.is_soft_no_image(k));
+    if !cached && !negative && !soft_no_image {
         // Miss-driven re-enqueue: when QML asks for the cover URL of
         // a media entry whose bytes aren't in the cache, kick a fetch
         // right here. This is the only implicit path covers reach the
@@ -1282,7 +1163,7 @@ fn cover_key_for(entry: &BrowseEntry, page_size: u32) -> String {
             cache.enqueue_with_media_id(k.clone(), entry.media_id, page_size);
         }
     }
-    cover_key_for_with(entry, media_key.as_ref(), cached, negative)
+    cover_key_for_with(entry, media_key.as_ref(), cached, negative || soft_no_image)
 }
 
 /// Build the canonical `(systemId, path)` identifier for a media
@@ -1418,14 +1299,14 @@ fn cover_key_for_with(
     entry: &BrowseEntry,
     key: Option<&MediaKey>,
     cached: bool,
-    negative: bool,
+    unavailable: bool,
 ) -> String {
     if entry.is_folder() {
         return "icons/Folder".to_string();
     }
     match key {
         Some(k) if cached => MediaImageCache::image_key_for(k),
-        Some(_) if !negative => "icons/Loading".to_string(),
+        Some(_) if !unavailable => "icons/Loading".to_string(),
         _ => "icons/File".to_string(),
     }
 }
@@ -2242,14 +2123,15 @@ mod tests {
     )]
 
     use super::{
-        chunk_for_subbatching, compute_unresolved_keys, cover_key_for_with, decide_initial,
-        dedup_roots_drop_ancestors, display_name, entry_system_id, is_strict_ancestor_path,
-        leading_dir_count, media_key_for, position_of_game_path, prefetch_around_plan,
-        project_status, transform_entries, InitialAction, Projection,
+        chunk_for_subbatching, compute_unresolved_keys, cover_key_for_with, cover_placeholder_for,
+        decide_initial, dedup_roots_drop_ancestors, detail_tags_from_tags, display_name,
+        entry_system_id, is_strict_ancestor_path, leading_dir_count, media_key_for,
+        position_of_game_path, prefetch_around_plan, project_status, transform_entries,
+        InitialAction, Projection,
     };
     use crate::media_image_cache::{MediaImageCache, MediaKey};
     use std::collections::HashSet;
-    use zaparoo_core::media_types::{BrowseEntry, MediaBrowseResult, Pagination};
+    use zaparoo_core::media_types::{BrowseEntry, MediaBrowseResult, Pagination, TagInfo};
     use zaparoo_core::platform::Platform;
     use zaparoo_core::remote_resource::ResourceStatus;
 
@@ -2670,12 +2552,34 @@ mod tests {
     }
 
     #[test]
+    fn cover_placeholder_never_returns_loading_icon() {
+        assert_eq!(
+            cover_placeholder_for(&media("smb", "/p/smb", "NES")),
+            "icons/File"
+        );
+        assert_eq!(
+            cover_placeholder_for(&folder("Games", "/x")),
+            "icons/Folder"
+        );
+    }
+
+    #[test]
     fn cover_key_for_media_negatively_memoed_returns_file_icon() {
         let entry = media("smb", "/p/smb", "NES");
         let key = media_key_for(&entry).expect("media has key");
         // Not cached, but negatively memoed → there is no image to
         // wait for, fall back to the plain file icon (no stuck
         // hourglass).
+        assert_eq!(
+            cover_key_for_with(&entry, Some(&key), false, true),
+            "icons/File"
+        );
+    }
+
+    #[test]
+    fn cover_key_for_media_soft_missed_returns_file_icon() {
+        let entry = media("smb", "/p/smb", "NES");
+        let key = media_key_for(&entry).expect("media has key");
         assert_eq!(
             cover_key_for_with(&entry, Some(&key), false, true),
             "icons/File"
@@ -2971,5 +2875,52 @@ mod tests {
         let mut expected: Vec<String> = (15..30).rev().map(|i| format!("/g/{i}")).collect();
         expected.extend((0..15).rev().map(|i| format!("/g/{i}")));
         assert_eq!(paths, expected);
+    }
+
+    #[test]
+    fn detail_tags_emit_fixed_rows_with_blank_values() {
+        let tags = vec![TagInfo {
+            tag_type: "genre".into(),
+            tag: "Platformer".into(),
+        }];
+        let detail = detail_tags_from_tags(&tags);
+        let rows: Vec<&str> = detail.split('\n').collect();
+        assert_eq!(
+            rows,
+            vec![
+                "Year\t",
+                "Genre\tPlatformer",
+                "Players\t",
+                "Developer\t",
+                "Publisher\t",
+                "Rating\t",
+            ]
+        );
+    }
+
+    #[test]
+    fn detail_tags_match_aliases_and_join_multiple_values() {
+        let tags = vec![
+            TagInfo {
+                tag_type: "platform".into(),
+                tag: "Arcade".into(),
+            },
+            TagInfo {
+                tag_type: "release_date".into(),
+                tag: "1984".into(),
+            },
+            TagInfo {
+                tag_type: "gamegenre".into(),
+                tag: "Action".into(),
+            },
+            TagInfo {
+                tag_type: "genre".into(),
+                tag: "Shooter".into(),
+            },
+        ];
+        let detail = detail_tags_from_tags(&tags);
+        let rows: Vec<&str> = detail.split('\n').collect();
+        assert_eq!(rows[0], "Year\t1984");
+        assert_eq!(rows[1], "Genre\tAction, Shooter");
     }
 }
