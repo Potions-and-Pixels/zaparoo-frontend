@@ -207,6 +207,30 @@ That is deliberate: MiSTer's parent process can kill and relaunch the launcher
 without warning. Each screen writes its own `*State` singleton on directional
 moves; the router writes `AppState.active_screen` when the screen flips.
 
+#### Shared focused-detail policy
+
+List-detail media screens use `FocusedMediaDetailController.qml` as the
+single policy point for focused metadata and cover behavior. New media
+list screens should reuse that controller instead of open-coding detail
+debounce, clearing, or repeat-scroll rules in the screen.
+
+The shared contract covers:
+
+- selection identity tracking (`system_id + path`, or a screen-supplied equivalent)
+- debounced detail loading
+- stale-request suppression
+- transient detail clearing
+- rapid vertical repeat behavior: while held `up` / `down` repeat is active in
+  list mode, metadata and screenshots stay hidden; title may continue to follow
+  selection, and detail reload resumes after repeat stops
+
+`MediaListScreen.qml` is the shared list/detail shell for media browse
+screens. Favorites and Recently Played use it directly; Games layers its
+folder-navigation, per-level persisted selection, and pagination rules on
+top of the same shell instead of duplicating the list/detail render tree.
+New media list screens should extend that component first and only add
+screen-specific hooks where the data model or navigation semantics differ.
+
 #### Screen flow
 
 - **Hub** (`HubScreen.qml`) — static centered row of category tiles.
