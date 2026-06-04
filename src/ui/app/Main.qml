@@ -50,6 +50,7 @@ MainLayout {
     property string _pendingLanguageSelection: ""
     property string _pendingResolutionSelection: ""
     property bool _discoverMenuPending: false
+    property bool _resumeStartupFocusPending: false
     property var _discoverParentEntries: []
     property string _pendingLauncherSystemId: ""
     property string _pendingLauncherSelectionId: ""
@@ -115,6 +116,12 @@ MainLayout {
         // Connection below fires it on first delivery.
         if (Browse.CategoriesModel.count > 0)
             root.hubScreen.restoreFromCategoriesReset();
+        if (root.activeScreen === root.screenHub) {
+            if (Browse.RecentsModel.resume_available)
+                root.hubScreen.focusResumeIfAvailable();
+            else
+                root._resumeStartupFocusPending = true;
+        }
         // Warm-start into Favorites/Recents needs the same
         // restore-on-ready dance the navigate helpers perform,
         // otherwise the grid lands on index 0 and ignores persisted
@@ -376,6 +383,13 @@ MainLayout {
             root._recentsReadyCallback = null;
             cb();
         }
+        function onResume_availableChanged(): void {
+            if (!root._resumeStartupFocusPending || !Browse.RecentsModel.resume_available)
+                return;
+            root._resumeStartupFocusPending = false;
+            if (root.activeScreen === root.screenHub)
+                root.hubScreen.focusResumeIfAvailable();
+        }
     }
     Connections {
         target: Browse.FavoritesModel
@@ -433,14 +447,20 @@ MainLayout {
 
     // Hub Accept routing. Empty-row passthrough preserves the committed
     // "Enter on empty hub goes to Systems" behaviour and
-    // keeps the navigation test synchronous. Otherwise: tentatively
-    // pin the destination to Systems, fill the chosen category, then
-    // either bypass to Games (MiSTer Arcade singleton) or fall
-    // through to Systems with a cover-prefetch warmup so the
-    // destination paints with logos already in QPixmapCache.
+    // keeps the navigation test synchronous. The Resume action is a
+    // hub payload rather than a category and launches the latest
+    // resumable history row. Otherwise: tentatively pin the
+    // destination to Systems, fill the chosen category, then either
+    // bypass to Games (MiSTer Arcade singleton) or fall through to
+    // Systems with a cover-prefetch warmup so the destination paints
+    // with logos already in QPixmapCache.
     function _navigateFromHub(category: string): void {
         if (category === "") {
             root._goto(root.screenSystems);
+            return;
+        }
+        if (category === "resume") {
+            Browse.RecentsModel.launch_resume();
             return;
         }
         Browse.HubState.category = category;
