@@ -71,6 +71,35 @@ ApplicationWindow {
     property bool _crtPreviewResizeGuard: false
 
     readonly property bool _crtPreviewActive: root.crtPreview && root.videoWidth > 0 && root.videoHeight > 0
+    property bool _startupTraceActive: true
+    property bool _statusIconsEnabled: false
+    property bool _headerMediaActivityEnabled: false
+    property bool _firstFrameSeen: false
+    property bool systemsScreenRequested: false
+    property bool gamesScreenRequested: false
+    property bool favoritesScreenRequested: false
+    property bool recentsScreenRequested: false
+    property bool settingsScreenRequested: false
+    property bool aboutScreenRequested: false
+    property bool cardWriteModalRequested: false
+    property bool settingNeedsRestartModalRequested: false
+    property bool contextMenuRequested: false
+    property bool qrCodeModalRequested: false
+    property bool gameInfoModalRequested: false
+    property bool firstRunIndexModalRequested: false
+    property bool commercialNoticeModalRequested: false
+    property bool logUploadModalRequested: false
+    property bool quitConfirmModalRequested: false
+    property bool listPickerModalRequested: false
+
+    function _startupTrace(): void {
+        if (!root._startupTraceActive)
+            return;
+        const parts = [];
+        for (let i = 0; i < arguments.length; i++)
+            parts.push(String(arguments[i]));
+        console.debug(parts.join(" "));
+    }
 
     function _clampCrtPreviewScale(scale: int): int {
         return Math.max(root._crtPreviewMinScale, Math.min(root._crtPreviewMaxScale, scale));
@@ -148,6 +177,14 @@ ApplicationWindow {
         if (root._crtPreviewActive && root.crtPreviewScale === 0 && !root._crtPreviewResizeGuard)
             root.applyCrtPreviewScale(root._crtPreviewEffectiveScale);
     }
+    onFrameSwapped: {
+        if (root._firstFrameSeen)
+            return;
+        root._firstFrameSeen = true;
+        root._statusIconsEnabled = true;
+        root._headerMediaActivityEnabled = true;
+        root._startupTrace("startup/qml firstFrameSwapped", "statusIconsEnabled=" + root._statusIconsEnabled, "mediaActivityEnabled=" + root._headerMediaActivityEnabled);
+    }
 
     // When the window crosses to a different screen (e.g. dev drags
     // it from a 4K to a 1080p monitor), Qt updates Screen.width and
@@ -203,20 +240,22 @@ ApplicationWindow {
     // reached via root.hubScreen.* / root.systemsScreen.* /
     // root.gamesScreen.* — no per-widget aliases here.
     property alias hubScreen: hubScreen
-    property alias systemsScreen: systemsScreen
-    property alias gamesScreen: gamesScreen
-    property alias favoritesScreen: favoritesScreen
-    property alias recentsScreen: recentsScreen
-    property alias settingsScreen: settingsScreen
-    property alias aboutScreen: aboutScreen
-    property alias contextMenu: contextMenu
-    property alias commercialNoticeModal: commercialNoticeModal
-    property alias firstRunIndexModal: firstRunIndexModal
-    property alias gameInfoModal: gameInfoModal
-    property alias logUploadModal: logUploadModal
-    property alias quitConfirmModal: quitConfirmModal
-    property alias settingNeedsRestartModal: settingNeedsRestartModal
-    property alias listPickerModal: listPickerModal
+    property var systemsScreen: systemsScreenLoader.item
+    property var gamesScreen: gamesScreenLoader.item
+    property var favoritesScreen: favoritesScreenLoader.item
+    property var recentsScreen: recentsScreenLoader.item
+    property var settingsScreen: settingsScreenLoader.item
+    property var aboutScreen: aboutScreenLoader.item
+    property var cardWriteModal: cardWriteModalLoader.item
+    property var contextMenu: contextMenuLoader.item
+    property var qrCodeModal: qrCodeModalLoader.item
+    property var commercialNoticeModal: commercialNoticeModalLoader.item
+    property var firstRunIndexModal: firstRunIndexModalLoader.item
+    property var gameInfoModal: gameInfoModalLoader.item
+    property var logUploadModal: logUploadModalLoader.item
+    property var quitConfirmModal: quitConfirmModalLoader.item
+    property var settingNeedsRestartModal: settingNeedsRestartModalLoader.item
+    property var listPickerModal: listPickerModalLoader.item
     property alias headerBar: headerBar
     property alias screensaverOverlay: screensaverOverlay
     // Exposed so Main.qml binds Sizing.screenWidth/Height to the
@@ -274,6 +313,8 @@ ApplicationWindow {
     // surfaces only via the top-right status pill — the user keeps
     // their cached catalog and just sees the link state change.
     property bool bootComplete: false
+    property bool startupRestoreCurtainVisible: Browse.AppState.active_screen !== "" && Browse.AppState.active_screen !== root.screenHub
+    readonly property bool catalogStillBooting: !Browse.CategoriesModel.loaded && (Browse.CategoriesModel.error_message ?? "") === ""
 
     // Per-screen state derivation. Shape mirrors ScreenStateOverlay's
     // `state` ternary so the help bar and the in-screen overlay agree
@@ -281,15 +322,15 @@ ApplicationWindow {
     // CategoriesModel binds eagerly via bind_to_endpoint! and exposes
     // no `loading` qproperty, so a count-of-zero collapses straight
     // into Empty (matching the overlay's existing behavior on Hub).
-    readonly property string systemsScreenState: Browse.SystemsModel.loading ? "loading" : ((Browse.SystemsModel.error_message ?? "") !== "" ? "error" : (Browse.SystemsModel.count === 0 ? "empty" : "ready"))
+    readonly property string systemsScreenState: (Browse.SystemsModel.loading || (root.activeScreen === root.screenSystems && root.catalogStillBooting)) ? "loading" : ((Browse.SystemsModel.error_message ?? "") !== "" ? "error" : (Browse.SystemsModel.count === 0 ? "empty" : "ready"))
 
-    readonly property string gamesScreenState: Browse.GamesModel.loading ? "loading" : ((Browse.GamesModel.error_message ?? "") !== "" ? "error" : (Browse.GamesModel.count === 0 ? "empty" : "ready"))
+    readonly property string gamesScreenState: (Browse.GamesModel.loading || (root.activeScreen === root.screenGames && root.catalogStillBooting)) ? "loading" : ((Browse.GamesModel.error_message ?? "") !== "" ? "error" : (Browse.GamesModel.count === 0 ? "empty" : "ready"))
 
-    readonly property string favoritesScreenState: Browse.FavoritesModel.loading ? "loading" : ((Browse.FavoritesModel.error_message ?? "") !== "" ? "error" : (Browse.FavoritesModel.count === 0 ? "empty" : "ready"))
+    readonly property string favoritesScreenState: (Browse.FavoritesModel.loading || (root.activeScreen === root.screenFavorites && root.catalogStillBooting)) ? "loading" : ((Browse.FavoritesModel.error_message ?? "") !== "" ? "error" : (Browse.FavoritesModel.count === 0 ? "empty" : "ready"))
 
     readonly property string hubScreenState: (Browse.CategoriesModel.error_message ?? "") !== "" ? "error" : (Browse.CategoriesModel.count === 0 ? "empty" : "ready")
 
-    readonly property string recentsScreenState: Browse.RecentsModel.loading ? "loading" : ((Browse.RecentsModel.error_message ?? "") !== "" ? "error" : (Browse.RecentsModel.count === 0 ? "empty" : "ready"))
+    readonly property string recentsScreenState: (Browse.RecentsModel.loading || (root.activeScreen === root.screenRecents && root.catalogStillBooting)) ? "loading" : ((Browse.RecentsModel.error_message ?? "") !== "" ? "error" : (Browse.RecentsModel.count === 0 ? "empty" : "ready"))
     readonly property string displayOrientation: Browse.Settings.current_orientation
     readonly property bool _sceneRotated: root.displayOrientation === "cw" || root.displayOrientation === "ccw"
     readonly property bool _browseListLayout: Browse.Settings.current_browse_layout === "list"
@@ -349,8 +390,12 @@ ApplicationWindow {
     // between the two sides would defeat the guard — see #24 for the
     // tracked single-source-of-truth refactor.
     onActiveScreenChanged: {
+        root._startupTrace("startup/qml activeScreenChanged", "activeScreen=" + root.activeScreen, "pendingTransition=" + root.pendingTransition, "startupRestoreCurtainVisible=" + root.startupRestoreCurtainVisible);
         if (ScreenManager.activeScreen !== root.activeScreen)
             ScreenManager.activeScreen = root.activeScreen;
+    }
+    onStartupRestoreCurtainVisibleChanged: {
+        root._startupTrace("startup/qml startupRestoreCurtainVisibleChanged", "visible=" + root.startupRestoreCurtainVisible, "activeScreen=" + root.activeScreen);
     }
     Connections {
         target: ScreenManager
@@ -436,6 +481,8 @@ ApplicationWindow {
             // rendered, so this is MiSTer-safe; `cache: true` keeps the
             // pixmap in QPixmapCache after first decode.
             Image {
+                id: backgroundTexture
+
                 anchors.fill: parent
                 source: "qrc:/qt/qml/Zaparoo/App/resources/images/bg-circuit.png"
                 fillMode: Image.Tile
@@ -445,6 +492,25 @@ ApplicationWindow {
                 // of flashing the bare bgDeep underneath. One small PNG decode
                 // at startup is cheap.
                 asynchronous: false
+
+                property double _startupTraceLoadStartedAt: 0
+
+                onStatusChanged: {
+                    if (!root._startupTraceActive && !root._firstFrameSeen)
+                        return;
+                    if (status === Image.Loading) {
+                        backgroundTexture._startupTraceLoadStartedAt = Date.now();
+                        root._startupTrace("startup/qml resource load start", "coverKey=background/bg-circuit", "source=" + source);
+                    } else if (status === Image.Ready) {
+                        const durMs = backgroundTexture._startupTraceLoadStartedAt > 0 ? Math.max(0, Date.now() - backgroundTexture._startupTraceLoadStartedAt) : 0;
+                        root._startupTrace("startup/qml resource load ready", "coverKey=background/bg-circuit", "source=" + source, "dur_ms=" + durMs, "tileWidth=" + sourceSize.width, "tileHeight=" + sourceSize.height);
+                        backgroundTexture._startupTraceLoadStartedAt = 0;
+                    } else if (status === Image.Error) {
+                        const durMs = backgroundTexture._startupTraceLoadStartedAt > 0 ? Math.max(0, Date.now() - backgroundTexture._startupTraceLoadStartedAt) : 0;
+                        root._startupTrace("startup/qml resource load error", "coverKey=background/bg-circuit", "source=" + source, "dur_ms=" + durMs);
+                        backgroundTexture._startupTraceLoadStartedAt = 0;
+                    }
+                }
             }
 
             // ── Top header (logo + status row + status pill) ───────────────────────────
@@ -463,6 +529,8 @@ ApplicationWindow {
                 layoutProfile: root._browseViewProfile
                 browseTitle: root.browseHeaderTitle
                 browseProgressText: root.browseHeaderProgressText
+                statusIconsEnabled: root._statusIconsEnabled
+                mediaActivityEnabled: root._headerMediaActivityEnabled
                 z: 200
             }
 
@@ -500,175 +568,246 @@ ApplicationWindow {
                 id: stackedScreens
 
                 anchors.fill: parent
-                // Screens stay hidden until the catalog has loaded for the
-                // first time. BootOverlay holds the window in the meantime;
-                // see the `bootComplete` property declaration above.
-                visible: root.bootComplete
+                visible: !root.startupRestoreCurtainVisible
 
                 HubScreen {
                     id: hubScreen
                     anchors.fill: parent
                     visible: root.activeScreen === root.screenHub
                     transitioning: root.pendingTransition !== ""
+                    onVisibleChanged: {
+                        if (!visible || !root._startupTraceActive)
+                            return;
+                        root._startupTrace("startup/qml firstHubVisible", "restoreCurtainVisible=" + root.startupRestoreCurtainVisible, "connectionState=" + Browse.AppStatus.connection_state, "categories=" + Browse.CategoriesModel.count);
+                        root._startupTraceActive = false;
+                    }
                 }
 
-                SystemsScreen {
-                    id: systemsScreen
+                Loader {
+                    id: systemsScreenLoader
                     anchors.fill: parent
-                    visible: root.activeScreen === root.screenSystems
-                    transitioning: root.pendingTransition !== ""
+                    active: root.systemsScreenRequested
+                    visible: status === Loader.Ready && root.activeScreen === root.screenSystems
+                    sourceComponent: Component {
+                        SystemsScreen {
+                            anchors.fill: parent
+                            transitioning: root.pendingTransition !== ""
+                            optimisticLoading: root.activeScreen === root.screenSystems && root.catalogStillBooting
+                        }
+                    }
                 }
 
-                GamesScreen {
-                    id: gamesScreen
+                Loader {
+                    id: gamesScreenLoader
                     anchors.fill: parent
-                    visible: root.activeScreen === root.screenGames
-                    transitioning: root.pendingTransition !== ""
+                    active: root.gamesScreenRequested
+                    visible: status === Loader.Ready && root.activeScreen === root.screenGames
+                    sourceComponent: Component {
+                        GamesScreen {
+                            anchors.fill: parent
+                            transitioning: root.pendingTransition !== ""
+                            optimisticLoading: root.activeScreen === root.screenGames && root.catalogStillBooting
+                        }
+                    }
                 }
 
-                FavoritesScreen {
-                    id: favoritesScreen
+                Loader {
+                    id: favoritesScreenLoader
                     anchors.fill: parent
-                    visible: root.activeScreen === root.screenFavorites
-                    transitioning: root.pendingTransition !== ""
+                    active: root.favoritesScreenRequested
+                    visible: status === Loader.Ready && root.activeScreen === root.screenFavorites
+                    sourceComponent: Component {
+                        FavoritesScreen {
+                            anchors.fill: parent
+                            transitioning: root.pendingTransition !== ""
+                            optimisticLoading: root.activeScreen === root.screenFavorites && root.catalogStillBooting
+                        }
+                    }
                 }
 
-                RecentsScreen {
-                    id: recentsScreen
+                Loader {
+                    id: recentsScreenLoader
                     anchors.fill: parent
-                    visible: root.activeScreen === root.screenRecents
-                    transitioning: root.pendingTransition !== ""
+                    active: root.recentsScreenRequested
+                    visible: status === Loader.Ready && root.activeScreen === root.screenRecents
+                    sourceComponent: Component {
+                        RecentsScreen {
+                            anchors.fill: parent
+                            transitioning: root.pendingTransition !== ""
+                            optimisticLoading: root.activeScreen === root.screenRecents && root.catalogStillBooting
+                        }
+                    }
                 }
 
-                SettingsScreen {
-                    id: settingsScreen
+                Loader {
+                    id: settingsScreenLoader
                     anchors.fill: parent
-                    visible: root.activeScreen === root.screenSettings
-                    transitioning: root.pendingTransition !== ""
+                    active: root.settingsScreenRequested
+                    visible: status === Loader.Ready && root.activeScreen === root.screenSettings
+                    sourceComponent: Component {
+                        SettingsScreen {
+                            anchors.fill: parent
+                            transitioning: root.pendingTransition !== ""
+                            optimisticLoading: root.activeScreen === root.screenSettings && root.catalogStillBooting
+                        }
+                    }
                 }
 
-                AboutScreen {
-                    id: aboutScreen
+                Loader {
+                    id: aboutScreenLoader
                     anchors.fill: parent
-                    visible: root.activeScreen === root.screenAbout
-                    transitioning: root.pendingTransition !== ""
+                    active: root.aboutScreenRequested
+                    visible: status === Loader.Ready && root.activeScreen === root.screenAbout
+                    sourceComponent: Component {
+                        AboutScreen {
+                            anchors.fill: parent
+                            transitioning: root.pendingTransition !== ""
+                        }
+                    }
                 }
-            }
-
-            // ── Boot overlay ─────────────────────────────────────────────────────────
-            //
-            // Painted between the screens and the modal layer; unmounts itself
-            // the first time `bootComplete` flips true. Loader (rather than
-            // `visible: false`) so the overlay leaves the scene graph after
-            // dismissal — a subsequent disconnect must not bring it back over
-            // the user's cached catalog.
-
-            Loader {
-                anchors.fill: parent
-                active: !root.bootComplete
-                z: 50
-                sourceComponent: BootOverlay {}
             }
 
             // ── Card writer modal ────────────────────────────────────────────────────
 
-            Modal {
-                id: cardWriteModal
-
-                open: root.cardWriteModalVisible
-                kind: "transient"
-                failed: root.cardWriteFailed
-                title: root.cardWriteFailed ? qsTr("Writing failed") : qsTr("Put a writable card near the reader")
-                onCancelRequested: root.cancelCardWriteRequested()
+            Loader {
+                id: cardWriteModalLoader
+                active: root.cardWriteModalRequested
+                sourceComponent: Component {
+                    Modal {
+                        open: root.cardWriteModalVisible
+                        kind: "transient"
+                        failed: root.cardWriteFailed
+                        title: root.cardWriteFailed ? qsTr("Writing failed") : qsTr("Put a writable card near the reader")
+                        onCancelRequested: root.cancelCardWriteRequested()
+                    }
+                }
             }
 
             // ── Setting restart prompt modal ────────────────────────────────────────────────────
 
-            Modal {
-                id: settingNeedsRestartModal
-
-                open: root.settingNeedsRestartModalVisible
-                kind: "confirm"
-                title: qsTr("Quit and restart Zaparoo Frontend?")
-                body: qsTr("In order to apply this setting we need to restart the frontend.")
-                onConfirmed: root.acceptRestart()
-                onCancelRequested: root.cancelRestart()
+            Loader {
+                id: settingNeedsRestartModalLoader
+                active: root.settingNeedsRestartModalRequested
+                sourceComponent: Component {
+                    Modal {
+                        open: root.settingNeedsRestartModalVisible
+                        kind: "confirm"
+                        title: qsTr("Quit and restart Zaparoo Frontend?")
+                        body: qsTr("In order to apply this setting we need to restart the frontend.")
+                        onConfirmed: root.acceptRestart()
+                        onCancelRequested: root.cancelRestart()
+                    }
+                }
             }
 
-            ContextMenu {
-                id: contextMenu
-
-                open: root.contextMenuVisible
-                anchorRect: root.contextMenuAnchor
-                entries: root.contextMenuEntries
-                bottomUnsafeHeight: BrowseLayouts.numberValue(root._browseViewProfile, "footer.bottomUnsafeHeight", Sizing.pctH(6) + Sizing.pctH(2))
-                onAccepted: id => root.contextMenuAccepted(id)
-                onCloseRequested: root.contextMenuCloseRequested()
+            Loader {
+                id: contextMenuLoader
+                active: root.contextMenuRequested
+                sourceComponent: Component {
+                    ContextMenu {
+                        open: root.contextMenuVisible
+                        anchorRect: root.contextMenuAnchor
+                        entries: root.contextMenuEntries
+                        bottomUnsafeHeight: BrowseLayouts.numberValue(root._browseViewProfile, "footer.bottomUnsafeHeight", Sizing.pctH(6) + Sizing.pctH(2))
+                        onAccepted: id => root.contextMenuAccepted(id)
+                        onCloseRequested: root.contextMenuCloseRequested()
+                    }
+                }
             }
 
-            QrCodeModal {
-                id: qrCodeModal
-
+            Loader {
+                id: qrCodeModalLoader
                 anchors.fill: parent
-                open: root.qrCodeModalVisible
+                active: root.qrCodeModalRequested
+                sourceComponent: Component {
+                    QrCodeModal {
+                        anchors.fill: parent
+                        open: root.qrCodeModalVisible
+                    }
+                }
             }
 
-            GameInfoModal {
-                id: gameInfoModal
-
+            Loader {
+                id: gameInfoModalLoader
                 anchors.fill: parent
-                open: root.gameInfoModalVisible
-                onCloseRequested: root.closeGameInfoRequested()
+                active: root.gameInfoModalRequested
+                sourceComponent: Component {
+                    GameInfoModal {
+                        anchors.fill: parent
+                        open: root.gameInfoModalVisible
+                        onCloseRequested: root.closeGameInfoRequested()
+                    }
+                }
             }
 
             // First-run mediadb index modal. Pushed by Main.qml the first time
             // we connect to a Core whose mediadb is empty. Blocks the screens
             // beneath until the initial scan completes (or the user cancels and
             // tries again).
-            FirstRunIndexModal {
-                id: firstRunIndexModal
-
+            Loader {
+                id: firstRunIndexModalLoader
                 anchors.fill: parent
-                open: root.firstRunIndexModalVisible
-                onCloseRequested: root.closeFirstRunIndexRequested()
+                active: root.firstRunIndexModalRequested
+                sourceComponent: Component {
+                    FirstRunIndexModal {
+                        anchors.fill: parent
+                        open: root.firstRunIndexModalVisible
+                        onCloseRequested: root.closeFirstRunIndexRequested()
+                    }
+                }
             }
 
             // Commercial-use notice. Sits above every other modal (z: 310) so
             // it always paints first on a fresh install. Once the user acks,
             // `Browse.Notice.commercial_ack` flips to true on disk and the
             // modal stays closed for the rest of this install.
-            CommercialNoticeModal {
-                id: commercialNoticeModal
-
+            Loader {
+                id: commercialNoticeModalLoader
                 anchors.fill: parent
-                open: root.commercialNoticeModalVisible
-                onCloseRequested: root.closeCommercialNoticeRequested()
+                active: root.commercialNoticeModalRequested
+                sourceComponent: Component {
+                    CommercialNoticeModal {
+                        anchors.fill: parent
+                        open: root.commercialNoticeModalVisible
+                        onCloseRequested: root.closeCommercialNoticeRequested()
+                    }
+                }
             }
 
             // Log-upload modal. Pushed by Main.qml when the user triggers the
             // "Upload log" action in Settings. Owns its own three-phase view
             // (uploading / success / error) — the router only sees open / close.
-            LogUploadModal {
-                id: logUploadModal
-
+            Loader {
+                id: logUploadModalLoader
                 anchors.fill: parent
-                open: root.logUploadModalVisible
-                onCloseRequested: root.closeLogUploadRequested()
+                active: root.logUploadModalRequested
+                sourceComponent: Component {
+                    LogUploadModal {
+                        anchors.fill: parent
+                        open: root.logUploadModalVisible
+                        onCloseRequested: root.closeLogUploadRequested()
+                    }
+                }
             }
 
             // Quit-confirm modal. Pushed by Main.qml when the user presses
             // cancel on Hub. Default focus is "No" so an accidental press
             // can't quit; "Yes" routes through `quitConfirmAccepted` and the
             // router calls Qt.quit().
-            Modal {
-                id: quitConfirmModal
-
-                open: root.quitConfirmModalVisible
-                kind: "confirm"
-                title: qsTr("Quit Zaparoo Frontend?")
-                body: qsTr("Are you sure you want to exit?")
-                onConfirmed: root.quitConfirmAccepted()
-                onCancelRequested: root.closeQuitConfirmRequested()
+            Loader {
+                id: quitConfirmModalLoader
+                anchors.fill: parent
+                active: root.quitConfirmModalRequested
+                sourceComponent: Component {
+                    Modal {
+                        open: root.quitConfirmModalVisible
+                        kind: "confirm"
+                        title: qsTr("Quit Zaparoo Frontend?")
+                        body: qsTr("Are you sure you want to exit?")
+                        onConfirmed: root.quitConfirmAccepted()
+                        onCancelRequested: root.closeQuitConfirmRequested()
+                    }
+                }
             }
 
             // List-picker modal. Settings opens this for picker rows
@@ -676,16 +815,21 @@ ApplicationWindow {
             // fieldId round-trip lets the router dispatch the chosen id
             // back to the matching Browse.Settings.set_X without parsing
             // the title.
-            ListPickerModal {
-                id: listPickerModal
-
+            Loader {
+                id: listPickerModalLoader
                 anchors.fill: parent
-                open: root.listPickerModalVisible
-                title: root.listPickerTitle
-                entries: root.listPickerEntries
-                initialId: root.listPickerInitialId
-                onAccepted: id => root.listPickerAccepted(root.listPickerFieldId, id)
-                onCloseRequested: root.listPickerCloseRequested(root.listPickerFieldId)
+                active: root.listPickerModalRequested
+                sourceComponent: Component {
+                    ListPickerModal {
+                        anchors.fill: parent
+                        open: root.listPickerModalVisible
+                        title: root.listPickerTitle
+                        entries: root.listPickerEntries
+                        initialId: root.listPickerInitialId
+                        onAccepted: id => root.listPickerAccepted(root.listPickerFieldId, id)
+                        onCloseRequested: root.listPickerCloseRequested(root.listPickerFieldId)
+                    }
+                }
             }
 
             // ── Instructions bar ──────────────────────────────────────────────────────
@@ -768,8 +912,10 @@ ApplicationWindow {
                             }
                         ];
                     if (root.logUploadModalVisible) {
-                        const phase = root.logUploadModal.phase;
-                        if (phase === root.logUploadModal._stateSuccess)
+                        const phase = root.logUploadModal ? root.logUploadModal.phase : "";
+                        const success = root.logUploadModal ? root.logUploadModal._stateSuccess : "__none__";
+                        const error = root.logUploadModal ? root.logUploadModal._stateError : "__none__";
+                        if (phase === success)
                             return [
                                 {
                                     button: "ButtonA",
@@ -780,7 +926,7 @@ ApplicationWindow {
                                     label: qsTr("Close")
                                 }
                             ];
-                        if (phase === root.logUploadModal._stateError)
+                        if (phase === error)
                             return [
                                 {
                                     button: "ButtonA",
@@ -821,10 +967,10 @@ ApplicationWindow {
                                 label: qsTr("Cancel")
                             }
                         ];
-                    if (!root.bootComplete)
+                    if (!root.bootComplete || root.startupRestoreCurtainVisible)
                         return [];
                     if (root.firstRunIndexModalVisible) {
-                        const phase = root.firstRunIndexModal.phase;
+                        const phase = root.firstRunIndexModal ? root.firstRunIndexModal.phase : "";
                         if (phase === "running")
                             return [
                                 {
@@ -874,6 +1020,8 @@ ApplicationWindow {
                                 }
                             ];
                         if (root.systemsScreenState === "ready") {
+                            if (root.systemsScreen === null)
+                                return [];
                             // L/R shoulders page jump; only advertise the cue
                             // when there's a second page to jump to, so we
                             // don't promise a press that no-ops on a single
@@ -916,7 +1064,10 @@ ApplicationWindow {
                     if (root.activeScreen === root.screenFavorites || root.activeScreen === root.screenRecents) {
                         const isFavorites = root.activeScreen === root.screenFavorites;
                         const state = isFavorites ? root.favoritesScreenState : root.recentsScreenState;
-                        const grid = isFavorites ? root.favoritesScreen.favoritesGrid : root.recentsScreen.recentsGrid;
+                        const screen = isFavorites ? root.favoritesScreen : root.recentsScreen;
+                        if (screen === null)
+                            return [];
+                        const grid = isFavorites ? screen.favoritesGrid : screen.recentsGrid;
                         if (state === "loading")
                             return [
                                 {
@@ -964,6 +1115,8 @@ ApplicationWindow {
                         ];
                     }
                     if (root.activeScreen === root.screenSettings) {
+                        if (root.settingsScreen === null)
+                            return [];
                         let row = [];
                         // Up/Down moves between fields; only useful when there
                         // are 2+ fields.
@@ -999,6 +1152,8 @@ ApplicationWindow {
                         return row;
                     }
                     if (root.activeScreen === root.screenAbout) {
+                        if (root.aboutScreen === null)
+                            return [];
                         let row = [];
                         // Up/Down only meaningful when the body actually
                         // overflows the viewport (per the minimal help-bar
@@ -1023,6 +1178,8 @@ ApplicationWindow {
                             }
                         ];
                     if (root.gamesScreenState === "ready") {
+                        if (root.gamesScreen === null)
+                            return [];
                         const pages = root.gamesScreen.gamesGrid.pageCount;
                         // Options menu is only meaningful on media leaves —
                         // folder/root entries open via Accept and have no

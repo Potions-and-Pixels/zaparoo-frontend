@@ -48,10 +48,48 @@ import Zaparoo.Browse as Browse
 Item {
     id: hub
 
+    Component.onCompleted: console.debug("startup/qml component HubScreen completed")
+
+    readonly property var _placeholderCategories: [
+        {
+            id: CategoryIds.arcadeId,
+            name: qsTr("Arcade"),
+            coverKey: CategoryIds.coverKey(CategoryIds.arcadeId)
+        },
+        {
+            id: CategoryIds.computerId,
+            name: qsTr("Computers"),
+            coverKey: CategoryIds.coverKey(CategoryIds.computerId)
+        },
+        {
+            id: CategoryIds.consoleId,
+            name: qsTr("Consoles"),
+            coverKey: CategoryIds.coverKey(CategoryIds.consoleId)
+        },
+        {
+            id: CategoryIds.handheldId,
+            name: qsTr("Handhelds"),
+            coverKey: CategoryIds.coverKey(CategoryIds.handheldId)
+        }
+    ]
+    readonly property var visibleCategoryEntries: {
+        if (Browse.CategoriesModel.count <= 0)
+            return hub._placeholderCategories;
+        const entries = [];
+        for (let i = 0; i < Browse.CategoriesModel.count; i++) {
+            const name = Browse.CategoriesModel.category_at(i);
+            entries.push({
+                id: name,
+                name: name,
+                coverKey: CategoryIds.coverKey(name)
+            });
+        }
+        return entries;
+    }
     property bool transitioning: false
     // 0 = categories row, 1 = actions row.
-    property int currentRow: 0
-    // Index within the active row.
+    property int currentRow: 1
+    // Index within the active row. Resume is first while optimistic/history is unknown.
     property int currentIndex: 0
     // Source-row index from the most recent cross. Used to make a
     // Down → Up (or Up → Down) round-trip return to the originating
@@ -79,17 +117,21 @@ Item {
     readonly property int _blockHeight: 2 * (categoriesRow.cellHeight + 2 * categoriesRow.verticalPadding) + (categoriesRow.spacing - categoriesRow.verticalPadding - actionsRow.verticalPadding) + Sizing.pctH(3) + Sizing.pctH(7)
     readonly property int _blockY: Math.round((Sizing.headerBottom + hub.height - Sizing.pctH(6) - hub._blockHeight) / 2)
 
-    // Action-row data. Resume is prepended only when Core history has
-    // a fresh launchable row; the rest keep stable ids so persisted
-    // focus can remap across insertion/removal.
+    readonly property bool resumeKnownUnavailable: !Browse.RecentsModel.loading && !Browse.RecentsModel.resume_available && Browse.AppStatus.connection_state === 2
+    readonly property bool resumeActionVisible: !hub.resumeKnownUnavailable
+
+    // Action-row data. Resume is visible by default while Core history
+    // is unknown; hide it only after Recents proves there is nothing
+    // resumable. The tile always uses the play icon so startup never
+    // waits on a game cover for the Hub's primary action.
     readonly property var actionEntries: {
         const entries = [];
-        if (Browse.RecentsModel.resume_available) {
+        if (hub.resumeActionVisible) {
             const resumeName = Browse.RecentsModel.resume_name;
             entries.push({
                 id: "resume",
-                coverKey: Browse.RecentsModel.resume_cover_key || "icons/PlayOutline",
-                text: resumeName.length > 0 ? qsTr("Resume: %1").arg(resumeName) : qsTr("Resume Game")
+                coverKey: "icons/PlayOutline",
+                text: resumeName.length > 0 ? resumeName : qsTr("Resume")
             });
         }
         entries.push({
@@ -123,9 +165,9 @@ Item {
         hub.currentIndex = hub._actionIndexForId(Browse.HubState.selected_action);
     }
 
-    function focusResumeIfAvailable(): void {
+    function focusResumeIfVisible(): void {
         const resumeIndex = hub._actionIndexForId("resume");
-        if (!Browse.RecentsModel.resume_available || hub.actionEntries[resumeIndex].id !== "resume")
+        if (!hub.resumeActionVisible || hub.actionEntries[resumeIndex].id !== "resume")
             return;
         hub.currentRow = 1;
         hub.currentIndex = resumeIndex;
@@ -133,14 +175,34 @@ Item {
         hub._commitActionSelection();
     }
 
-    onActionEntriesChanged: hub._remapActionFocus()
+    function _focusFallbackAfterResumeRemoved(): void {
+        if (Browse.CategoriesModel.count > 0) {
+            hub.currentRow = 0;
+            hub.currentIndex = 0;
+            hub._crossSavedIndex = -1;
+            hub._commitCategorySelection();
+            return;
+        }
+        hub.currentRow = 1;
+        hub.currentIndex = hub._actionIndexForId("settings");
+        hub._crossSavedIndex = -1;
+        hub._commitActionSelection();
+    }
+
+    onActionEntriesChanged: {
+        if (hub.currentRow === 1 && Browse.HubState.selected_action === "resume" && !hub.resumeActionVisible) {
+            hub._focusFallbackAfterResumeRemoved();
+            return;
+        }
+        hub._remapActionFocus();
+    }
 
     // Test-harness hook so `tst_navigation.qml` can reset both focus
     // axes between cases without poking individual properties through
     // MainLayout's alias.
     function resetFocus(): void {
-        hub.currentRow = 0;
-        hub.currentIndex = 0;
+        hub.currentRow = 1;
+        hub.currentIndex = hub._actionIndexForId("resume");
         hub._crossSavedIndex = -1;
     }
 
@@ -158,7 +220,7 @@ Item {
     // category — otherwise the visible focus drifts off whichever
     // screen the user is on.
     function restoreFromCategoriesReset(): void {
-        const savedCategory = Browse.HubState.category;
+        const savedCategory = CategoryIds.canonicalize(Browse.HubState.category);
         const idx = savedCategory === "" ? -1 : Browse.CategoriesModel.index_for_category(savedCategory);
         const chosenCategoryIndex = idx >= 0 ? idx : 0;
         const chosenCategory = idx >= 0 ? savedCategory : Browse.CategoriesModel.category_at(chosenCategoryIndex);
@@ -171,9 +233,15 @@ Item {
         // Settings — the only meaningful action ("Run Update media
         // database from Settings") the empty-hub message points at.
         const savedRow = Browse.HubState.selected_row;
-        if (savedRow === 1) {
+        const savedAction = Browse.HubState.selected_action;
+        if (savedRow === 1 && savedAction !== "") {
             hub.currentRow = 1;
-            hub.currentIndex = hub._actionIndexForId(Browse.HubState.selected_action);
+            hub.currentIndex = hub._actionIndexForId(savedAction);
+        } else if (idx >= 0) {
+            hub.currentRow = 0;
+            hub.currentIndex = chosenCategoryIndex;
+        } else if (hub.resumeActionVisible) {
+            hub.focusResumeIfVisible();
         } else if (Browse.CategoriesModel.count === 0) {
             hub.currentRow = 1;
             hub.currentIndex = hub._actionIndexForId("settings");
@@ -197,7 +265,7 @@ Item {
     // against. Both rows wrap modulo their count so a single Left/Right
     // press at either end whips around to the far side.
     function _navigate(delta: int): bool {
-        const count = hub.currentRow === 0 ? Browse.CategoriesModel.count : hub.actionEntries.length;
+        const count = hub.currentRow === 0 ? hub.visibleCategoryEntries.length : hub.actionEntries.length;
         if (count <= 0)
             return false;
         const next = ((hub.currentIndex + delta) % count + count) % count;
@@ -247,7 +315,7 @@ Item {
     // Returns false only when the destination row is empty (no
     // categories loaded yet, etc.).
     function _crossRow(): bool {
-        const topCount = Browse.CategoriesModel.count;
+        const topCount = hub.visibleCategoryEntries.length;
         const bottomCount = hub.actionEntries.length;
         const sourceCount = hub.currentRow === 0 ? topCount : bottomCount;
         const destCount = hub.currentRow === 0 ? bottomCount : topCount;
@@ -273,10 +341,18 @@ Item {
     // press fires two model resets per press, each destroying-and-
     // recreating SystemsScreen's bound delegates on the UI thread —
     // choppy on MiSTer even though SystemsScreen is `visible: false`.
+    function _currentCategoryId(): string {
+        if (Browse.CategoriesModel.count > 0 && hub.currentIndex < Browse.CategoriesModel.count)
+            return Browse.CategoriesModel.category_at(hub.currentIndex);
+        const entry = hub.visibleCategoryEntries[hub.currentIndex];
+        return entry ? CategoryIds.canonicalize(entry.id) : "";
+    }
+
     function _commitCategorySelection(): void {
         Browse.HubState.selected_row = 0;
-        if (Browse.CategoriesModel.count > 0)
-            Browse.HubState.category = Browse.CategoriesModel.category_at(hub.currentIndex);
+        const category = hub._currentCategoryId();
+        if (category !== "")
+            Browse.HubState.category = category;
     }
 
     function _commitActionSelection(): void {
@@ -292,7 +368,7 @@ Item {
     }
 
     function _focusCategory(index: int): void {
-        if (index < 0 || index >= Browse.CategoriesModel.count)
+        if (index < 0 || index >= hub.visibleCategoryEntries.length)
             return;
         hub.currentRow = 0;
         hub.currentIndex = index;
@@ -312,11 +388,13 @@ Item {
     }
 
     function _activateCurrent(): void {
+        hub._commitCurrent();
         if (hub.currentRow === 0) {
-            // Empty row sends "" — router treats that as the committed
-            // "Enter on empty hub goes to Systems" passthrough.
-            const chosen = Browse.CategoriesModel.count <= 0 ? "" : Browse.CategoriesModel.category_at(hub.currentIndex);
-            hub.requestAccept(chosen);
+            // During optimistic boot the visible category row is backed
+            // by localized placeholder labels. Accept the stable category
+            // id, not the display name, so persisted HubState and router
+            // comparisons remain locale-independent.
+            hub.requestAccept(hub._currentCategoryId());
             return;
         }
 
@@ -360,7 +438,7 @@ Item {
         readonly property int spacing: Sizing.pctW(3)
         readonly property int sideInset: Sizing.pctW(5)
         readonly property int maxCellWidth: Sizing.pctH(22)
-        readonly property int n: Browse.CategoriesModel.count
+        readonly property int n: hub.visibleCategoryEntries.length
         // n=0 falls back to maxCellWidth so the actions row (which
         // mirrors `categoriesRow.cellWidth`) still renders at proper
         // size when the catalog reports 0 systems. Without the
@@ -400,14 +478,13 @@ Item {
         Repeater {
             id: itemRepeater
 
-            model: Browse.CategoriesModel
+            model: hub.visibleCategoryEntries
 
             Item {
                 id: cellItem
 
                 required property int index
-                required property string name
-                required property string coverKey
+                required property var modelData
 
                 x: categoriesRow.rowOriginX + index * (categoriesRow.cellWidth + categoriesRow.spacing)
                 y: categoriesRow.verticalPadding
@@ -424,8 +501,8 @@ Item {
                     sourceComponent: tileDelegate
                     isSelected: cellItem.isSelected
                     isFocused: hub.currentRow === 0
-                    name: cellItem.name
-                    coverKey: cellItem.coverKey
+                    name: cellItem.modelData.name
+                    coverKey: cellItem.modelData.coverKey
                 }
 
                 MouseArea {
@@ -543,8 +620,9 @@ Item {
                 const entry = hub.actionEntries[hub.currentIndex];
                 return entry ? entry.text : "";
             }
-            if (Browse.CategoriesModel.count > 0)
-                return Browse.CategoriesModel.category_at(hub.currentIndex);
+            const entry = hub.visibleCategoryEntries[hub.currentIndex];
+            if (entry)
+                return entry.name;
             return "";
         }
         visible: !hub.transitioning
@@ -559,9 +637,10 @@ Item {
         y: categoriesRow.y + Sizing.center(categoriesRow.height, height)
         width: categoriesRow.width
         height: categoriesRow.height
+        enabled: Browse.CategoriesModel.loaded || (Browse.CategoriesModel.error_message ?? "") !== ""
         loading: false
         errorMessage: Browse.CategoriesModel.error_message ?? ""
-        count: Browse.CategoriesModel.count
+        count: Browse.CategoriesModel.loaded ? Browse.CategoriesModel.count : 1
         emptyText: qsTr("No systems available. Run Update media database from Settings.")
     }
 }

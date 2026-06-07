@@ -37,6 +37,7 @@ Item {
     // the tile ring keeps a single visible focus indicator at all
     // times. The ring restores automatically when the modal pops.
     property bool gridFocused: true
+    property bool optimisticLoading: false
     readonly property bool _listLayout: Browse.Settings.current_browse_layout === "list"
     readonly property bool _crtGridLayout: Theme.crtNativePath && !systems._listLayout
     readonly property bool _crtListStrip: Theme.crtNativePath && systems._listLayout
@@ -109,7 +110,7 @@ Item {
     // Mirrors ScreenStateOverlay's `state` ternary so accept routing and
     // the in-screen overlay agree on which state we're in.
     function _state(): string {
-        if (Browse.SystemsModel.loading)
+        if (Browse.SystemsModel.loading || systems.optimisticLoading)
             return "loading";
         if ((Browse.SystemsModel.error_message ?? "") !== "")
             return "error";
@@ -320,7 +321,8 @@ Item {
         y: systems._listLayout ? listCard.y : systemsGrid.y
         width: systems._listLayout ? systems.width : systemsGrid.width
         height: systems._listLayout ? Math.max(0, systems.height - listCard.y - systems._listOverlayBottomMargin) : systemsGrid.height
-        loading: Browse.SystemsModel.loading
+        enabled: true
+        loading: Browse.SystemsModel.loading || systems.optimisticLoading
         errorMessage: Browse.SystemsModel.error_message ?? ""
         count: Browse.SystemsModel.count
         emptyText: qsTr("No systems in this category")

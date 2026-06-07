@@ -67,6 +67,7 @@ Item {
 
     property bool transitioning: false
     property bool gridFocused: true
+    property bool optimisticLoading: false
     property bool detailRapidScrollActive: false
     property bool detailRapidIndicatorActive: detailRapidScrollActive
     property string detailRapidScrollAction: ""
@@ -76,6 +77,7 @@ Item {
     property bool showTopStrip: true
     property bool showBottomStatusRow: false
     property bool activeLabelAtBottom: false
+    property bool suppressSelectionPersist: false
     property int gridBottomMargin: Sizing.pctH(15)
     property int activeLabelBottomMargin: 0
     property int activeLabelHeight: Sizing.pctH(7)
@@ -120,7 +122,7 @@ Item {
     }
 
     function _loading(): bool {
-        return root.mediaModel !== null ? root.mediaModel.loading : false;
+        return root.optimisticLoading || (root.mediaModel !== null ? root.mediaModel.loading : false);
     }
 
     function _errorMessage(): string {
@@ -151,7 +153,7 @@ Item {
     }
 
     function _persistFocus(): void {
-        if (root.mediaModel === null)
+        if (root.suppressSelectionPersist || root.mediaModel === null)
             return;
         const idx = mediaGrid.currentIndex;
         if (idx < 0)
@@ -508,6 +510,7 @@ Item {
         y: root._listLayout ? listCard.y : mediaGrid.y
         width: root._listLayout ? listCard.width : mediaGrid.width
         height: root._listLayout ? Math.max(0, root.height - listCard.y - root._listOverlayBottomMargin) : mediaGrid.height
+        enabled: true
         loading: root._loading()
         errorMessage: root._errorMessage()
         count: root._count()
