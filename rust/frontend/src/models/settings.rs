@@ -193,6 +193,14 @@ pub mod ffi {
         #[qproperty(bool, current_debug_logging, READ, WRITE = set_debug_logging, NOTIFY)]
         #[qproperty(QStringList, available_screensaver_timeouts, READ, CONSTANT)]
         #[qproperty(QString, current_screensaver_timeout, READ, WRITE = set_screensaver_timeout, NOTIFY)]
+        #[qproperty(QStringList, available_media_image_types, READ, CONSTANT)]
+        #[qproperty(QString, current_media_image_type, READ, WRITE = set_media_image_type, NOTIFY)]
+        // Kiosk lockdown flags — READ + CONSTANT, admin-set via
+        // frontend.toml. See SettingsRust doc comment.
+        #[qproperty(bool, current_hide_settings, READ, CONSTANT)]
+        #[qproperty(bool, current_hide_favorites, READ, CONSTANT)]
+        #[qproperty(bool, current_hide_recents, READ, CONSTANT)]
+        #[qproperty(bool, current_hide_resume, READ, CONSTANT)]
         type Settings = super::SettingsRust;
 
         #[qinvokable]
