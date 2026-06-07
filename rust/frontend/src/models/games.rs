@@ -31,6 +31,7 @@
 // when the user spams direction-arrow + Accept across a model swap.
 
 use crate::media_image_cache::{global_media_image_cache, MediaImageCache, MediaKey};
+use crate::models::tag_utils::tag_display_value;
 use crate::models::{global_handle, global_store};
 use cxx_qt::{CxxQtType, Threading};
 use cxx_qt_lib::{
@@ -1217,9 +1218,9 @@ fn detail_value_for_aliases(source: &[TagInfo], aliases: &[&str]) -> String {
             aliases
                 .iter()
                 .any(|alias| tag.tag_type.eq_ignore_ascii_case(alias))
-                && !tag.tag.trim().is_empty()
+                && !tag_display_value(tag).is_empty()
         })
-        .map(|tag| tag.tag.trim().to_string())
+        .map(tag_display_value)
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -3123,6 +3124,7 @@ mod tests {
         let tags = vec![TagInfo {
             tag_type: "genre".into(),
             tag: "Platformer".into(),
+            label: String::new(),
         }];
         let detail = detail_tags_from_tags(&tags);
         let rows: Vec<&str> = detail.split('\n').collect();
@@ -3145,23 +3147,39 @@ mod tests {
             TagInfo {
                 tag_type: "platform".into(),
                 tag: "Arcade".into(),
+                label: String::new(),
             },
             TagInfo {
                 tag_type: "release_date".into(),
                 tag: "1984".into(),
+                label: String::new(),
             },
             TagInfo {
                 tag_type: "gamegenre".into(),
                 tag: "Action".into(),
+                label: String::new(),
             },
             TagInfo {
                 tag_type: "genre".into(),
                 tag: "Shooter".into(),
+                label: String::new(),
             },
         ];
         let detail = detail_tags_from_tags(&tags);
         let rows: Vec<&str> = detail.split('\n').collect();
         assert_eq!(rows[0], "Year\t1984");
         assert_eq!(rows[1], "Genre\tAction, Shooter");
+    }
+
+    #[test]
+    fn detail_tags_prefer_label_for_display() {
+        let tags = vec![TagInfo {
+            tag_type: "developer".into(),
+            tag: "nintendo".into(),
+            label: "Nintendo".into(),
+        }];
+        let detail = detail_tags_from_tags(&tags);
+        let rows: Vec<&str> = detail.split('\n').collect();
+        assert_eq!(rows[3], "Developer\tNintendo");
     }
 }
