@@ -113,10 +113,16 @@ pub mod ffi {
         fn start_index(self: Pin<&mut MediaStatus>);
 
         #[qinvokable]
+        fn start_index_for_system(self: Pin<&mut MediaStatus>, system_id: QString);
+
+        #[qinvokable]
         fn cancel_index(self: Pin<&mut MediaStatus>);
 
         #[qinvokable]
         fn start_scrape(self: Pin<&mut MediaStatus>, force: bool);
+
+        #[qinvokable]
+        fn start_scrape_for_system(self: Pin<&mut MediaStatus>, system_id: QString);
 
         #[qinvokable]
         fn cancel_scrape(self: Pin<&mut MediaStatus>);
@@ -199,6 +205,8 @@ fn project(state: &MediaStatusState) -> Snapshot {
 
 impl Initialize for ffi::MediaStatus {
     fn initialize(mut self: Pin<&mut Self>) {
+        let started = std::time::Instant::now();
+        crate::startup_trace("rust:model MediaStatus init start");
         let resource = crate::models::global_store().media_status();
         let mut rx = resource.subscribe();
         apply(self.as_mut(), project(&rx.borrow_and_update()));
@@ -210,6 +218,10 @@ impl Initialize for ffi::MediaStatus {
                 let _ = qt_thread.queue(move |m| apply(m, snapshot));
             }
         });
+        crate::startup_trace(format!(
+            "rust:model MediaStatus init end dur_ms={}",
+            started.elapsed().as_millis()
+        ));
     }
 }
 
@@ -219,6 +231,23 @@ impl ffi::MediaStatus {
         crate::models::global_handle().spawn(async move {
             if let Err(e) = resource.start_index(MediaIndexParams::default()).await {
                 warn!("media_status: start_index failed: {}", e.message);
+            }
+        });
+    }
+
+    fn start_index_for_system(self: Pin<&mut Self>, system_id: QString) {
+        let system_id: String = system_id.into();
+        if system_id.is_empty() {
+            warn!("media_status: start_index_for_system ignored empty system_id");
+            return;
+        }
+        let resource = crate::models::global_store().media_status();
+        crate::models::global_handle().spawn(async move {
+            let params = MediaIndexParams {
+                systems: Some(vec![system_id]),
+            };
+            if let Err(e) = resource.start_index(params).await {
+                warn!("media_status: start_index_for_system failed: {}", e.message);
             }
         });
     }
@@ -251,6 +280,28 @@ impl ffi::MediaStatus {
             };
             if let Err(e) = resource.start_scrape(params).await {
                 warn!("media_status: start_scrape failed: {}", e.message);
+            }
+        });
+    }
+
+    fn start_scrape_for_system(self: Pin<&mut Self>, system_id: QString) {
+        let system_id: String = system_id.into();
+        if system_id.is_empty() {
+            warn!("media_status: start_scrape_for_system ignored empty system_id");
+            return;
+        }
+        let resource = crate::models::global_store().media_status();
+        crate::models::global_handle().spawn(async move {
+            let params = MediaScrapeParams {
+                scraper_id: "gamelist.xml".into(),
+                systems: vec![system_id],
+                force: false,
+            };
+            if let Err(e) = resource.start_scrape(params).await {
+                warn!(
+                    "media_status: start_scrape_for_system failed: {}",
+                    e.message
+                );
             }
         });
     }

@@ -5,6 +5,7 @@
 use crate::media_image_cache::{
     global_media_image_cache, MediaImageCache, MediaImageUpdate, MediaKey,
 };
+use crate::models::tag_utils::tag_display_value;
 use crate::models::{global_handle, global_store};
 use cxx_qt::{CxxQtType, Threading};
 use cxx_qt_lib::QString;
@@ -223,9 +224,10 @@ fn detail_tags_from_meta(meta: &MediaMeta, path: &str) -> String {
             source
                 .iter()
                 .filter(|tag| {
-                    tag.tag_type.eq_ignore_ascii_case(tag_type) && !tag.tag.trim().is_empty()
+                    tag.tag_type.eq_ignore_ascii_case(tag_type)
+                        && !tag_display_value(tag).is_empty()
                 })
-                .map(|tag| (display_label(&tag.tag_type), tag.tag.trim().to_string())),
+                .map(|tag| (display_label(&tag.tag_type), tag_display_value(tag))),
         );
     }
     rows.extend(
@@ -234,9 +236,9 @@ fn detail_tags_from_meta(meta: &MediaMeta, path: &str) -> String {
             .filter(|tag| {
                 !is_ordered_tag(&tag.tag_type)
                     && !tag.tag_type.trim().is_empty()
-                    && !tag.tag.trim().is_empty()
+                    && !tag_display_value(tag).is_empty()
             })
-            .map(|tag| (display_label(&tag.tag_type), tag.tag.trim().to_string())),
+            .map(|tag| (display_label(&tag.tag_type), tag_display_value(tag))),
     );
     let filename = file_stem_or_name(path);
     if !filename.is_empty() {

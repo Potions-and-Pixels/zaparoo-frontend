@@ -25,6 +25,8 @@ import Zaparoo.Browse as Browse
 Item {
     id: about
 
+    Component.onCompleted: console.debug("startup/qml component AboutScreen completed")
+
     // Bound by MainLayout to `root.pendingTransition !== ""`. About is
     // a destination, never a source — kept for parity with the other
     // screens.
@@ -256,13 +258,13 @@ Item {
                     renderType: Text.NativeRendering
                 }
 
-                // Translator names are not translated, they're proper
-                // names. Native-language labels (Italiano, Español) read
-                // correctly in any UI locale.
+                // Translator names are proper names; the full block stays
+                // one text item so translators can localize language labels
+                // without changing the credits layout.
                 Text {
                     anchors.horizontalCenter: parent.horizontalCenter
                     horizontalAlignment: Text.AlignHCenter
-                    text: "Italiano - Andrea Bogazzi\nEspañol - Carlos R."
+                    text: qsTr("Italiano - Andrea Bogazzi\nEspañol - Carlos R.\nEuskara - devilschile2")
                     color: Theme.textPrimary
                     font.family: Theme.fontUi
                     font.pixelSize: Sizing.fontSize(2.6)

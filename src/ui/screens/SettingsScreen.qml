@@ -22,10 +22,13 @@ import Zaparoo.Browse as Browse
 // Mouse support is cross-platform and controls cursor visibility plus mouse
 // hit targets.
 //
-// Pure input dispatcher: emits `requestHubScreen()` on Escape; left/
-// right cycle the focused field's value via the model singleton.
+// Pure input dispatcher: root rows open category subpages; subpage
+// rows open pickers, toggle values, or emit router actions. Escape
+// returns from subpage to root, then from root to Hub.
 Item {
     id: settings
+
+    Component.onCompleted: console.debug("startup/qml component SettingsScreen completed")
 
     // Bound by MainLayout to `root.pendingTransition !== ""`. Settings
     // is a destination, never a source, so this is currently always
@@ -33,6 +36,7 @@ Item {
     // other screens so the convention holds when a future routing
     // change adds a Settings-as-source path.
     property bool transitioning: false
+    property bool optimisticLoading: false
 
     signal requestHubScreen
     // Forward signal carrying the focused action row's id. The router
@@ -44,22 +48,42 @@ Item {
     // matching `Browse.Settings` setter (keyed off `fieldId`).
     signal requestListPicker(title: string, entries: var, initialId: string, fieldId: string)
 
-    // Field registry. Each entry's `kind` is `"header"` (non-focusable
-    // group label) or `"field"` (a navigable row). Field entries also
-    // carry an `id` that handleAction routes to the right model setter.
-    // Keeping this as data (rather than a Repeater of typed children)
-    // makes adding rows a one-line edit and keeps navigation uniform.
-    //
-    // Section grouping mirrors the Settings menus on Switch/Xbox/
-    // Playnite/Pegasus: a single page with non-focusable headers
-    // splitting commonly-used controls (General, Library) from rarer
-    // diagnostics-flavoured ones (Advanced).
-    readonly property var fields: {
+    readonly property string pageRoot: "root"
+    readonly property string pageDisplayInterface: "displayInterface"
+    readonly property string pageControlsInput: "controlsInput"
+    readonly property string pageLibraryData: "libraryData"
+    readonly property string pageSupportAbout: "supportAbout"
+    property string currentPage: settings.pageRoot
+    property var _pageIndexes: ({})
+
+    // Page-aware field registries. The root mirrors console settings
+    // menus: stable domain categories first, short subpages second.
+    // Future Core features should land in these domains rather than a
+    // vague Advanced bucket.
+    readonly property var categoryFields: [
+        {
+            kind: "field",
+            id: "pageDisplayInterface",
+            label: qsTr("Display & Interface")
+        },
+        {
+            kind: "field",
+            id: "pageControlsInput",
+            label: qsTr("Controls & Input")
+        },
+        {
+            kind: "field",
+            id: "pageLibraryData",
+            label: qsTr("Library & Data Management")
+        },
+        {
+            kind: "field",
+            id: "pageSupportAbout",
+            label: qsTr("Support & About")
+        }
+    ]
+    readonly property var displayInterfaceFields: {
         const out = [];
-        out.push({
-            kind: "header",
-            label: qsTr("General")
-        });
         if (Browse.Settings.is_mister) {
             out.push({
                 kind: "field",
@@ -67,11 +91,6 @@ Item {
                 label: qsTr("Resolution")
             });
         }
-        out.push({
-            kind: "field",
-            id: "language",
-            label: qsTr("Language")
-        });
         out.push({
             kind: "field",
             id: "orientation",
@@ -84,8 +103,8 @@ Item {
         });
         out.push({
             kind: "field",
-            id: "buttonLayout",
-            label: qsTr("Button style")
+            id: "mediaImageType",
+            label: qsTr("Preferred artwork")
         });
         out.push({
             kind: "field",
@@ -93,59 +112,84 @@ Item {
             label: qsTr("Screensaver")
         });
         out.push({
-            kind: "header",
-            label: qsTr("Library")
-        });
-        out.push({
             kind: "field",
-            id: "discoverArcadeAlternateVersions",
-            label: qsTr("Discover arcade alternate versions")
+            id: "language",
+            label: qsTr("Language")
         });
-        out.push({
+        return out;
+    }
+    readonly property var controlsInputFields: [
+        {
             kind: "field",
-            id: "mediaImageType",
-            label: qsTr("Preferred artwork")
-        });
-        out.push({
-            kind: "field",
-            id: "updateMediaDb",
-            label: qsTr("Update media database")
-        });
-        out.push({
-            kind: "field",
-            id: "runScraper",
-            label: qsTr("Scrape metadata")
-        });
-        out.push({
-            kind: "field",
-            id: "rescrapeExisting",
-            label: qsTr("Re-scrape existing")
-        });
-        out.push({
-            kind: "header",
-            label: qsTr("Advanced")
-        });
-        out.push({
+            id: "buttonLayout",
+            label: qsTr("Button style")
+        },
+        {
             kind: "field",
             id: "mouseEnabled",
             label: qsTr("Mouse support")
-        });
-        out.push({
+        }
+    ]
+    readonly property var libraryDataFields: [
+        {
             kind: "field",
-            id: "debugLogging",
-            label: qsTr("Debug logging")
-        });
-        out.push({
+            id: "updateMediaDb",
+            label: qsTr("Update media database")
+        },
+        {
             kind: "field",
-            id: "uploadLog",
-            label: qsTr("Upload log file")
-        });
-        out.push({
+            id: "discoverArcadeAlternateVersions",
+            label: qsTr("Discover arcade alternate versions")
+        },
+        {
+            kind: "field",
+            id: "runScraper",
+            label: qsTr("Scrape metadata")
+        },
+        {
+            kind: "field",
+            id: "rescrapeExisting",
+            label: qsTr("Re-scrape existing")
+        }
+    ]
+    readonly property var supportAboutFields: [
+        {
             kind: "field",
             id: "aboutLicense",
             label: qsTr("About / License")
-        });
-        return out;
+        },
+        {
+            kind: "field",
+            id: "debugLogging",
+            label: qsTr("Debug logging")
+        },
+        {
+            kind: "field",
+            id: "uploadLog",
+            label: qsTr("Upload log file")
+        }
+    ]
+    readonly property var fields: {
+        if (settings.currentPage === settings.pageDisplayInterface)
+            return settings.displayInterfaceFields;
+        if (settings.currentPage === settings.pageControlsInput)
+            return settings.controlsInputFields;
+        if (settings.currentPage === settings.pageLibraryData)
+            return settings.libraryDataFields;
+        if (settings.currentPage === settings.pageSupportAbout)
+            return settings.supportAboutFields;
+        return settings.categoryFields;
+    }
+    readonly property string pageTitle: {
+        if (settings.currentPage === settings.pageDisplayInterface)
+            return qsTr("Display & Interface");
+        if (settings.currentPage === settings.pageControlsInput)
+            return qsTr("Controls & Input");
+        if (settings.currentPage === settings.pageLibraryData)
+            return qsTr("Library & Data Management");
+        if (settings.currentPage === settings.pageSupportAbout)
+            return qsTr("Support & About");
+        return qsTr("Settings");
     }
 
     // Live-state caption helpers for the action rows. While the matching
@@ -254,7 +298,7 @@ Item {
     function _fieldControl(id: string): string {
         if (id === "mouseEnabled" || id === "discoverArcadeAlternateVersions" || id === "debugLogging" || id === "rescrapeExisting")
             return "toggle";
-        if (id === "aboutLicense")
+        if (id === "aboutLicense" || id === "pageDisplayInterface" || id === "pageControlsInput" || id === "pageLibraryData" || id === "pageSupportAbout")
             return "navigate";
         if (id === "updateMediaDb" || id === "runScraper" || id === "uploadLog")
             return "action";
@@ -327,14 +371,14 @@ Item {
         const id = settings.fields[settings.currentIndex].id;
         return id === "language" || id === "orientation" || id === "browseLayout" || id === "buttonLayout" || id === "resolution" || id === "screensaverTimeout" || id === "mediaImageType";
     }
-    // True when the focused field is an action button (updateMediaDb,
-    // runScraper, uploadLog, aboutLicense). Drives the help-bar Accept
-    // hint and the SettingsField chevron.
+    // True when focused row accepts A without left/right cycling:
+    // pickers, jobs, modal/navigation rows, and root category rows.
+    // Drives help-bar Accept hint and suppresses left/right Change cue.
     readonly property bool focusedFieldIsAction: {
         if (!settings._isField(settings.currentIndex))
             return false;
         const id = settings.fields[settings.currentIndex].id;
-        return id === "updateMediaDb" || id === "runScraper" || id === "uploadLog" || id === "aboutLicense";
+        return settings.focusedFieldIsPicker || id === "updateMediaDb" || id === "runScraper" || id === "uploadLog" || id === "aboutLicense" || id === "pageDisplayInterface" || id === "pageControlsInput" || id === "pageLibraryData" || id === "pageSupportAbout";
     }
     // Verb shown on the help-bar Accept hint for the focused action
     // row. Index/scrape flip between Start and Cancel because the press
@@ -349,9 +393,7 @@ Item {
             return settings.focusedActionBusy ? qsTr("Cancel") : qsTr("Start");
         if (id === "uploadLog")
             return qsTr("Upload");
-        if (id === "aboutLicense")
-            return qsTr("Open");
-        return "";
+        return qsTr("Open");
     }
     // True when the focused action's matching operation is currently
     // running, so the help bar can label Accept as "Cancel" rather
@@ -426,33 +468,39 @@ Item {
     }
 
     function _languageDisplay(value: string): string {
-        if (value === "en")
+        if (value === "en" || value === "en_US" || value === "en_GB")
             return qsTr("English");
         if (value === "it_IT")
             return qsTr("Italian");
-        if (value === "de")
+        if (value === "es" || value === "es_ES")
+            return qsTr("Spanish");
+        if (value === "eu" || value === "eu_ES")
+            return qsTr("Basque");
+        if (value === "de" || value === "de_DE")
             return qsTr("German");
-        if (value === "el")
+        if (value === "el" || value === "el_GR")
             return qsTr("Greek");
-        if (value === "ja")
+        if (value === "ja" || value === "ja_JP")
             return qsTr("Japanese");
-        if (value === "ko")
+        if (value === "ko" || value === "ko_KR")
             return qsTr("Korean");
-        if (value === "nl")
+        if (value === "nl" || value === "nl_NL")
             return qsTr("Dutch");
-        if (value === "ro")
+        if (value === "ro" || value === "ro_RO")
             return qsTr("Romanian");
-        if (value === "sk")
+        if (value === "sk" || value === "sk_SK")
             return qsTr("Slovak");
-        if (value === "uk")
+        if (value === "uk" || value === "uk_UA")
             return qsTr("Ukrainian");
         if (value === "zh_CN")
             return qsTr("Chinese (Simplified)");
-        if (value === "he")
+        if (value === "zh_TW" || value === "zh_HK")
+            return qsTr("Chinese (Traditional)");
+        if (value === "he" || value === "he_IL")
             return qsTr("Hebrew");
-        if (value === "ar")
+        if (value === "ar" || value === "ar_SA")
             return qsTr("Arabic");
-        if (value === "hi")
+        if (value === "hi" || value === "hi_IN")
             return qsTr("Hindi");
         return qsTr("Auto");
     }
@@ -674,7 +722,53 @@ Item {
             settings._setRescrapeExisting(direction);
     }
 
+    function _rememberPageFocus(): void {
+        settings._pageIndexes[settings.currentPage] = settings.currentIndex;
+    }
+
+    function _restorePageFocus(): void {
+        const first = settings._firstNavigableIndex();
+        const fallback = first >= 0 ? first : 0;
+        const remembered = settings._pageIndexes[settings.currentPage];
+        const idx = remembered === undefined ? fallback : Math.max(0, Math.min(settings.fieldCount - 1, remembered));
+        settings.currentIndex = settings._isField(idx) ? idx : fallback;
+        flickable.contentY = 0;
+    }
+
+    function _switchPage(page: string): void {
+        settings._rememberPageFocus();
+        settings.currentPage = page;
+        settings._restorePageFocus();
+    }
+
+    function _openPage(id: string): bool {
+        if (id === "pageDisplayInterface")
+            settings._switchPage(settings.pageDisplayInterface);
+        else if (id === "pageControlsInput")
+            settings._switchPage(settings.pageControlsInput);
+        else if (id === "pageLibraryData")
+            settings._switchPage(settings.pageLibraryData);
+        else if (id === "pageSupportAbout")
+            settings._switchPage(settings.pageSupportAbout);
+        else
+            return false;
+        return true;
+    }
+
+    function _goBack(): void {
+        if (settings.currentPage !== settings.pageRoot) {
+            settings._switchPage(settings.pageRoot);
+            return;
+        }
+        settings.requestHubScreen();
+    }
+
     function handleAction(action: string): void {
+        if (settings.optimisticLoading) {
+            if (action === "cancel")
+                settings._goBack();
+            return;
+        }
         if (action === "up") {
             settings.currentIndex = settings._seekNavigable(settings.currentIndex, -1);
         } else if (action === "down") {
@@ -687,6 +781,8 @@ Item {
             if (!settings._isField(settings.currentIndex))
                 return;
             const id = settings.fields[settings.currentIndex].id;
+            if (settings._openPage(id))
+                return;
             if (id === "mouseEnabled")
                 settings._toggleMouseEnabled();
             else if (id === "discoverArcadeAlternateVersions")
@@ -706,7 +802,7 @@ Item {
             else
                 settings._openPickerForField(id);
         } else if (action === "cancel") {
-            settings.requestHubScreen();
+            settings._goBack();
         }
     }
 
@@ -715,17 +811,18 @@ Item {
     MouseArea {
         anchors.fill: parent
         acceptedButtons: Qt.RightButton
-        onClicked: settings.requestHubScreen()
+        onClicked: settings._goBack()
     }
 
     TopStatusStrip {
         id: topStrip
+        visible: !settings.optimisticLoading
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.top: parent.top
         anchors.topMargin: Sizing.headerBottom
         height: Sizing.pctH(7)
-        title: qsTr("Settings")
+        title: settings.pageTitle
         currentPage: 0
         totalPages: 0
         totalText: ""
@@ -758,6 +855,7 @@ Item {
     // margin clears the help bar (pctH(6)) plus a small gap.
     Flickable {
         id: flickable
+        visible: !settings.optimisticLoading
 
         // topMargin and bottomMargin are sized to leave a clear band
         // for the scroll chevrons to sit outside the scrollable area
@@ -848,7 +946,7 @@ Item {
                             else if (row.modelData.id === "rescrapeExisting")
                                 settings._toggleRescrapeExisting();
                         }
-                        onRightClicked: settings.requestHubScreen()
+                        onRightClicked: settings._goBack()
                         // Picker, action, and navigate rows route
                         // through `onAccepted` (see SettingsField's
                         // MouseArea), so the focus commit lives here
@@ -856,6 +954,8 @@ Item {
                         // the action.
                         onAccepted: {
                             settings.currentIndex = row.index;
+                            if (settings._openPage(row.modelData.id))
+                                return;
                             if (row.modelData.id === "updateMediaDb")
                                 settings._triggerIndex();
                             else if (row.modelData.id === "runScraper")
@@ -897,7 +997,7 @@ Item {
         anchors.horizontalCenter: flickable.horizontalCenter
         fillMode: Image.PreserveAspectFit
         smooth: true
-        visible: settings._hasContentAbove
+        visible: !settings.optimisticLoading && settings._hasContentAbove
     }
 
     Image {
@@ -909,7 +1009,7 @@ Item {
         anchors.horizontalCenter: flickable.horizontalCenter
         fillMode: Image.PreserveAspectFit
         smooth: true
-        visible: settings._hasContentBelow
+        visible: !settings.optimisticLoading && settings._hasContentBelow
     }
 
     // Empty-state placeholder shown on runtimes with no settings to
@@ -918,11 +1018,19 @@ Item {
     Text {
         x: Sizing.center(parent.width, width)
         y: Sizing.center(parent.height, height)
-        visible: settings.fieldCount === 0
+        visible: !settings.optimisticLoading && settings.fieldCount === 0
         text: qsTr("No settings available on this platform")
         color: Theme.textLabel
         font.family: Theme.fontUi
         font.pixelSize: Sizing.fontSize(2.6)
         renderType: Text.NativeRendering
+    }
+
+    ScreenStateOverlay {
+        anchors.fill: parent
+        enabled: settings.optimisticLoading
+        loading: settings.optimisticLoading
+        count: 0
+        loadingText: qsTr("Loading settings…")
     }
 }

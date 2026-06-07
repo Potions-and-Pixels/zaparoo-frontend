@@ -21,6 +21,7 @@ Item {
     property bool detailSuppressed: false
     property bool showChrome: true
     property string loadingText: qsTr("Loading…")
+    property int loadingDelayMs: 150
     property var layoutProfile: null
 
     readonly property var _detail: root.layoutProfile && root.layoutProfile.detail ? root.layoutProfile.detail : null
@@ -58,40 +59,103 @@ Item {
     readonly property int _carouselGutter: (canPreviousImage || canNextImage) ? Sizing.pctW(4) : 0
     readonly property bool _coverPending: coverKey === "icons/Loading"
     readonly property url _coverSource: _coverPending ? "" : Resources.coverUrl(coverKey)
+    readonly property bool _coverBusy: root._coverPending || cover.status === Image.Loading
     readonly property bool _paneLoading: root.loading
+    readonly property bool _delayedPaneLoading: root._paneLoading && root._paneLoadingDelayElapsed
+    readonly property bool _delayedCoverBusy: root._coverBusy && root._coverLoadingDelayElapsed
     readonly property bool _detailVisible: !root._paneLoading && !root.detailSuppressed
     readonly property bool _suppressedPlaceholderCover: root.detailSuppressed && coverKey.startsWith("icons/") && root._coverSource !== ""
     readonly property var _detailRows: _parseDetailTags(detailTags)
     readonly property int _tagRowCount: _detailRows.length
     readonly property int _tagTextSize: Sizing.fontSize(2.2)
     readonly property int _tagLabelGap: Sizing.pctW(1.4)
+    readonly property int _metadataLabelMaxWidth: root._detail && root._detail.metadataLabelMaxWidth !== undefined ? root._detail.metadataLabelMaxWidth : 0
+    readonly property int _labelColumnWidth: root._metadataLabelMaxWidth > 0 ? Math.min(root._labelColumnNaturalWidth, root._metadataLabelMaxWidth) : root._labelColumnNaturalWidth
     readonly property int _metadataNaturalHeight: _tagRowCount <= 0 ? 0 : (_tagRowCount * _tagRowHeight) + ((_tagRowCount - 1) * _tagRowSpacing)
     readonly property int _compactMetadataHeight: Math.min(Sizing.px(content.height * 0.38), _metadataNaturalHeight)
 
-    property int _labelColumnWidth: 0
+    property int _labelColumnNaturalWidth: 0
+    property bool _paneLoadingDelayElapsed: false
+    property bool _coverLoadingDelayElapsed: false
 
-    onDetailTagsChanged: root._labelColumnWidth = 0
+    onDetailTagsChanged: root._labelColumnNaturalWidth = 0
+    onLoadingChanged: root._updatePaneLoadingDelay()
+    onLoadingDelayMsChanged: {
+        root._updatePaneLoadingDelay();
+        root._updateCoverLoadingDelay();
+    }
+    on_CoverBusyChanged: root._updateCoverLoadingDelay()
 
-    function _localizedTagLabel(label: string): string {
+    Timer {
+        id: paneLoadingDelayTimer
+
+        interval: Math.max(0, root.loadingDelayMs)
+        repeat: false
+        onTriggered: root._paneLoadingDelayElapsed = root._paneLoading
+    }
+
+    Timer {
+        id: coverLoadingDelayTimer
+
+        interval: Math.max(0, root.loadingDelayMs)
+        repeat: false
+        onTriggered: root._coverLoadingDelayElapsed = root._coverBusy
+    }
+
+    function _updatePaneLoadingDelay(): void {
+        paneLoadingDelayTimer.stop();
+        root._paneLoadingDelayElapsed = false;
+        if (!root._paneLoading)
+            return;
+        if (root.loadingDelayMs <= 0) {
+            root._paneLoadingDelayElapsed = true;
+            return;
+        }
+        paneLoadingDelayTimer.restart();
+    }
+
+    function _updateCoverLoadingDelay(): void {
+        coverLoadingDelayTimer.stop();
+        root._coverLoadingDelayElapsed = false;
+        if (!root._coverBusy)
+            return;
+        if (root.loadingDelayMs <= 0) {
+            root._coverLoadingDelayElapsed = true;
+            return;
+        }
+        coverLoadingDelayTimer.restart();
+    }
+
+    function _tagLabel(fullLabel: string, shortLabel: string): var {
+        return {
+            "label": fullLabel + "\u009C" + shortLabel,
+            "measureLabel": fullLabel
+        };
+    }
+
+    function _localizedTagLabel(label: string): var {
         if (label === "Year")
-            return qsTr("Year");
+            return root._tagLabel(qsTr("Year"), qsTr("Yr", "Short metadata label for Year; keep 2-4 characters if possible"));
         if (label === "Genre")
-            return qsTr("Genre");
+            return root._tagLabel(qsTr("Genre"), qsTr("Gen", "Short metadata label for Genre; keep 2-4 characters if possible"));
         if (label === "Players")
-            return qsTr("Players");
+            return root._tagLabel(qsTr("Players"), qsTr("Plyr", "Short metadata label for Players; keep 2-4 characters if possible"));
         if (label === "Developer")
-            return qsTr("Developer");
+            return root._tagLabel(qsTr("Developer"), qsTr("Dev", "Short metadata label for Developer; keep 2-4 characters if possible"));
         if (label === "Publisher")
-            return qsTr("Publisher");
+            return root._tagLabel(qsTr("Publisher"), qsTr("Pub", "Short metadata label for Publisher; keep 2-4 characters if possible"));
         if (label === "Rating")
-            return qsTr("Rating");
+            return root._tagLabel(qsTr("Rating"), qsTr("Rtg", "Short metadata label for Rating; keep 2-4 characters if possible"));
         if (label === "Category")
-            return qsTr("Category");
+            return root._tagLabel(qsTr("Category"), qsTr("Cat", "Short metadata label for Category; keep 2-4 characters if possible"));
         if (label === "Release date")
-            return qsTr("Release date");
+            return root._tagLabel(qsTr("Release date"), qsTr("Date", "Short metadata label for Release date; keep 2-4 characters if possible"));
         if (label === "Manufacturer")
-            return qsTr("Manufacturer");
-        return label;
+            return root._tagLabel(qsTr("Manufacturer"), qsTr("Mfr", "Short metadata label for Manufacturer; keep 2-4 characters if possible"));
+        return {
+            "label": label,
+            "measureLabel": label
+        };
     }
 
     function _parseDetailTags(tags: string): var {
@@ -100,9 +164,11 @@ Item {
         return tags.split("\n").map(row => {
             const parts = row.split("\t");
             const rawLabel = parts.length > 0 ? parts[0] : "";
+            const label = root._localizedTagLabel(rawLabel);
             return {
                 "rawLabel": rawLabel,
-                "label": root._localizedTagLabel(rawLabel),
+                "label": label.label,
+                "measureLabel": label.measureLabel,
                 "value": parts.length > 1 ? parts[1] : ""
             };
         });
@@ -183,13 +249,13 @@ Item {
                     y: Sizing.center(parent.height, height)
                     width: Math.min(Sizing.pctH(10), parent.width, parent.height)
                     height: width
-                    source: Resources.iconUrl(root._coverPending || cover.status === Image.Loading ? "Loading" : "File")
+                    source: Resources.iconUrl(root._coverBusy ? "Loading" : "File")
                     sourceSize.width: Sizing.px(width)
                     sourceSize.height: Sizing.px(height)
                     fillMode: Image.PreserveAspectFit
                     smooth: true
                     asynchronous: false
-                    visible: !root._paneLoading && !root._suppressedPlaceholderCover && (root.detailSuppressed || root._coverPending || cover.status === Image.Loading || root._coverSource === "" || cover.status === Image.Error)
+                    visible: !root._paneLoading && !root._suppressedPlaceholderCover && (root.detailSuppressed || root._delayedCoverBusy || (!root._coverBusy && (root._coverSource === "" || cover.status === Image.Error)))
                 }
             }
         }
@@ -296,18 +362,19 @@ Item {
                                 height: root._tagRowHeight
 
                                 readonly property string label: modelData.label ?? ""
+                                readonly property string measureLabel: modelData.measureLabel ?? tagRow.label
                                 readonly property string value: modelData.value ?? ""
 
                                 TextMetrics {
                                     id: labelMetrics
 
-                                    text: tagRow.label
+                                    text: tagRow.measureLabel
                                     font.family: Theme.fontUi
                                     font.pixelSize: root._tagTextSize
-                                    onAdvanceWidthChanged: root._labelColumnWidth = Math.max(root._labelColumnWidth, Math.ceil(advanceWidth))
+                                    onAdvanceWidthChanged: root._labelColumnNaturalWidth = Math.max(root._labelColumnNaturalWidth, Math.ceil(advanceWidth))
                                 }
 
-                                Component.onCompleted: root._labelColumnWidth = Math.max(root._labelColumnWidth, Math.ceil(labelMetrics.advanceWidth))
+                                Component.onCompleted: root._labelColumnNaturalWidth = Math.max(root._labelColumnNaturalWidth, Math.ceil(labelMetrics.advanceWidth))
 
                                 Text {
                                     anchors.left: parent.left
@@ -317,6 +384,7 @@ Item {
                                     color: Theme.textLabel
                                     font.family: Theme.fontUi
                                     font.pixelSize: root._tagTextSize
+                                    textFormat: Text.PlainText
                                     elide: Text.ElideRight
                                     horizontalAlignment: Text.AlignRight
                                     renderType: Text.NativeRendering
@@ -345,7 +413,7 @@ Item {
         }
 
         LoadingIndicator {
-            visible: root._paneLoading && !root.detailSuppressed
+            visible: root._delayedPaneLoading && !root.detailSuppressed
             x: Sizing.center(parent.width, width)
             y: Sizing.center(parent.height, height)
             text: root.loadingText

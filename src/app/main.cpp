@@ -14,7 +14,6 @@
 #include <QFont>
 #include <QFontDatabase>
 #include <QGuiApplication>
-#include <QImageReader>
 #include <QList>
 #include <QLocale>
 #include <QPixmapCache>
@@ -55,6 +54,8 @@ extern "C" const char* zaparoo_rust_language_code();
 extern "C" bool zaparoo_rust_crt_native_path_enabled();
 extern "C" uint32_t zaparoo_rust_video_width();
 extern "C" uint32_t zaparoo_rust_video_height();
+extern "C" bool zaparoo_rust_debug_logging_enabled();
+extern "C" void zaparoo_rust_trace_startup(const uint8_t* stage, size_t len);
 
 // Pull Zaparoo QML plugin symbols into the final binary so the linker does
 // not strip their static-initializer registration functions.
@@ -125,6 +126,18 @@ static ParsedArguments extractCrtArgument(int argc, char* argv[])
 
 constexpr int kRestartExitCode = 1000;
 
+static void startupTrace(const char* stage)
+{
+    if (!zaparoo_rust_debug_logging_enabled())
+    {
+        return;
+    }
+    const size_t len = std::strlen(stage);
+    // Rust FFI accepts raw UTF-8 bytes; char storage is the source buffer.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    zaparoo_rust_trace_startup(reinterpret_cast<const uint8_t*>(stage), len);
+}
+
 int main(int argc, char* argv[]) // NOLINT
 {
     ParsedArguments parsedArgs = extractCrtArgument(argc, argv);
@@ -158,16 +171,39 @@ int main(int argc, char* argv[]) // NOLINT
     {
         return EXIT_FAILURE;
     }
+    startupTrace("cpp:rust init complete");
 
     // Start Core before Qt/font/QML setup so service boot overlaps the
     // frontend's own construction work. On desktop this is a no-op.
     zaparoo_rust_post_qt_start();
+    startupTrace("cpp:post-qt-start hook complete");
 
     // Install after zaparoo_rust_init() so tracing is live before any Qt
     // messages are emitted.
     qInstallMessageHandler(qtMessageHandler);
+    startupTrace("cpp:qt message handler installed");
+
+    // Resolve language before font registration so startup only pays for
+    // script fallback fonts the selected locale can actually use. The base
+    // NotoSans.ttf covers Latin/Greek/Cyrillic UI locales; the large CJK
+    // faces are only needed for Japanese/Korean/Chinese.
+    const QString langCode = QString::fromUtf8(zaparoo_rust_language_code());
+    const QLocale locale = langCode.isEmpty() ? QLocale::system() : QLocale(langCode);
+    const QLocale::Language uiLanguage = locale.language();
+    const bool crtNativePathEnabled = zaparoo_rust_crt_native_path_enabled();
+
+#ifdef ZAPAROO_EMBEDDED_BUILD
+    if (qEnvironmentVariableIsEmpty("QT_QPA_FONTDIR"))
+    {
+        qputenv("QT_QPA_FONTDIR", QByteArrayLiteral("/tmp/zaparoo"));
+    }
+#endif
+
     QGuiApplication app(qtArgc, qtArgv);
+    startupTrace("cpp:QGuiApplication constructed");
     QPixmapCache::setCacheLimit(kPixmapCacheLimitKiB);
+    startupTrace("cpp:QPixmapCache limit set");
+
     // addApplicationFont returns -1 on failure (broken qrc path,
     // unreadable file). Logging the failure mode keeps a refactor that
     // breaks the resource alias from silently degrading to the default
@@ -183,31 +219,89 @@ int main(int argc, char* argv[]) // NOLINT
         qInfo("Registered font %s: %s", qUtf8Printable(path),
               qUtf8Printable(QFontDatabase::applicationFontFamilies(fontId).join(", ")));
     };
-    registerFont(QStringLiteral(":/qt/qml/Zaparoo/App/resources/fonts/MxPlus_HP_100LX_6x8.ttf"));
-    registerFont(QStringLiteral(":/qt/qml/Zaparoo/App/resources/fonts/NotoSans.ttf"));
-    registerFont(QStringLiteral(":/qt/qml/Zaparoo/App/resources/fonts/NotoSansArabic.ttf"));
-    registerFont(QStringLiteral(":/qt/qml/Zaparoo/App/resources/fonts/NotoSansDevanagari.ttf"));
-    registerFont(QStringLiteral(":/qt/qml/Zaparoo/App/resources/fonts/NotoSansHebrew.ttf"));
-    registerFont(QStringLiteral(":/qt/qml/Zaparoo/App/resources/fonts/NotoSansJP.ttf"));
-    registerFont(QStringLiteral(":/qt/qml/Zaparoo/App/resources/fonts/NotoSansKR.ttf"));
-    registerFont(QStringLiteral(":/qt/qml/Zaparoo/App/resources/fonts/NotoSansTC.ttf"));
-    // Keep the primary UI fonts separated by mode (CRT = HP 100LX,
-    // standard = Noto Sans). Only register bundled CJK fallbacks so
-    // scripts the primary family lacks still resolve consistently.
-    QFontDatabase::addApplicationFallbackFontFamily(QChar::Script_Hiragana,
-                                                    QStringLiteral("Noto Sans JP"));
-    QFontDatabase::addApplicationFallbackFontFamily(QChar::Script_Katakana,
-                                                    QStringLiteral("Noto Sans JP"));
-    QFontDatabase::addApplicationFallbackFontFamily(QChar::Script_Hangul,
-                                                    QStringLiteral("Noto Sans KR"));
-    QFontDatabase::addApplicationFallbackFontFamily(QChar::Script_Han,
-                                                    QStringLiteral("Noto Sans TC"));
-    QFontDatabase::addApplicationFallbackFontFamily(QChar::Script_Arabic,
-                                                    QStringLiteral("Noto Sans Arabic"));
-    QFontDatabase::addApplicationFallbackFontFamily(QChar::Script_Devanagari,
-                                                    QStringLiteral("Noto Sans Devanagari"));
-    qInfo("Registered application font fallbacks for CJK, Arabic, and Devanagari scripts");
-    const bool crtNativePathEnabled = zaparoo_rust_crt_native_path_enabled();
+    struct FallbackFont
+    {
+        QChar::Script script;
+        QString path;
+        QString family;
+    };
+    const auto registerFallbackFont = [&registerFont](const FallbackFont& font)
+    {
+        registerFont(font.path);
+        QFontDatabase::addApplicationFallbackFontFamily(font.script, font.family);
+    };
+
+    if (crtNativePathEnabled)
+    {
+        registerFont(
+            QStringLiteral(":/qt/qml/Zaparoo/App/resources/fonts/MxPlus_HP_100LX_6x8.ttf"));
+    }
+    else
+    {
+        registerFont(QStringLiteral(":/qt/qml/Zaparoo/App/resources/fonts/NotoSans.ttf"));
+    }
+
+    bool registeredScriptFallback = false;
+    if (uiLanguage == QLocale::Arabic)
+    {
+        registerFallbackFont({QChar::Script_Arabic,
+                              QStringLiteral(":/qt/qml/Zaparoo/App/resources/fonts/"
+                                             "NotoSansArabic.ttf"),
+                              QStringLiteral("Noto Sans Arabic")});
+        registeredScriptFallback = true;
+    }
+    if (!crtNativePathEnabled && uiLanguage == QLocale::Hebrew)
+    {
+        registerFallbackFont({QChar::Script_Hebrew,
+                              QStringLiteral(":/qt/qml/Zaparoo/App/resources/fonts/"
+                                             "NotoSansHebrew.ttf"),
+                              QStringLiteral("Noto Sans Hebrew")});
+        registeredScriptFallback = true;
+    }
+    if (uiLanguage == QLocale::Hindi)
+    {
+        registerFallbackFont({QChar::Script_Devanagari,
+                              QStringLiteral(":/qt/qml/Zaparoo/App/resources/fonts/"
+                                             "NotoSansDevanagari.ttf"),
+                              QStringLiteral("Noto Sans Devanagari")});
+        registeredScriptFallback = true;
+    }
+    if (uiLanguage == QLocale::Japanese)
+    {
+        registerFallbackFont({QChar::Script_Hiragana,
+                              QStringLiteral(":/qt/qml/Zaparoo/App/resources/fonts/NotoSansJP.ttf"),
+                              QStringLiteral("Noto Sans JP")});
+        QFontDatabase::addApplicationFallbackFontFamily(QChar::Script_Katakana,
+                                                        QStringLiteral("Noto Sans JP"));
+        QFontDatabase::addApplicationFallbackFontFamily(QChar::Script_Han,
+                                                        QStringLiteral("Noto Sans JP"));
+        registeredScriptFallback = true;
+    }
+    if (uiLanguage == QLocale::Korean)
+    {
+        registerFallbackFont({QChar::Script_Hangul,
+                              QStringLiteral(":/qt/qml/Zaparoo/App/resources/fonts/NotoSansKR.ttf"),
+                              QStringLiteral("Noto Sans KR")});
+        registeredScriptFallback = true;
+    }
+    if (uiLanguage == QLocale::Chinese)
+    {
+        registerFallbackFont({QChar::Script_Han,
+                              QStringLiteral(":/qt/qml/Zaparoo/App/resources/fonts/NotoSansTC.ttf"),
+                              QStringLiteral("Noto Sans TC")});
+        registeredScriptFallback = true;
+    }
+    if (registeredScriptFallback)
+    {
+        qInfo("Registered locale-specific font fallbacks for %s", qUtf8Printable(locale.name()));
+    }
+    {
+        QFont defaultFont = QGuiApplication::font();
+        defaultFont.setFamily(crtNativePathEnabled ? QStringLiteral("MxPlus HP 100LX 6x8")
+                                                   : QStringLiteral("Noto Sans"));
+        QGuiApplication::setFont(defaultFont);
+    }
+    startupTrace("cpp:font registration complete");
     if (crtNativePathEnabled)
     {
         QQuickWindow::setTextRenderType(QQuickWindow::NativeTextRendering);
@@ -232,8 +326,6 @@ int main(int argc, char* argv[]) // NOLINT
     // The Rust side resolves `[general] language` from frontend.toml into a
     // BCP-47 tag ("ja", "de_DE") or an empty string (follow system locale).
     // Stack lifetime is fine — `translator` outlives app.exec() and all QML.
-    const QString langCode = QString::fromUtf8(zaparoo_rust_language_code());
-    const QLocale locale = langCode.isEmpty() ? QLocale::system() : QLocale(langCode);
     QTranslator translator;
     if (translator.load(locale, "frontend", "_", ":/i18n"))
     {
@@ -247,6 +339,7 @@ int main(int argc, char* argv[]) // NOLINT
         qInfo("No translation catalog for %s in :/i18n; using source strings",
               qUtf8Printable(locale.name()));
     }
+    startupTrace("cpp:translator setup complete");
 
     QQmlApplicationEngine engine;
     // Engine takes ownership of the provider — it deletes it when the
@@ -257,21 +350,7 @@ int main(int argc, char* argv[]) // NOLINT
     // MainLayout does).
     // NOLINTNEXTLINE(cppcoreguidelines-owning-memory)
     engine.addImageProvider(QStringLiteral("media-image"), new MediaImageProvider());
-
-    // One-shot diagnostic: a static MiSTer Qt build configured without
-    // `-feature-png` / libpng silently lacks the PNG QImageIOHandler, so
-    // `QImage::loadFromData(<png bytes>)` returns null and every cover
-    // looks "missing" with no other signal. Logging the registered
-    // formats at startup turns that failure mode into one decisive line.
-    QStringList formatNames;
-    const QList<QByteArray> supportedFormats = QImageReader::supportedImageFormats();
-    formatNames.reserve(supportedFormats.size());
-    for (const QByteArray& fmt : supportedFormats)
-    {
-        formatNames << QString::fromLatin1(fmt);
-    }
-    qInfo("QImageReader supportedImageFormats: %s",
-          qUtf8Printable(formatNames.join(QStringLiteral(", "))));
+    startupTrace("cpp:QQmlApplicationEngine + image provider ready");
 
     QVariantMap initialProperties = {
         {"crtNativePath", crtNativePathEnabled},
@@ -321,6 +400,7 @@ int main(int argc, char* argv[]) // NOLINT
     initialProperties.insert(QStringLiteral("videoHeight"),
                              static_cast<int>(zaparoo_rust_video_height()));
     engine.setInitialProperties(initialProperties);
+    startupTrace("cpp:QML initial properties set");
 
     // objectCreationFailed fires before loadFromModule returns when a QML
     // type fails to resolve or compile. Individual QML errors are already
@@ -331,6 +411,7 @@ int main(int argc, char* argv[]) // NOLINT
         &engine, &QQmlApplicationEngine::objectCreationFailed, &engine, [](const QUrl& url)
         { qCritical("QML object creation failed for %s", qUtf8Printable(url.toString())); });
 
+    startupTrace("cpp:loading QML root module");
     engine.loadFromModule("Zaparoo.App", "Main");
 
     if (engine.rootObjects().isEmpty())
@@ -338,11 +419,28 @@ int main(int argc, char* argv[]) // NOLINT
         qCritical("QML engine produced no root objects; startup aborted (see earlier errors)");
         return EXIT_FAILURE;
     }
+    startupTrace("cpp:QML root object created");
+
+    auto* rootWindow = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+    if (rootWindow != nullptr)
+    {
+        QObject::connect(rootWindow, &QQuickWindow::frameSwapped, rootWindow,
+                         [logged = false]() mutable
+                         {
+                             if (logged)
+                             {
+                                 return;
+                             }
+                             logged = true;
+                             startupTrace("cpp:first frame swapped");
+                         });
+    }
 
     if (crtNativePathEnabled)
     {
         qInfo("CRT startup decision: initialising native video writer");
         initNativeVideoWriter();
+        startupTrace("cpp:native video writer initialized");
         // Drive the fb0 -> DDR copy from Qt's render-finish signal so
         // we mirror exactly one frame per actual scenegraph render
         // (idle scenes produce no `frameSwapped` and therefore no
@@ -360,7 +458,6 @@ int main(int argc, char* argv[]) // NOLINT
         // queued connection puts it FIFO behind the UpdateRequest,
         // so `doRedraw()` runs first and we then read the freshly
         // updated fb0.
-        auto* rootWindow = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
         if (rootWindow != nullptr)
         {
             QObject::connect(

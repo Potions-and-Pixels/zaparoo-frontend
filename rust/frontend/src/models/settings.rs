@@ -87,8 +87,9 @@ const MISTER_RESOLUTIONS: &[&str] = &[
     "2048x1536",
 ];
 const LANGUAGES: &[&str] = &[
-    "auto", "en", "it_IT", "de", "el", "ja", "ko", "nl", "ro", "sk", "uk", "zh_CN", "he", "ar",
-    "hi",
+    "auto", "en", "en_US", "en_GB", "it_IT", "es", "es_ES", "eu", "eu_ES", "de", "de_DE", "el",
+    "el_GR", "ja", "ja_JP", "ko", "ko_KR", "nl", "nl_NL", "ro", "ro_RO", "sk", "sk_SK", "uk",
+    "uk_UA", "zh_CN", "zh_TW", "zh_HK", "he", "he_IL", "ar", "ar_SA", "hi", "hi_IN",
 ];
 const DEFAULT_LANGUAGE: &str = "auto";
 const ORIENTATIONS: &[&str] = &["horizontal", "cw", "ccw"];
@@ -239,6 +240,8 @@ pub mod ffi {
 
 impl Initialize for ffi::Settings {
     fn initialize(mut self: Pin<&mut Self>) {
+        let started = std::time::Instant::now();
+        crate::startup_trace("rust:model Settings init start");
         let snapshot: SettingsState = with_persist_read(|s| s.settings.clone());
         let config_path = config_file_path();
         let is_mister = runtime::current().is_mister();
@@ -287,6 +290,12 @@ impl Initialize for ffi::Settings {
         self.as_mut().rust_mut().current_hide_recents =
             config.settings.hide_recents.unwrap_or(false);
         self.as_mut().rust_mut().current_hide_resume = config.settings.hide_resume.unwrap_or(false);
+        // Keep the startup trace as the LAST line of initialize() so
+        // its duration measurement covers every field init above it.
+        crate::startup_trace(format!(
+            "rust:model Settings init end dur_ms={}",
+            started.elapsed().as_millis()
+        ));
     }
 }
 
@@ -752,6 +761,8 @@ mod tests {
         assert_eq!(normalize_language("AUTO"), DEFAULT_LANGUAGE);
         assert_eq!(normalize_language("fr"), DEFAULT_LANGUAGE);
         assert_eq!(normalize_language("it_IT"), "it_IT");
+        assert_eq!(normalize_language("es_ES"), "es_ES");
+        assert_eq!(normalize_language("eu_ES"), "eu_ES");
     }
 
     #[test]

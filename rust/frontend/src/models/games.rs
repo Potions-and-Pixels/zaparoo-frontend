@@ -31,6 +31,7 @@
 // when the user spams direction-arrow + Accept across a model swap.
 
 use crate::media_image_cache::{global_media_image_cache, MediaImageCache, MediaKey};
+use crate::models::tag_utils::tag_display_value;
 use crate::models::{global_handle, global_store};
 use cxx_qt::{CxxQtType, Threading};
 use cxx_qt_lib::{
@@ -1217,9 +1218,9 @@ fn detail_value_for_aliases(source: &[TagInfo], aliases: &[&str]) -> String {
             aliases
                 .iter()
                 .any(|alias| tag.tag_type.eq_ignore_ascii_case(alias))
-                && !tag.tag.trim().is_empty()
+                && !tag_display_value(tag).is_empty()
         })
-        .map(|tag| tag.tag.trim().to_string())
+        .map(tag_display_value)
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -1581,21 +1582,34 @@ fn notify_cover_update(mut model: Pin<&mut ffi::GamesModel>, key: &MediaKey) {
             handle.abort();
         }
         // Bytes are cached, but QML's `MediaImageProvider` still has to
-        // decode them. The hidden cover pre-warmer in `GamesScreen.qml`
-        // dispatches all N requests at once and the provider's 4-worker
-        // pool decodes them in ~75–150 ms; without this settle window
-        // the gate flips `loading=false` ~80 ms after the last byte
-        // lands and `gamesGrid` materialises before the last few
-        // decodes complete, painting the procedural fallback over those
-        // tiles for a frame or two. The settle uses the same seq-ticket
-        // guard as the safety timer so a folder change cancels the
-        // pending release.
-        info!("games: cover gate bytes settled — entering decode-settle window");
+        // decode them. PagedGrid now feeds real coverKey values to the
+        // current and next page while the loading overlay is still up,
+        // but MiSTer's software-rendered frame loop can lag behind the
+        // last cache broadcast. Keep a bounded MiSTer-only settle window
+        // long enough for the first-page provider/decode lag seen there
+        // so the first visible grid frame is less likely to paint
+        // fallbacks or hourglasses. Desktop/non-MiSTer releases
+        // immediately so restores are not globally delayed.
+        // TODO: Replace this heuristic with a QML decode-ready handshake
+        // from the first visible page (Ready/Error per Image plus a
+        // timeout fallback), so the gate releases on real decode state
+        // instead of runtime-specific sleep.
+        let settle_delay = if matches!(platform::current(), Some(Platform::Mister)) {
+            Duration::from_millis(1000)
+        } else {
+            Duration::ZERO
+        };
+        info!(
+            settle_ms = settle_delay.as_millis(),
+            "games: cover gate bytes settled — entering decode-settle window"
+        );
         let seq = model.rust().cover_gate_seq.clone();
         let ticket = seq.fetch_add(1, Ordering::SeqCst) + 1;
         let qt_thread = model.qt_thread();
         let handle = global_handle().spawn(async move {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            if !settle_delay.is_zero() {
+                tokio::time::sleep(settle_delay).await;
+            }
             let _ = qt_thread.queue(move |mut model: Pin<&mut ffi::GamesModel>| {
                 if seq.load(Ordering::SeqCst) != ticket {
                     return;
@@ -3110,6 +3124,7 @@ mod tests {
         let tags = vec![TagInfo {
             tag_type: "genre".into(),
             tag: "Platformer".into(),
+            label: String::new(),
         }];
         let detail = detail_tags_from_tags(&tags);
         let rows: Vec<&str> = detail.split('\n').collect();
@@ -3132,23 +3147,39 @@ mod tests {
             TagInfo {
                 tag_type: "platform".into(),
                 tag: "Arcade".into(),
+                label: String::new(),
             },
             TagInfo {
                 tag_type: "release_date".into(),
                 tag: "1984".into(),
+                label: String::new(),
             },
             TagInfo {
                 tag_type: "gamegenre".into(),
                 tag: "Action".into(),
+                label: String::new(),
             },
             TagInfo {
                 tag_type: "genre".into(),
                 tag: "Shooter".into(),
+                label: String::new(),
             },
         ];
         let detail = detail_tags_from_tags(&tags);
         let rows: Vec<&str> = detail.split('\n').collect();
         assert_eq!(rows[0], "Year\t1984");
         assert_eq!(rows[1], "Genre\tAction, Shooter");
+    }
+
+    #[test]
+    fn detail_tags_prefer_label_for_display() {
+        let tags = vec![TagInfo {
+            tag_type: "developer".into(),
+            tag: "nintendo".into(),
+            label: "Nintendo".into(),
+        }];
+        let detail = detail_tags_from_tags(&tags);
+        let rows: Vec<&str> = detail.split('\n').collect();
+        assert_eq!(rows[3], "Developer\tNintendo");
     }
 }
