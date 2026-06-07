@@ -111,11 +111,13 @@ for module in "${QML_MODULES[@]}"; do
 done
 
 info "Copying licenses..."
-cp "${PROJECT_ROOT}/src/LICENSES/LGPLv3.txt" "${DEPLOY_DIR}/"
-cp "${PROJECT_ROOT}/src/LICENSES/Qt-LGPL-NOTICE.txt" "${DEPLOY_DIR}/"
-cp "${PROJECT_ROOT}/src/LICENSES/OFL.txt" "${DEPLOY_DIR}/"
-cp "${PROJECT_ROOT}/src/LICENSES/PressStart2P-ATTRIBUTION.txt" "${DEPLOY_DIR}/"
 cp "${PROJECT_ROOT}/COPYING" "${DEPLOY_DIR}/"
+LICENSE_FILES=("${PROJECT_ROOT}/src/LICENSES/"*)
+if [ "${#LICENSE_FILES[@]}" -gt 0 ] && [ -e "${LICENSE_FILES[0]}" ]; then
+    cp "${LICENSE_FILES[@]}" "${DEPLOY_DIR}/"
+else
+    warn "No license files found in ${PROJECT_ROOT}/src/LICENSES"
+fi
 
 info "Creating frontend script..."
 cat > "${DEPLOY_DIR}/run.sh" << 'EOF'

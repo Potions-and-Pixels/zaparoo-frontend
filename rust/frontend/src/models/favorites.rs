@@ -19,7 +19,8 @@
 //
 // Search is flat (no folder navigation, no auto-nav) so this model
 // stays a fraction of the size of `GamesModel`. Card-write isn't wired
-// here yet — favorites launches by `run`-ing the entry's ZapScript.
+// here yet — runtime launches prefer the exact indexed path, while
+// QR/card-write payloads prefer Core's portable ZapScript.
 
 use crate::media_image_cache::{global_media_image_cache, MediaImageCache, MediaKey};
 use crate::models::{global_handle, global_store};
@@ -81,6 +82,7 @@ pub struct FavoritesModelRust {
     current_detail_loading: bool,
     current_detail_tags: QString,
     current_detail_image_key: QString,
+    cover_requests_paused: bool,
     current_detail_media_key: Option<MediaKey>,
     current_detail_media_id: Option<i64>,
     card_write_seq: Arc<AtomicU64>,
@@ -143,6 +145,7 @@ pub mod ffi {
         #[qproperty(bool, current_detail_loading)]
         #[qproperty(QString, current_detail_tags)]
         #[qproperty(QString, current_detail_image_key)]
+        #[qproperty(bool, cover_requests_paused)]
         type FavoritesModel = super::FavoritesModelRust;
 
         #[qinvokable]
@@ -180,6 +183,12 @@ pub mod ffi {
 
         #[qinvokable]
         fn clear_current_detail(self: Pin<&mut FavoritesModel>);
+
+        #[qinvokable]
+        fn refresh_cover_keys(self: Pin<&mut FavoritesModel>, first_row: i32, count: i32);
+
+        #[qinvokable]
+        fn clear_pending_cover_requests(self: Pin<&mut FavoritesModel>);
 
         #[qinvokable]
         fn index_for_path(self: &FavoritesModel, path: &QString) -> i32;
@@ -275,7 +284,9 @@ fn apply_state(
         // any in-flight `fetch_more` sees a stale ticket and bails.
         model.as_mut().rust_mut().seq.fetch_add(1, Ordering::SeqCst);
         model.as_mut().ensure_cover_subscription();
-        enqueue_favorites_covers(&entries);
+        if !model.cover_requests_paused {
+            enqueue_favorites_covers(&entries);
+        }
         let count = i32::try_from(entries.len()).unwrap_or(i32::MAX);
         clear_current_detail_state(model.as_mut());
         model.as_mut().begin_reset_model();
@@ -287,19 +298,28 @@ fn apply_state(
         if model.has_next_page != has_next_page {
             model.as_mut().set_has_next_page(has_next_page);
         }
-        // Decide whether to release `loading` immediately or hold it
-        // until covers are cached. `arm_cover_gate` flips loading off
-        // itself when the page has nothing to wait on (every cover
-        // already cached, or all rows unattributed); otherwise it
-        // leaves loading=true and arms the safety timer.
-        arm_cover_gate(model.as_mut());
+        // Hidden startup binding can pause cover requests so Hub paints without
+        // Favorites' off-screen cover gate. Screen entry resumes requests and
+        // refreshes visible cover roles.
+        if model.cover_requests_paused {
+            disarm_cover_gate(model.as_mut());
+            if model.loading {
+                model.as_mut().set_loading(false);
+            }
+        } else {
+            // Decide whether to release `loading` immediately or hold it until
+            // covers are cached. `arm_cover_gate` flips loading off itself when
+            // the page has nothing to wait on; otherwise it leaves loading=true
+            // and arms the safety timer.
+            arm_cover_gate(model.as_mut());
+        }
         if model.loading_more {
             model.as_mut().set_loading_more(false);
         }
         // Look-ahead prefetch: warm page 2 so the first scroll past the
         // initial page doesn't surface a "Loading more…" cue. `fetch_more`
         // is itself guarded by `has_next_page` and `loading_more`.
-        if has_next_page {
+        if has_next_page && !model.cover_requests_paused {
             model.as_mut().fetch_more();
         }
     } else if err.is_empty() {
@@ -361,7 +381,9 @@ impl ffi::FavoritesModel {
             NAME_ROLE => QVariant::from(&QString::from(entry.name.as_str())),
             PATH_ROLE => QVariant::from(&QString::from(entry.path.as_str())),
             SYSTEM_ID_ROLE => QVariant::from(&QString::from(entry.system.id.as_str())),
-            COVER_KEY_ROLE => QVariant::from(&QString::from(cover_key_for(entry).as_str())),
+            COVER_KEY_ROLE => QVariant::from(&QString::from(
+                cover_key_for(entry, !self.cover_requests_paused).as_str(),
+            )),
             ZAP_SCRIPT_ROLE => QVariant::from(&QString::from(entry.zap_script.as_str())),
             FAVORITE_ROLE => QVariant::from(&favorite_role_value(&entry.tags)),
             FILE_STEM_ROLE => {
@@ -413,6 +435,14 @@ impl ffi::FavoritesModel {
         });
     }
 
+    fn refresh_cover_keys(mut self: Pin<&mut Self>, first_row: i32, count: i32) {
+        emit_cover_key_range(self.as_mut(), first_row, count);
+    }
+
+    fn clear_pending_cover_requests(self: Pin<&mut Self>) {
+        global_media_image_cache().clear_pending_requests();
+    }
+
     fn launch_at(self: Pin<&mut Self>, index: i32) {
         if index < 0 || index >= self.count {
             return;
@@ -435,7 +465,7 @@ impl ffi::FavoritesModel {
         if index < 0 || index >= self.count {
             return QString::default();
         }
-        QString::from(self.entries[index as usize].zap_script.as_str())
+        QString::from(portable_text_for_entry(&self.entries[index as usize]).as_str())
     }
 
     fn write_card_at(mut self: Pin<&mut Self>, index: i32) {
@@ -446,13 +476,13 @@ impl ffi::FavoritesModel {
             return;
         }
         let entry = &self.entries[index as usize];
-        if entry.zap_script.is_empty() {
+        let text = portable_text_for_entry(entry);
+        if text.is_empty() {
             self.as_mut()
-                .set_card_write_error(QString::from("missing zap script"));
+                .set_card_write_error(QString::from("missing launch payload"));
             self.as_mut().set_card_write_pending(false);
             return;
         }
-        let text = entry.zap_script.clone();
         let name = entry.name.clone();
         let store = global_store();
         let seq = self.rust().card_write_seq.clone();
@@ -581,7 +611,8 @@ impl ffi::FavoritesModel {
         let detail_key = match media_id {
             Some(id) => MediaKey::with_media_id(system.clone(), path.clone(), id),
             None => MediaKey::new(system.clone(), path.clone()),
-        };
+        }
+        .with_current_cover_preference();
         self.as_mut().rust_mut().current_detail_media_key = Some(detail_key);
         self.as_mut().rust_mut().current_detail_media_id = media_id;
         sync_current_detail_image_key(self.as_mut());
@@ -659,18 +690,18 @@ impl ffi::FavoritesModel {
 /// `QQuickImageProvider` resolves to RAM bytes; otherwise we enqueue a
 /// fetch (carrying the optional `mediaId` hint) and fall back to the
 /// system logo as a nicer placeholder than the generic file glyph.
-fn cover_key_for(entry: &MediaItem) -> String {
+fn cover_key_for(entry: &MediaItem, requests_enabled: bool) -> String {
     if entry.system.id.is_empty() {
         return "icons/File".to_string();
     }
-    let media_key = media_key_for(entry);
+    let media_key = media_key_for(entry).map(MediaKey::with_current_cover_preference);
     let cache = global_media_image_cache();
     let cached = media_key.as_ref().is_some_and(|k| cache.is_cached(k));
     let negative = media_key.as_ref().is_some_and(|k| cache.is_negative(k));
     let soft_no_image = media_key
         .as_ref()
         .is_some_and(|k| cache.is_soft_no_image(k));
-    if !cached && !negative && !soft_no_image {
+    if requests_enabled && !cached && !negative && !soft_no_image {
         // Miss-driven re-enqueue, same rationale as GamesModel's
         // `cover_key_for`: tiles re-bound after LRU eviction or stale-
         // enqueue truncation will hit this branch and re-arm the fetch.
@@ -678,7 +709,32 @@ fn cover_key_for(entry: &MediaItem) -> String {
             cache.enqueue_search_cover_with_media_id(k.clone(), entry.media_id, PAGE_SIZE);
         }
     }
-    cover_key_for_with(entry, media_key.as_ref(), cached, negative, soft_no_image)
+    cover_key_for_with(
+        entry,
+        media_key.as_ref(),
+        cached,
+        negative,
+        soft_no_image || !requests_enabled,
+    )
+}
+
+fn emit_cover_key_range(mut model: Pin<&mut ffi::FavoritesModel>, first_row: i32, count: i32) {
+    if model.count <= 0 || count <= 0 {
+        return;
+    }
+    let first = first_row.clamp(0, model.count - 1);
+    let last = first.saturating_add(count - 1).min(model.count - 1);
+    if last < first {
+        return;
+    }
+    let mut roles = QList::<i32>::default();
+    roles.append(COVER_KEY_ROLE);
+    let parent = QModelIndex::default();
+    let top_left = model.index(first, 0, &parent);
+    let bottom_right = model.index(last, 0, &parent);
+    model
+        .as_mut()
+        .data_changed(&top_left, &bottom_right, &roles);
 }
 
 /// Build the canonical `(systemId, mediaPath)` identifier for a search
@@ -890,7 +946,7 @@ fn cover_key_for_with(
 fn enqueue_favorites_covers(results: &[MediaItem]) {
     let cache = global_media_image_cache();
     for entry in results.iter().rev() {
-        if let Some(key) = media_key_for(entry) {
+        if let Some(key) = media_key_for(entry).map(MediaKey::with_current_cover_preference) {
             cache.enqueue_search_cover_with_media_id(key, entry.media_id, PAGE_SIZE);
         }
     }
@@ -910,9 +966,12 @@ fn notify_cover_update(mut model: Pin<&mut ffi::FavoritesModel>, key: &MediaKey)
         .entries
         .iter()
         .enumerate()
-        .filter(|(_, e)| match (key.media_id, e.media_id) {
-            (Some(a), Some(b)) => a == b,
-            _ => e.path == *key.path && e.system.id == *key.system_id,
+        .filter(|(_, e)| {
+            key.is_cover_key()
+                && match (key.media_id, e.media_id) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => e.path == *key.path && e.system.id == *key.system_id,
+                }
         })
         .filter_map(|(i, _)| i32::try_from(i).ok())
         .collect();
@@ -992,7 +1051,7 @@ where
 {
     entries
         .iter()
-        .filter_map(media_key_for)
+        .filter_map(|entry| media_key_for(entry).map(MediaKey::with_current_cover_preference))
         .filter(|k| !is_cached(k) && !is_negative(k))
         .collect()
 }
@@ -1069,10 +1128,20 @@ fn release_cover_gate_after_timeout(mut model: Pin<&mut ffi::FavoritesModel>) {
 }
 
 /// Build the `text` payload sent to Core's `run` for a search entry.
-/// Search entries carry a Core-built `ZapScript` command, so use it
-/// directly and suppress the run when it is empty.
+/// Runtime launches prefer exact paths to avoid title/ZapScript
+/// ambiguity; portable write/QR paths prefer Core's `ZapScript`.
 fn launch_text_for(entry: &MediaItem) -> String {
+    if !entry.path.trim().is_empty() {
+        return entry.path.clone();
+    }
     entry.zap_script.clone()
+}
+
+fn portable_text_for_entry(entry: &MediaItem) -> String {
+    if !entry.zap_script.trim().is_empty() {
+        return entry.zap_script.clone();
+    }
+    entry.path.clone()
 }
 
 fn position_of_path(entries: &[MediaItem], needle: &str) -> i32 {
@@ -1101,7 +1170,9 @@ fn apply_append_page(
             let has_next_page = result.has_next_page();
             let next_cursor = result.next_cursor();
             let new_count = i32::try_from(result.results.len()).unwrap_or(i32::MAX - model.count);
-            enqueue_favorites_covers(&result.results);
+            if !model.cover_requests_paused {
+                enqueue_favorites_covers(&result.results);
+            }
             if new_count > 0 {
                 let first = model.count;
                 let last = first.saturating_add(new_count).saturating_sub(1);

@@ -74,6 +74,11 @@ Item {
         });
         out.push({
             kind: "field",
+            id: "orientation",
+            label: qsTr("Orientation")
+        });
+        out.push({
+            kind: "field",
             id: "browseLayout",
             label: qsTr("Browsing layout")
         });
@@ -98,6 +103,11 @@ Item {
         });
         out.push({
             kind: "field",
+            id: "mediaImageType",
+            label: qsTr("Preferred artwork")
+        });
+        out.push({
+            kind: "field",
             id: "updateMediaDb",
             label: qsTr("Update media database")
         });
@@ -105,6 +115,11 @@ Item {
             kind: "field",
             id: "runScraper",
             label: qsTr("Scrape metadata")
+        });
+        out.push({
+            kind: "field",
+            id: "rescrapeExisting",
+            label: qsTr("Re-scrape existing")
         });
         out.push({
             kind: "header",
@@ -167,6 +182,11 @@ Item {
     // don't queue a request that Core will reject.
     readonly property bool _indexBusy: Browse.MediaStatus.indexing || Browse.MediaStatus.optimizing
     readonly property bool _scrapeBusy: Browse.MediaStatus.scraping
+    property bool rescrapeExisting: false
+    // Keep the one-shot force flag visible while the scrape it started
+    // is active; clear it only after Core reports the scrape stopped.
+    property bool _activeScrapeUsedRescrape: false
+    readonly property bool _visibleRescrapeExisting: settings._scrapeBusy && Browse.MediaStatus.scrape_force_known ? Browse.MediaStatus.scrape_force : settings.rescrapeExisting
 
     // Drive the top/bottom scroll chevrons. Mirrors PagedGrid's
     // `hasPagesAbove`/`hasPagesBelow` recipe, but for a continuous
@@ -190,8 +210,65 @@ Item {
             return;
         if (settings._scrapeBusy)
             Browse.MediaStatus.cancel_scrape();
-        else
-            Browse.MediaStatus.start_scrape();
+        else {
+            settings._activeScrapeUsedRescrape = settings.rescrapeExisting;
+            Browse.MediaStatus.start_scrape(settings.rescrapeExisting);
+        }
+    }
+
+    on_ScrapeBusyChanged: {
+        if (!settings._scrapeBusy && settings._activeScrapeUsedRescrape) {
+            settings.rescrapeExisting = false;
+            settings._activeScrapeUsedRescrape = false;
+        }
+    }
+
+    function _fieldEnabled(id: string): bool {
+        if (id === "updateMediaDb")
+            return !settings._scrapeBusy;
+        if (id === "runScraper")
+            return !settings._indexBusy;
+        if (id === "rescrapeExisting")
+            return !settings._indexBusy && !settings._scrapeBusy;
+        return true;
+    }
+
+    function _fieldValue(id: string): string {
+        if (id === "resolution")
+            return settings._resolutionDisplay(Browse.Settings.current_resolution);
+        if (id === "language")
+            return settings._languageDisplay(Browse.Settings.current_language);
+        if (id === "orientation")
+            return settings._orientationDisplay(Browse.Settings.current_orientation);
+        if (id === "browseLayout")
+            return settings._browseLayoutDisplay(Browse.Settings.current_browse_layout);
+        if (id === "buttonLayout")
+            return settings._buttonLayoutDisplay(Browse.Settings.current_button_layout);
+        if (id === "screensaverTimeout")
+            return settings._screensaverTimeoutDisplay(Browse.Settings.current_screensaver_timeout);
+        if (id === "mediaImageType")
+            return settings._mediaImageTypeDisplay(Browse.Settings.current_media_image_type);
+        return "";
+    }
+
+    function _fieldControl(id: string): string {
+        if (id === "mouseEnabled" || id === "discoverArcadeAlternateVersions" || id === "debugLogging" || id === "rescrapeExisting")
+            return "toggle";
+        if (id === "aboutLicense")
+            return "navigate";
+        if (id === "updateMediaDb" || id === "runScraper" || id === "uploadLog")
+            return "action";
+        return "picker";
+    }
+
+    function _fieldChecked(id: string): bool {
+        if (id === "debugLogging")
+            return Browse.Settings.current_debug_logging;
+        if (id === "discoverArcadeAlternateVersions")
+            return Browse.Settings.current_discover_arcade_alternate_versions;
+        if (id === "rescrapeExisting")
+            return settings._visibleRescrapeExisting;
+        return Browse.Settings.current_mouse_enabled;
     }
 
     readonly property int fieldCount: settings.fields.length
@@ -217,14 +294,20 @@ Item {
     }
 
     // Walk from `from` in `direction` (±1) until we hit a focusable
-    // row or run off the registry. Headers are transparent — Up/Down
-    // skip across them so the user feels a single flat list.
+    // row. Headers are transparent, and edges wrap so Up on the first
+    // field lands on the last field (and vice versa).
     function _seekNavigable(from: int, direction: int): int {
-        let i = from + direction;
-        while (i >= 0 && i < settings.fieldCount) {
+        if (settings.fieldCount <= 0)
+            return from;
+        let i = from;
+        for (let steps = 0; steps < settings.fieldCount; steps++) {
+            i += direction;
+            if (i < 0)
+                i = settings.fieldCount - 1;
+            else if (i >= settings.fieldCount)
+                i = 0;
             if (settings.fields[i].kind === "field")
                 return i;
-            i += direction;
         }
         return from;
     }
@@ -233,7 +316,7 @@ Item {
         if (!settings._isField(settings.currentIndex))
             return false;
         const id = settings.fields[settings.currentIndex].id;
-        return id === "mouseEnabled" || id === "discoverArcadeAlternateVersions" || id === "debugLogging";
+        return id === "mouseEnabled" || id === "discoverArcadeAlternateVersions" || id === "debugLogging" || id === "rescrapeExisting";
     }
     // True when the focused field is a list-picker row (Accept opens a
     // modal; left/right is a no-op — pickers don't cycle inline). Drives
@@ -242,7 +325,7 @@ Item {
         if (!settings._isField(settings.currentIndex))
             return false;
         const id = settings.fields[settings.currentIndex].id;
-        return id === "language" || id === "browseLayout" || id === "buttonLayout" || id === "resolution";
+        return id === "language" || id === "orientation" || id === "browseLayout" || id === "buttonLayout" || id === "resolution" || id === "screensaverTimeout" || id === "mediaImageType";
     }
     // True when the focused field is an action button (updateMediaDb,
     // runScraper, uploadLog, aboutLicense). Drives the help-bar Accept
@@ -337,6 +420,11 @@ Item {
         return raw === undefined || raw === null ? [] : raw;
     }
 
+    function _orientationList(): list<string> {
+        const raw = Browse.Settings.available_orientations;
+        return raw === undefined || raw === null ? [] : raw;
+    }
+
     function _languageDisplay(value: string): string {
         if (value === "en")
             return qsTr("English");
@@ -369,6 +457,14 @@ Item {
         return qsTr("Auto");
     }
 
+    function _orientationDisplay(value: string): string {
+        if (value === "cw")
+            return qsTr("Rotated CW");
+        if (value === "ccw")
+            return qsTr("Rotated CCW");
+        return qsTr("Horizontal");
+    }
+
     function _browseLayoutDisplay(value: string): string {
         if (value === "list")
             return qsTr("Detailed list view");
@@ -390,6 +486,11 @@ Item {
         return raw === undefined || raw === null ? [] : raw;
     }
 
+    function _mediaImageTypeList(): list<string> {
+        const raw = Browse.Settings.available_media_image_types;
+        return raw === undefined || raw === null ? [] : raw;
+    }
+
     function _screensaverTimeoutDisplay(value: string): string {
         if (value === "off")
             return qsTr("Off");
@@ -408,6 +509,36 @@ Item {
         if (value === "1800")
             return qsTr("30 minutes");
         return qsTr("%1 seconds").arg(value);
+    }
+
+    function _mediaImageTypeDisplay(value: string): string {
+        if (value === "auto")
+            return qsTr("Auto");
+        if (value === "image")
+            return qsTr("Image");
+        if (value === "thumbnail")
+            return qsTr("Thumbnail");
+        if (value === "boxart")
+            return qsTr("Box art");
+        if (value === "boxart3d")
+            return qsTr("3D box art");
+        if (value === "screenshot")
+            return qsTr("Screenshot");
+        if (value === "wheel")
+            return qsTr("Wheel");
+        if (value === "titleshot")
+            return qsTr("Title screen");
+        if (value === "map")
+            return qsTr("Map");
+        if (value === "marquee")
+            return qsTr("Marquee");
+        if (value === "fanart")
+            return qsTr("Fan art");
+        if (value === "boxartside")
+            return qsTr("Box side");
+        if (value === "boxartback")
+            return qsTr("Box back");
+        return value;
     }
 
     // Build the picker entry list for a field. Each entry is
@@ -437,6 +568,15 @@ Item {
                     label: settings._languageDisplay(list[i])
                 });
             initialId = Browse.Settings.current_language;
+        } else if (id === "orientation") {
+            title = qsTr("Orientation");
+            const list = settings._orientationList();
+            for (let i = 0; i < list.length; i++)
+                entries.push({
+                    id: list[i],
+                    label: settings._orientationDisplay(list[i])
+                });
+            initialId = Browse.Settings.current_orientation;
         } else if (id === "browseLayout") {
             title = qsTr("Browsing layout");
             const list = settings._browseLayoutList();
@@ -464,6 +604,15 @@ Item {
                     label: settings._screensaverTimeoutDisplay(list[i])
                 });
             initialId = Browse.Settings.current_screensaver_timeout;
+        } else if (id === "mediaImageType") {
+            title = qsTr("Preferred artwork");
+            const list = settings._mediaImageTypeList();
+            for (let i = 0; i < list.length; i++)
+                entries.push({
+                    id: list[i],
+                    label: settings._mediaImageTypeDisplay(list[i])
+                });
+            initialId = Browse.Settings.current_media_image_type;
         } else {
             return;
         }
@@ -496,6 +645,18 @@ Item {
         Browse.Settings.set_discover_arcade_alternate_versions(!Browse.Settings.current_discover_arcade_alternate_versions);
     }
 
+    function _setRescrapeExisting(direction: int): void {
+        if (settings._indexBusy || settings._scrapeBusy)
+            return;
+        settings.rescrapeExisting = direction > 0;
+    }
+
+    function _toggleRescrapeExisting(): void {
+        if (settings._indexBusy || settings._scrapeBusy)
+            return;
+        settings.rescrapeExisting = !settings.rescrapeExisting;
+    }
+
     function _cycleFocused(direction: int): void {
         if (!settings._isField(settings.currentIndex))
             return;
@@ -509,6 +670,8 @@ Item {
             settings._setDiscoverArcadeAlternateVersions(direction);
         else if (id === "debugLogging")
             settings._setDebugLogging(direction);
+        else if (id === "rescrapeExisting")
+            settings._setRescrapeExisting(direction);
     }
 
     function handleAction(action: string): void {
@@ -530,6 +693,8 @@ Item {
                 settings._toggleDiscoverArcadeAlternateVersions();
             else if (id === "debugLogging")
                 settings._toggleDebugLogging();
+            else if (id === "rescrapeExisting")
+                settings._toggleRescrapeExisting();
             else if (id === "updateMediaDb")
                 settings._triggerIndex();
             else if (id === "runScraper")
@@ -665,11 +830,11 @@ Item {
                         // dims and its MouseArea stops responding.
                         // Keyboard Accept is separately gated in
                         // `_triggerIndex`/`_triggerScrape`.
-                        enabled: row.modelData.id === "updateMediaDb" ? !settings._scrapeBusy : row.modelData.id === "runScraper" ? !settings._indexBusy : true
+                        enabled: settings._fieldEnabled(row.modelData.id)
                         label: row.modelData.label
-                        value: row.modelData.id === "resolution" ? settings._resolutionDisplay(Browse.Settings.current_resolution) : row.modelData.id === "language" ? settings._languageDisplay(Browse.Settings.current_language) : row.modelData.id === "browseLayout" ? settings._browseLayoutDisplay(Browse.Settings.current_browse_layout) : row.modelData.id === "buttonLayout" ? settings._buttonLayoutDisplay(Browse.Settings.current_button_layout) : row.modelData.id === "screensaverTimeout" ? settings._screensaverTimeoutDisplay(Browse.Settings.current_screensaver_timeout) : ""
-                        control: row.modelData.id === "mouseEnabled" || row.modelData.id === "discoverArcadeAlternateVersions" || row.modelData.id === "debugLogging" ? "toggle" : row.modelData.id === "aboutLicense" ? "navigate" : (row.modelData.id === "updateMediaDb" || row.modelData.id === "runScraper" || row.modelData.id === "uploadLog") ? "action" : "picker"
-                        checked: row.modelData.id === "debugLogging" ? Browse.Settings.current_debug_logging : row.modelData.id === "discoverArcadeAlternateVersions" ? Browse.Settings.current_discover_arcade_alternate_versions : Browse.Settings.current_mouse_enabled
+                        value: settings._fieldValue(row.modelData.id)
+                        control: settings._fieldControl(row.modelData.id)
+                        checked: settings._fieldChecked(row.modelData.id)
                         actionStatus: row.modelData.id === "updateMediaDb" ? settings._indexActionStatus() : row.modelData.id === "runScraper" ? settings._scrapeActionStatus() : ""
                         onHovered: settings.currentIndex = row.index
                         onClicked: {
@@ -680,6 +845,8 @@ Item {
                                 settings._toggleDiscoverArcadeAlternateVersions();
                             else if (row.modelData.id === "debugLogging")
                                 settings._toggleDebugLogging();
+                            else if (row.modelData.id === "rescrapeExisting")
+                                settings._toggleRescrapeExisting();
                         }
                         onRightClicked: settings.requestHubScreen()
                         // Picker, action, and navigate rows route

@@ -22,18 +22,21 @@
 //   * `current_language` — READ + NOTIFY. Mirrors `[general].language`
 //     from frontend.toml and is also recorded in persisted state so the
 //     settings snapshot stays coherent.
+//   * `available_orientations` — CONSTANT. Three display transforms:
+//     horizontal (default), rotated clockwise, rotated counter-clockwise.
+//   * `current_orientation` — READ + NOTIFY, persisted. Applied live by
+//     the QML scene wrapper while also mirrored into frontend.toml so
+//     MiSTer survives `/tmp` resets.
 //   * `available_browse_layouts` — CONSTANT. The browsing layout picker
 //     choices. "grid" is the existing layout; "list" is the detailed list
 //     placeholder until the new browsing screen is built.
 //   * `current_browse_layout` — READ + NOTIFY, persisted. Defaults to
 //     "grid" so existing installs keep current behavior.
 //   * `available_button_layouts` — CONSTANT. Single-letter ids used to
-//     compose resources/images/buttons/<layout>/Button*.png. Style A is
-//     the legacy Nintendo-style glyph set, B is the Xbox-style set, C
-//     is the Sony-style set, and D is the alternate internal set; the
-//     user-facing labels are "Style A/B/C/D"
-//     (see `SettingsScreen.qml::_buttonLayoutDisplay`) so the picker
-//     reads as a neutral aesthetic choice rather than a vendor pick.
+//     compose resources/images/buttons/<layout>/Button*.png. User-facing
+//     labels are "Style A/B/C/D" (see
+//     `SettingsScreen.qml::_buttonLayoutDisplay`) so the picker stays a
+//     neutral aesthetic choice and avoids implying platform affiliation.
 //   * `current_button_layout` — READ + NOTIFY, persisted. Defaults to
 //     "a" — the new id for the previous "nintendo" asset directory.
 //     `normalize_button_layout` migrates legacy persisted values
@@ -74,12 +77,22 @@ use zaparoo_core::runtime;
 /// empty leading entry is the "use `frontend.toml` defaults" sentinel;
 /// the form renders it as `qsTr("Default")` so users can cycle back
 /// to no-override after picking a custom value.
-const MISTER_RESOLUTIONS: &[&str] = &["", "1280x720", "1920x1080", "640x480", "1920x1440"];
+const MISTER_RESOLUTIONS: &[&str] = &[
+    "",
+    "1280x720",
+    "1920x1080",
+    "1920x1200",
+    "1920x1440",
+    "640x480",
+    "2048x1536",
+];
 const LANGUAGES: &[&str] = &[
     "auto", "en", "it_IT", "de", "el", "ja", "ko", "nl", "ro", "sk", "uk", "zh_CN", "he", "ar",
     "hi",
 ];
 const DEFAULT_LANGUAGE: &str = "auto";
+const ORIENTATIONS: &[&str] = &["horizontal", "cw", "ccw"];
+const DEFAULT_ORIENTATION: &str = "horizontal";
 const BROWSE_LAYOUTS: &[&str] = &["grid", "list"];
 const DEFAULT_BROWSE_LAYOUT: &str = "grid";
 const BUTTON_LAYOUTS: &[&str] = &["a", "b", "c", "d"];
@@ -90,6 +103,22 @@ const DEFAULT_BUTTON_LAYOUT: &str = "a";
 // is long enough that idle browsing does not trip it.
 const SCREENSAVER_TIMEOUTS: &[&str] = &["off", "60", "120", "300", "600", "900", "1800"];
 const DEFAULT_SCREENSAVER_TIMEOUT: &str = "300";
+const MEDIA_IMAGE_TYPES: &[&str] = &[
+    "auto",
+    "image",
+    "thumbnail",
+    "boxart",
+    "boxart3d",
+    "screenshot",
+    "wheel",
+    "titleshot",
+    "map",
+    "marquee",
+    "fanart",
+    "boxartside",
+    "boxartback",
+];
+const DEFAULT_MEDIA_IMAGE_TYPE: &str = "auto";
 
 // Debug-only QA shortcut so the activation path can be exercised
 // without waiting for the production timer. Only appears in debug
@@ -110,6 +139,8 @@ pub struct SettingsRust {
     current_resolution: QString,
     available_languages: QStringList,
     current_language: QString,
+    available_orientations: QStringList,
+    current_orientation: QString,
     available_browse_layouts: QStringList,
     current_browse_layout: QString,
     available_button_layouts: QStringList,
@@ -119,6 +150,8 @@ pub struct SettingsRust {
     current_debug_logging: bool,
     available_screensaver_timeouts: QStringList,
     current_screensaver_timeout: QString,
+    available_media_image_types: QStringList,
+    current_media_image_type: QString,
     // ----- Kiosk lockdown -----
     // READ + CONSTANT: set once at Initialize from `frontend.toml`,
     // never mutated from QML. Hiding the Settings screen (which
@@ -149,6 +182,8 @@ pub mod ffi {
         #[qproperty(QString, current_resolution, READ, WRITE = set_resolution, NOTIFY)]
         #[qproperty(QStringList, available_languages, READ, CONSTANT)]
         #[qproperty(QString, current_language, READ, WRITE = set_language, NOTIFY)]
+        #[qproperty(QStringList, available_orientations, READ, CONSTANT)]
+        #[qproperty(QString, current_orientation, READ, WRITE = set_orientation, NOTIFY)]
         #[qproperty(QStringList, available_browse_layouts, READ, CONSTANT)]
         #[qproperty(QString, current_browse_layout, READ, WRITE = set_browse_layout, NOTIFY)]
         #[qproperty(QStringList, available_button_layouts, READ, CONSTANT)]
@@ -158,12 +193,6 @@ pub mod ffi {
         #[qproperty(bool, current_debug_logging, READ, WRITE = set_debug_logging, NOTIFY)]
         #[qproperty(QStringList, available_screensaver_timeouts, READ, CONSTANT)]
         #[qproperty(QString, current_screensaver_timeout, READ, WRITE = set_screensaver_timeout, NOTIFY)]
-        // Kiosk lockdown flags — READ + CONSTANT, admin-set via
-        // frontend.toml. See SettingsRust doc comment.
-        #[qproperty(bool, current_hide_settings, READ, CONSTANT)]
-        #[qproperty(bool, current_hide_favorites, READ, CONSTANT)]
-        #[qproperty(bool, current_hide_recents, READ, CONSTANT)]
-        #[qproperty(bool, current_hide_resume, READ, CONSTANT)]
         type Settings = super::SettingsRust;
 
         #[qinvokable]
@@ -171,6 +200,9 @@ pub mod ffi {
 
         #[qinvokable]
         fn set_language(self: Pin<&mut Settings>, value: QString);
+
+        #[qinvokable]
+        fn set_orientation(self: Pin<&mut Settings>, value: QString);
 
         #[qinvokable]
         fn set_browse_layout(self: Pin<&mut Settings>, value: QString);
@@ -189,6 +221,9 @@ pub mod ffi {
 
         #[qinvokable]
         fn set_screensaver_timeout(self: Pin<&mut Settings>, value: QString);
+
+        #[qinvokable]
+        fn set_media_image_type(self: Pin<&mut Settings>, value: QString);
     }
 
     impl cxx_qt::Initialize for Settings {}
@@ -212,6 +247,8 @@ impl Initialize for ffi::Settings {
         self.as_mut().rust_mut().current_resolution = QString::from(merged.resolution.as_str());
         self.as_mut().rust_mut().available_languages = languages();
         self.as_mut().rust_mut().current_language = QString::from(merged.language.as_str());
+        self.as_mut().rust_mut().available_orientations = orientations();
+        self.as_mut().rust_mut().current_orientation = QString::from(merged.orientation.as_str());
         self.as_mut().rust_mut().available_browse_layouts = browse_layouts();
         self.as_mut().rust_mut().current_browse_layout =
             QString::from(merged.browse_layout.as_str());
@@ -226,6 +263,9 @@ impl Initialize for ffi::Settings {
         self.as_mut().rust_mut().available_screensaver_timeouts = screensaver_timeouts();
         self.as_mut().rust_mut().current_screensaver_timeout =
             QString::from(merged.screensaver_timeout.as_str());
+        self.as_mut().rust_mut().available_media_image_types = media_image_types();
+        self.as_mut().rust_mut().current_media_image_type =
+            QString::from(merged.media_image_type.as_str());
         // Kiosk lockdown flags — read straight from Config, no
         // persist/state.toml involvement (they're not user-toggleable;
         // there's no UI to toggle them from since `hide_settings`
@@ -269,6 +309,21 @@ impl ffi::Settings {
         mirror_settings_to_config(&config_file_path(), &snapshot.settings);
         self.as_mut().rust_mut().current_language = QString::from(value_str.as_str());
         self.as_mut().current_language_changed();
+    }
+
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "cxx-qt qinvokable signature requires QString by value"
+    )]
+    fn set_orientation(mut self: Pin<&mut Self>, value: QString) {
+        let value_str = normalize_orientation(&value.to_string()).to_string();
+        if self.current_orientation.to_string() == value_str {
+            return;
+        }
+        let snapshot = persist_settings(|s| s.orientation.clone_from(&value_str));
+        mirror_settings_to_config(&config_file_path(), &snapshot.settings);
+        self.as_mut().rust_mut().current_orientation = QString::from(value_str.as_str());
+        self.as_mut().current_orientation_changed();
     }
 
     #[allow(
@@ -348,6 +403,21 @@ impl ffi::Settings {
         self.as_mut().rust_mut().current_screensaver_timeout = QString::from(value_str.as_str());
         self.as_mut().current_screensaver_timeout_changed();
     }
+
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "cxx-qt qinvokable signature requires QString by value"
+    )]
+    fn set_media_image_type(mut self: Pin<&mut Self>, value: QString) {
+        let value_str = normalize_media_image_type(&value.to_string()).to_string();
+        if self.current_media_image_type.to_string() == value_str {
+            return;
+        }
+        let snapshot = persist_settings(|s| s.media_image_type.clone_from(&value_str));
+        mirror_settings_to_config(&config_file_path(), &snapshot.settings);
+        self.as_mut().rust_mut().current_media_image_type = QString::from(value_str.as_str());
+        self.as_mut().current_media_image_type_changed();
+    }
 }
 
 fn persist_settings<F: FnOnce(&mut SettingsState)>(mutator: F) -> persist::PersistedState {
@@ -376,12 +446,14 @@ fn mirror_settings_to_config(config_path: &std::path::Path, settings: &SettingsS
         SettingsMirror {
             resolution: settings.resolution.as_str(),
             language: settings.language.as_str(),
+            orientation: settings.orientation.as_str(),
             browse_layout: settings.browse_layout.as_str(),
             button_layout: settings.button_layout.as_str(),
             mouse_enabled: settings.mouse_enabled,
             discover_arcade_alternate_versions: settings.discover_arcade_alternate_versions,
             debug_logging: settings.debug_logging,
             screensaver_timeout: settings.screensaver_timeout.as_str(),
+            media_image_type: settings.media_image_type.as_str(),
         },
     ) {
         warn!(
@@ -399,6 +471,14 @@ fn merge_settings(snapshot: &SettingsState, config: &Config) -> SettingsState {
             String::new()
         },
         language: normalize_language(&config.language).to_string(),
+        orientation: normalize_orientation(
+            config
+                .settings
+                .orientation
+                .as_deref()
+                .unwrap_or(snapshot.orientation.as_str()),
+        )
+        .to_string(),
         browse_layout: normalize_browse_layout(
             config
                 .settings
@@ -434,6 +514,14 @@ fn merge_settings(snapshot: &SettingsState, config: &Config) -> SettingsState {
                 .unwrap_or(snapshot.screensaver_timeout.as_str()),
         )
         .to_string(),
+        media_image_type: normalize_media_image_type(
+            config
+                .settings
+                .media_image_type
+                .as_deref()
+                .unwrap_or(snapshot.media_image_type.as_str()),
+        )
+        .to_string(),
     }
 }
 
@@ -461,6 +549,14 @@ fn browse_layouts() -> QStringList {
     list
 }
 
+fn orientations() -> QStringList {
+    let mut list = QStringList::default();
+    for orientation in ORIENTATIONS {
+        list.append(QString::from(*orientation));
+    }
+    list
+}
+
 fn languages() -> QStringList {
     let mut list = QStringList::default();
     for language in LANGUAGES {
@@ -481,6 +577,14 @@ fn screensaver_timeouts() -> QStringList {
     list
 }
 
+fn media_image_types() -> QStringList {
+    let mut list = QStringList::default();
+    for value in MEDIA_IMAGE_TYPES {
+        list.append(QString::from(*value));
+    }
+    list
+}
+
 fn normalize_language(value: &str) -> &str {
     let trimmed = value.trim();
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
@@ -491,6 +595,15 @@ fn normalize_language(value: &str) -> &str {
         .copied()
         .find(|language| *language == trimmed)
         .unwrap_or(DEFAULT_LANGUAGE)
+}
+
+fn normalize_orientation(value: &str) -> &'static str {
+    let trimmed = value.trim();
+    ORIENTATIONS
+        .iter()
+        .copied()
+        .find(|orientation| *orientation == trimmed)
+        .unwrap_or(DEFAULT_ORIENTATION)
 }
 
 fn normalize_browse_layout(value: &str) -> &'static str {
@@ -519,6 +632,15 @@ fn normalize_screensaver_timeout(value: &str) -> &'static str {
         .unwrap_or(DEFAULT_SCREENSAVER_TIMEOUT)
 }
 
+fn normalize_media_image_type(value: &str) -> &'static str {
+    let trimmed = value.trim();
+    MEDIA_IMAGE_TYPES
+        .iter()
+        .copied()
+        .find(|v| *v == trimmed)
+        .unwrap_or(DEFAULT_MEDIA_IMAGE_TYPE)
+}
+
 fn normalize_button_layout(value: &str) -> &'static str {
     let trimmed = value.trim();
     // Legacy alias map: state files written by builds before the
@@ -541,9 +663,9 @@ fn normalize_button_layout(value: &str) -> &'static str {
 mod tests {
     use super::{
         browse_layouts, button_layouts, curated_resolutions, languages, normalize_browse_layout,
-        normalize_button_layout, normalize_language, BROWSE_LAYOUTS, BUTTON_LAYOUTS,
-        DEFAULT_BROWSE_LAYOUT, DEFAULT_BUTTON_LAYOUT, DEFAULT_LANGUAGE, LANGUAGES,
-        MISTER_RESOLUTIONS,
+        normalize_button_layout, normalize_language, normalize_orientation, orientations,
+        BROWSE_LAYOUTS, BUTTON_LAYOUTS, DEFAULT_BROWSE_LAYOUT, DEFAULT_BUTTON_LAYOUT,
+        DEFAULT_LANGUAGE, DEFAULT_ORIENTATION, LANGUAGES, MISTER_RESOLUTIONS, ORIENTATIONS,
     };
 
     #[test]
@@ -583,6 +705,14 @@ mod tests {
     }
 
     #[test]
+    fn orientations_preserve_order() {
+        let list = orientations();
+        let collected: Vec<String> = list.iter().map(String::from).collect();
+        let expected: Vec<String> = ORIENTATIONS.iter().map(|s| (*s).to_string()).collect();
+        assert_eq!(collected, expected);
+    }
+
+    #[test]
     fn browse_layouts_preserve_order() {
         let list = browse_layouts();
         let collected: Vec<String> = list.iter().map(String::from).collect();
@@ -596,6 +726,15 @@ mod tests {
         assert_eq!(normalize_browse_layout("detail"), DEFAULT_BROWSE_LAYOUT);
         assert_eq!(normalize_browse_layout("grid"), "grid");
         assert_eq!(normalize_browse_layout("list"), "list");
+    }
+
+    #[test]
+    fn orientation_normalization_defaults_to_horizontal() {
+        assert_eq!(normalize_orientation(""), DEFAULT_ORIENTATION);
+        assert_eq!(normalize_orientation("sideways"), DEFAULT_ORIENTATION);
+        assert_eq!(normalize_orientation("horizontal"), "horizontal");
+        assert_eq!(normalize_orientation("cw"), "cw");
+        assert_eq!(normalize_orientation("ccw"), "ccw");
     }
 
     #[test]

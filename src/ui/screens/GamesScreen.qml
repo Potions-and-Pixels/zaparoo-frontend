@@ -24,10 +24,25 @@ MediaListScreen {
 
     property alias gamesGrid: games.mediaGrid
 
-    readonly property int _listPageSize: 10
+    readonly property bool _portraitNonCrtList: !Theme.crtNativePath && Browse.Settings.current_orientation !== "horizontal"
+    readonly property int _listPageSize: games._portraitNonCrtList ? 16 : 10
+    readonly property bool _tateOrientation: Browse.Settings.current_orientation !== "horizontal"
+    readonly property var _gridShape: Sizing.gamesGridShape(Sizing.screenWidth, Sizing.screenHeight)
+    readonly property int _gridColumns: games._gridShape.columns
+    readonly property int _gridRows: games._gridShape.rows
     readonly property int _browsePageSize: games._listLayout ? Math.max(1, games.listCard.visibleRowCount) : games.gamesGrid.pageSize
     readonly property bool _crtGridLayout: Theme.crtNativePath && !games._listLayout
-    readonly property var _tileLayout: games._crtGridLayout ? BrowseLayouts.crtTile : BrowseLayouts.defaultTile
+    readonly property bool _tateListLayout: games._tateOrientation
+    readonly property string _gridViewId: "gamesGrid"
+    readonly property string _listViewId: "gamesList"
+    readonly property string _tateListViewId: "gamesListTate"
+    readonly property string _activeViewId: games._listLayout ? (games._tateListLayout ? games._tateListViewId : games._listViewId) : games._gridViewId
+    readonly property string _browseThemeId: BrowseLayouts.currentThemeId
+    readonly property var _gridProfile: BrowseLayouts.themeProfile(games._browseThemeId, games._gridViewId)
+    readonly property var _viewProfile: BrowseLayouts.themeProfile(games._browseThemeId, games._activeViewId)
+    readonly property var _headerProfile: games._viewProfile && games._viewProfile.header ? games._viewProfile.header : null
+    readonly property var _statusProfile: games._viewProfile && games._viewProfile.status ? games._viewProfile.status : null
+    readonly property var _footerProfile: games._gridProfile && games._gridProfile.footer ? games._gridProfile.footer : null
 
     mediaModel: Browse.GamesModel
     emptyText: qsTr("No games in this system")
@@ -38,11 +53,11 @@ MediaListScreen {
     detailShowDescription: false
     detailShowTitle: false
     detailLoadingText: qsTr("Loading game…")
+    pauseCoverRequestsDuringRapid: true
     detailCanPreviousImage: Browse.GamesModel.current_detail_image_can_prev
     detailCanNextImage: Browse.GamesModel.current_detail_image_can_next
     detailIdentityForIndex: function (index) {
-        const entryType = Browse.GamesModel.entry_type_at(index);
-        if (entryType === "directory" || entryType === "root")
+        if (!Browse.GamesModel.is_media_capable_at(index))
             return "";
         const systemId = Browse.GamesModel.system_id_at(index);
         const path = Browse.GamesModel.path_at(index);
@@ -59,12 +74,12 @@ MediaListScreen {
     linearMoveAction: delta => games._performLinearMove(delta)
     pageAction: delta => games._performPage(delta)
     onListLayoutEntered: () => games._fillListPage()
+    gridViewId: games._gridViewId
+    listViewId: games._listViewId
+    tateListViewId: games._tateListViewId
     listLeftAction: () => Browse.GamesModel.cycle_detail_image(-1)
     listRightAction: () => Browse.GamesModel.cycle_detail_image(1)
-    contextMenuEnabledAt: index => {
-        const entryType = Browse.GamesModel.entry_type_at(index);
-        return entryType !== "directory" && entryType !== "root";
-    }
+    contextMenuEnabledAt: index => Browse.GamesModel.is_media_capable_at(index)
     retryAction: () => {
         if (games._atFolderLevel()) {
             const stack = Browse.GamesState.path_stack;
@@ -78,7 +93,7 @@ MediaListScreen {
     }
     acceptAction: index => {
         const entryType = Browse.GamesModel.entry_type_at(index);
-        if (entryType === "directory" || entryType === "root") {
+        if ((entryType === "directory" || entryType === "root") && !Browse.GamesModel.is_media_capable_at(index)) {
             games.flushSelectedPersist();
             games.requestNavigateIntoFolder(Browse.GamesModel.path_at(index));
             return;
@@ -94,10 +109,8 @@ MediaListScreen {
         else
             games.requestSystemsScreen();
     }
-    showTopStrip: games._tileLayout.showTopStrip
+    showTopStrip: games._statusProfile ? games._statusProfile.topStripVisible : true
     topStripTitleProvider: () => {
-        if (games._tileLayout.showHeaderTitleInHeader)
-            return "";
         const sid = Browse.GamesModel.current_system_id;
         if (sid === "")
             return "";
@@ -105,8 +118,8 @@ MediaListScreen {
         return idx >= 0 ? Browse.SystemsModel.system_name_at(idx) : sid;
     }
     topStripCurrentPageProvider: () => Math.floor(games.gamesGrid.currentIndex / games._browsePageSize)
-    topStripTotalPagesProvider: () => games._tileLayout.showBottomStatusRow ? 1 : Math.max(1, Math.ceil((Browse.GamesModel.dir_count + Browse.GamesModel.total_files) / games._browsePageSize))
-    topStripTotalTextProvider: () => games._listLayout || games._tileLayout.showBottomStatusRow ? "" : (Browse.GamesModel.total_files > 0 ? qsTr("%1 files").arg(Browse.GamesModel.total_files) : "")
+    topStripTotalPagesProvider: () => games._footerProfile && games._footerProfile.bottomStatusVisible ? 1 : Math.max(1, Math.ceil((Browse.GamesModel.dir_count + Browse.GamesModel.total_files) / games._browsePageSize))
+    topStripTotalTextProvider: () => games._listLayout || (games._footerProfile && games._footerProfile.bottomStatusVisible) ? "" : (Browse.GamesModel.total_files > 0 ? qsTr("%1 files").arg(Browse.GamesModel.total_files) : "")
     topStripRightTextProvider: () => {
         if (!games._listLayout)
             return "";
@@ -117,28 +130,34 @@ MediaListScreen {
         const total = Math.max(1, Browse.GamesModel.dir_count + Browse.GamesModel.total_files);
         return qsTr("%1 / %2").arg(games.gamesGrid.currentIndex + 1).arg(total);
     }
-    gridLayoutProfile: games._tileLayout
-    gridBottomMargin: games._tileLayout.activeLabelBottomMargin + games._tileLayout.activeLabelHeight
+    gridBottomMargin: games._footerProfile ? games._footerProfile.gridBottomMargin : (Sizing.pctH(8) + Sizing.pctH(7))
+    gridColumnsOverride: games._gridColumns
+    gridRowsOverride: games._gridRows
     gridTotalItemsOverride: Browse.GamesModel.dir_count + Browse.GamesModel.total_files
     gridHasMorePages: Browse.GamesModel.has_next_page
-    gridLoadMoreAction: () => Browse.GamesModel.fetch_more()
+    gridLoadMoreAction: urgent => {
+        if (urgent || games.detailRapidScrollActive)
+            Browse.GamesModel.fetch_more_rapid();
+        else
+            Browse.GamesModel.fetch_more();
+    }
     gridCurrentPageChangedAction: () => {
         const first = games.gamesGrid.currentPage * games.gamesGrid.pageSize;
         Browse.GamesModel.visible_first_row = first;
-        if (!games._listLayout)
+        if (!games._listLayout && !games.detailRapidScrollActive)
             Browse.GamesModel.prefetch_around(first);
     }
     activeLabelTextProvider: () => games.gamesGrid.itemCount > 0 ? Browse.GamesModel.name_at(games.gamesGrid.currentIndex) : ""
     activeLabelAtBottom: true
-    activeLabelBottomMargin: games._tileLayout.activeLabelBottomMargin
-    activeLabelHeight: games._tileLayout.activeLabelHeight
-    showBottomStatusRow: games._tileLayout.showBottomStatusRow
-    bottomStatusLeftMargin: games._tileLayout.bottomStatusLeftMargin
-    bottomStatusRightMargin: games._tileLayout.bottomStatusRightMargin
-    bottomStatusLeftText: games._tileLayout.showBottomStatusRow && Browse.GamesModel.total_files > 0 ? qsTr("%1 files").arg(Browse.GamesModel.total_files) : ""
-    bottomStatusRightText: games._tileLayout.showBottomStatusRow && Math.ceil((Browse.GamesModel.dir_count + Browse.GamesModel.total_files) / games._browsePageSize) > 1 ? qsTr("%1 / %2").arg(Math.floor(games.gamesGrid.currentIndex / games._browsePageSize) + 1).arg(Math.max(1, Math.ceil((Browse.GamesModel.dir_count + Browse.GamesModel.total_files) / games._browsePageSize))) : ""
+    activeLabelBottomMargin: games._footerProfile ? games._footerProfile.activeLabelBottomMargin : Sizing.pctH(8)
+    activeLabelHeight: games._footerProfile ? games._footerProfile.activeLabelHeight : Sizing.pctH(7)
+    showBottomStatusRow: games._footerProfile ? games._footerProfile.bottomStatusVisible : false
+    bottomStatusLeftMargin: games._footerProfile ? games._footerProfile.bottomStatusLeftMargin : 0
+    bottomStatusRightMargin: games._footerProfile ? games._footerProfile.bottomStatusRightMargin : 0
+    bottomStatusLeftText: games._footerProfile && games._footerProfile.bottomStatusVisible && Browse.GamesModel.total_files > 0 ? qsTr("%1 files").arg(Browse.GamesModel.total_files) : ""
+    bottomStatusRightText: games._footerProfile && games._footerProfile.bottomStatusVisible && Math.ceil((Browse.GamesModel.dir_count + Browse.GamesModel.total_files) / games._browsePageSize) > 1 ? qsTr("%1 / %2").arg(Math.floor(games.gamesGrid.currentIndex / games._browsePageSize) + 1).arg(Math.max(1, Math.ceil((Browse.GamesModel.dir_count + Browse.GamesModel.total_files) / games._browsePageSize))) : ""
     pageLoadingVisible: !games._listLayout && Browse.GamesModel.loading_more && games.gamesGrid.hasPendingTarget
-    pageLoadingLeftMargin: games._tileLayout.showBottomStatusRow && games.bottomStatusLeftText !== "" ? Sizing.px(games.width / 3) : games.gamesGrid.leftInset
+    pageLoadingLeftMargin: games._footerProfile && games._footerProfile.bottomStatusVisible && games.bottomStatusLeftText !== "" ? Sizing.px(games.width / 3) : games.gamesGrid.leftInset
 
     Binding {
         target: Browse.GamesModel
@@ -207,8 +226,7 @@ MediaListScreen {
     // directions have a row-edge escape branch, so all four cardinal
     // actions share this exact body.
     function _performGridMove(dx: int, dy: int): void {
-        if (games.gamesGrid.moveSelection(dx, dy))
-            games._scheduleSelectedPersist(Browse.GamesModel.path_at(games.gamesGrid.currentIndex));
+        games.gamesGrid.moveSelection(dx, dy);
     }
 
     function _performLinearMove(delta: int): void {
@@ -232,7 +250,6 @@ MediaListScreen {
             return;
         }
         games.gamesGrid.currentIndex = next;
-        games._scheduleSelectedPersist(Browse.GamesModel.path_at(games.gamesGrid.currentIndex));
         if (next >= count - 2 && Browse.GamesModel.has_next_page)
             Browse.GamesModel.fetch_more();
         games._prefetchListTail(next);
@@ -267,8 +284,7 @@ MediaListScreen {
             games._performLinearMove(delta * games._browsePageSize);
             return;
         }
-        if (games.gamesGrid.pageBy(delta))
-            games._scheduleSelectedPersist(Browse.GamesModel.path_at(games.gamesGrid.currentIndex));
+        games.gamesGrid.pageBy(delta);
     }
 
     // True when we're inside a navigated folder (path_stack length > 1).

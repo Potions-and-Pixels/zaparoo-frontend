@@ -44,11 +44,13 @@ pub struct Config {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SettingsConfig {
+    pub orientation: Option<String>,
     pub browse_layout: Option<String>,
     pub button_layout: Option<String>,
     pub mouse_enabled: Option<bool>,
     pub discover_arcade_alternate_versions: Option<bool>,
     pub screensaver_timeout: Option<String>,
+    pub media_image_type: Option<String>,
     /// Kiosk lockdown — hide the Settings tile on the Hub action row.
     /// `None`/`Some(false)` leave it visible (default). `Some(true)`
     /// removes it; the screen stays accessible programmatically but
@@ -71,12 +73,14 @@ pub struct SettingsConfig {
 pub struct SettingsMirror<'a> {
     pub resolution: &'a str,
     pub language: &'a str,
+    pub orientation: &'a str,
     pub browse_layout: &'a str,
     pub button_layout: &'a str,
     pub mouse_enabled: bool,
     pub discover_arcade_alternate_versions: bool,
     pub debug_logging: bool,
     pub screensaver_timeout: &'a str,
+    pub media_image_type: &'a str,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -147,11 +151,13 @@ struct RawInput {
 
 #[derive(Deserialize, Default)]
 struct RawSettings {
+    orientation: Option<String>,
     browse_layout: Option<String>,
     button_layout: Option<String>,
     mouse_enabled: Option<bool>,
     discover_arcade_alternate_versions: Option<bool>,
     screensaver_timeout: Option<String>,
+    media_image_type: Option<String>,
     hide_settings: Option<bool>,
     hide_favorites: Option<bool>,
     hide_recents: Option<bool>,
@@ -221,6 +227,10 @@ pub fn load_config(path: &Path) -> Config {
         cfg.key_to_action = input_actions::invert(&merged);
     }
     cfg.settings = SettingsConfig {
+        orientation: raw
+            .settings
+            .orientation
+            .map(|value| value.trim().to_string()),
         browse_layout: raw
             .settings
             .browse_layout
@@ -234,6 +244,10 @@ pub fn load_config(path: &Path) -> Config {
         screensaver_timeout: raw
             .settings
             .screensaver_timeout
+            .map(|value| value.trim().to_string()),
+        media_image_type: raw
+            .settings
+            .media_image_type
             .map(|value| value.trim().to_string()),
         hide_settings: raw.settings.hide_settings,
         hide_favorites: raw.settings.hide_favorites,
@@ -298,6 +312,10 @@ pub fn save_settings_mirror(path: &Path, mirror: SettingsMirror<'_>) -> Result<(
         ));
     };
     settings.insert(
+        "orientation".into(),
+        toml::Value::String(mirror.orientation.trim().to_string()),
+    );
+    settings.insert(
         "browse_layout".into(),
         toml::Value::String(mirror.browse_layout.trim().to_string()),
     );
@@ -316,6 +334,10 @@ pub fn save_settings_mirror(path: &Path, mirror: SettingsMirror<'_>) -> Result<(
     settings.insert(
         "screensaver_timeout".into(),
         toml::Value::String(mirror.screensaver_timeout.trim().to_string()),
+    );
+    settings.insert(
+        "media_image_type".into(),
+        toml::Value::String(mirror.media_image_type.trim().to_string()),
     );
 
     let logging_value = table
@@ -451,6 +473,7 @@ mod tests {
         assert_eq!(cfg.video_height, 1080);
         assert!(!cfg.debug_logging);
         assert_eq!(cfg.language, "");
+        assert_eq!(cfg.settings.orientation, None);
         assert_eq!(cfg.settings.browse_layout, None);
         assert_eq!(cfg.settings.button_layout, None);
         assert_eq!(cfg.settings.mouse_enabled, None);
@@ -592,6 +615,7 @@ mod tests {
             debug = true
 
             [settings]
+            orientation = "cw"
             browse_layout = "list"
             button_layout = "c"
             mouse_enabled = false
@@ -603,6 +627,7 @@ mod tests {
         assert_eq!(cfg.video_width, 640);
         assert_eq!(cfg.video_height, 480);
         assert!(cfg.debug_logging);
+        assert_eq!(cfg.settings.orientation.as_deref(), Some("cw"));
         assert_eq!(cfg.settings.browse_layout.as_deref(), Some("list"));
         assert_eq!(cfg.settings.button_layout.as_deref(), Some("c"));
         assert_eq!(cfg.settings.mouse_enabled, Some(false));
@@ -624,12 +649,14 @@ mod tests {
             SettingsMirror {
                 resolution: "1280x720",
                 language: "it_IT",
+                orientation: "cw",
                 browse_layout: "list",
                 button_layout: "b",
                 mouse_enabled: false,
                 discover_arcade_alternate_versions: true,
                 debug_logging: true,
                 screensaver_timeout: "300",
+                media_image_type: "auto",
             },
         )
         .expect("save");
@@ -638,6 +665,7 @@ mod tests {
         assert_eq!(cfg.video_width, 1280);
         assert_eq!(cfg.video_height, 720);
         assert!(cfg.video_explicit);
+        assert_eq!(cfg.settings.orientation.as_deref(), Some("cw"));
         assert_eq!(cfg.settings.browse_layout.as_deref(), Some("list"));
         assert_eq!(cfg.settings.button_layout.as_deref(), Some("b"));
         assert_eq!(cfg.settings.mouse_enabled, Some(false));
@@ -656,12 +684,14 @@ mod tests {
             SettingsMirror {
                 resolution: "1280x720",
                 language: "en",
+                orientation: "horizontal",
                 browse_layout: "grid",
                 button_layout: "a",
                 mouse_enabled: true,
                 discover_arcade_alternate_versions: false,
                 debug_logging: false,
                 screensaver_timeout: "60",
+                media_image_type: "auto",
             },
         )
         .expect("save");
@@ -672,6 +702,7 @@ mod tests {
         assert_eq!(cfg.core_endpoint, "ws://example.com/api");
         assert_eq!(cfg.video_width, 1280);
         assert_eq!(cfg.video_height, 720);
+        assert_eq!(cfg.settings.orientation.as_deref(), Some("horizontal"));
         assert_eq!(cfg.settings.browse_layout.as_deref(), Some("grid"));
         assert_eq!(cfg.settings.button_layout.as_deref(), Some("a"));
         assert_eq!(cfg.settings.mouse_enabled, Some(true));
@@ -688,17 +719,20 @@ mod tests {
             SettingsMirror {
                 resolution: "",
                 language: "",
+                orientation: "ccw",
                 browse_layout: "list",
                 button_layout: "c",
                 mouse_enabled: false,
                 discover_arcade_alternate_versions: true,
                 debug_logging: true,
                 screensaver_timeout: "off",
+                media_image_type: "auto",
             },
         )
         .expect("save");
         let written = std::fs::read_to_string(f.path()).expect("read");
         assert!(written.contains("language = \"auto\""));
+        assert!(written.contains("orientation = \"ccw\""));
         assert!(written.contains("browse_layout = \"list\""));
         assert!(written.contains("button_layout = \"c\""));
         assert!(written.contains("mouse_enabled = false"));
@@ -708,6 +742,7 @@ mod tests {
         let cfg = load_config(f.path());
         assert_eq!(cfg.language, "");
         assert!(!cfg.video_explicit);
+        assert_eq!(cfg.settings.orientation.as_deref(), Some("ccw"));
         assert_eq!(cfg.settings.browse_layout.as_deref(), Some("list"));
         assert_eq!(cfg.settings.button_layout.as_deref(), Some("c"));
         assert_eq!(cfg.settings.mouse_enabled, Some(false));

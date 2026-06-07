@@ -56,6 +56,9 @@ Item {
     property var gridCurrentPageChangedAction: null
     property var gridCurrentIndexChangedAction: null
     property var gridLoadMoreAction: null
+    property string gridViewId: "gamesGrid"
+    property string listViewId: "gamesList"
+    property string tateListViewId: "gamesListTate"
 
     property alias mediaGrid: mediaGrid
     property alias topStrip: topStrip
@@ -65,11 +68,13 @@ Item {
     property bool transitioning: false
     property bool gridFocused: true
     property bool detailRapidScrollActive: false
+    property bool detailRapidIndicatorActive: detailRapidScrollActive
+    property string detailRapidScrollAction: ""
+    property bool pauseCoverRequestsDuringRapid: true
     property bool forceListLayout: false
     property bool renderGridLayout: true
     property bool showTopStrip: true
     property bool showBottomStatusRow: false
-    property bool showHeaderTitleInHeader: false
     property bool activeLabelAtBottom: false
     property int gridBottomMargin: Sizing.pctH(15)
     property int activeLabelBottomMargin: 0
@@ -77,14 +82,26 @@ Item {
     property int bottomStatusLeftMargin: 0
     property int bottomStatusRightMargin: 0
     property int pageLoadingLeftMargin: 0
+    property int gridColumnsOverride: Sizing.gamesGridColumns
+    property int gridRowsOverride: Sizing.gamesGridRows
     property bool pageLoadingVisible: false
     property string bottomStatusLeftText: ""
     property string bottomStatusRightText: ""
-    property var gridLayoutProfile: null
     property int gridTotalItemsOverride: -1
     property bool gridHasMorePages: false
+    readonly property bool _listRapidLineMove: root._listLayout && (root.detailRapidScrollAction === "up" || root.detailRapidScrollAction === "down")
+    readonly property bool _showRapidScrollIndicator: root.detailRapidIndicatorActive && !root._listRapidLineMove
     readonly property bool _listLayout: root.forceListLayout || Browse.Settings.current_browse_layout === "list"
-    readonly property int _listOverlayBottomMargin: Sizing.pctH(15)
+    readonly property bool _tateListLayout: root._listLayout && Browse.Settings.current_orientation !== "horizontal"
+    readonly property string _activeListViewId: root._tateListLayout ? root.tateListViewId : root.listViewId
+    readonly property string _browseThemeId: BrowseLayouts.currentThemeId
+    readonly property var _gridLayoutProfile: BrowseLayouts.themeProfile(root._browseThemeId, root.gridViewId)
+    readonly property var _listLayoutProfile: BrowseLayouts.themeProfile(root._browseThemeId, root._activeListViewId)
+    readonly property var _activeViewProfile: root._listLayout ? root._listLayoutProfile : root._gridLayoutProfile
+    readonly property var _statusProfile: root._activeViewProfile && root._activeViewProfile.status ? root._activeViewProfile.status : null
+    readonly property var _footerProfile: root._gridLayoutProfile && root._gridLayoutProfile.footer ? root._gridLayoutProfile.footer : null
+    readonly property bool _crtListStrip: Theme.crtNativePath && root._listLayout
+    readonly property int _listOverlayBottomMargin: root._listLayoutProfile && root._listLayoutProfile.list ? root._listLayoutProfile.list.overlayBottomMargin : Sizing.pctH(15)
     readonly property bool _gateHide: root.transitioning || root._loading()
 
     signal requestHubScreen
@@ -152,7 +169,6 @@ Item {
         if (index < 0 || index >= mediaGrid.itemCount)
             return;
         mediaGrid.currentIndex = index;
-        root._persistFocus();
     }
 
     function _performLinearMove(delta: int): void {
@@ -174,9 +190,46 @@ Item {
             return;
         }
         mediaGrid.currentIndex = next;
-        root._persistFocus();
         if (next >= count - 2)
             root.mediaModel.fetch_more();
+    }
+
+    function _coverRefreshFirstRow(): int {
+        if (!root._listLayout)
+            return mediaGrid.currentPage * mediaGrid.pageSize;
+        return Math.max(0, mediaGrid.currentIndex - listCard.visibleRowCount);
+    }
+
+    function _coverRefreshRowCount(): int {
+        if (!root._listLayout)
+            return mediaGrid.pageSize * 2;
+        return Math.max(1, listCard.visibleRowCount * 3);
+    }
+
+    function _resumeCoverRequests(): void {
+        if (root.mediaModel === null)
+            return;
+        if (root.pauseCoverRequestsDuringRapid)
+            root.mediaModel.cover_requests_paused = false;
+        if (typeof root.mediaModel.refresh_cover_keys === "function")
+            root.mediaModel.refresh_cover_keys(root._coverRefreshFirstRow(), root._coverRefreshRowCount());
+        if (!root._listLayout && typeof root.gridCurrentPageChangedAction === "function")
+            root.gridCurrentPageChangedAction();
+    }
+
+    function _pauseCoverRequests(): void {
+        if (root.mediaModel === null || !root.pauseCoverRequestsDuringRapid)
+            return;
+        root.mediaModel.cover_requests_paused = true;
+        if (typeof root.mediaModel.clear_pending_cover_requests === "function")
+            root.mediaModel.clear_pending_cover_requests();
+    }
+
+    onDetailRapidScrollActiveChanged: {
+        if (root.detailRapidScrollActive)
+            root._pauseCoverRequests();
+        else
+            root._resumeCoverRequests();
     }
 
     function _performPage(delta: int): void {
@@ -283,12 +336,13 @@ Item {
 
     TopStatusStrip {
         id: topStrip
-        visible: !root._gateHide && root.showTopStrip
+        visible: !root._gateHide && (root._statusProfile ? root._statusProfile.topStripVisible : root.showTopStrip)
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.top: parent.top
-        anchors.topMargin: Sizing.headerBottom + Sizing.pctH(1)
-        height: root.showTopStrip ? Sizing.pctH(7) : 0
+        anchors.topMargin: Sizing.headerBottom + (root._statusProfile ? root._statusProfile.topMargin : Sizing.pctH(1))
+        height: root._statusProfile ? root._statusProfile.stripHeight : (root.showTopStrip ? Sizing.pctH(7) : 0)
+        slotMargin: root._statusProfile ? root._statusProfile.slotMargin : Sizing.pctW(5)
         title: typeof root.topStripTitleProvider === "function" ? root.topStripTitleProvider() : root.screenTitle
         currentPage: typeof root.topStripCurrentPageProvider === "function" ? root.topStripCurrentPageProvider() : mediaGrid.currentPage
         totalPages: typeof root.topStripTotalPagesProvider === "function" ? root.topStripTotalPagesProvider() : Math.max(1, Math.ceil(root._count() / mediaGrid.pageSize))
@@ -301,13 +355,14 @@ Item {
 
         visible: !root._gateHide && root._listLayout
         anchors.left: parent.left
-        anchors.leftMargin: Sizing.pctW(5)
+        anchors.leftMargin: root._listLayoutProfile && root._listLayoutProfile.list ? root._listLayoutProfile.list.cardSideMargin : Sizing.pctW(5)
         anchors.right: parent.right
-        anchors.rightMargin: Sizing.pctW(5)
+        anchors.rightMargin: root._listLayoutProfile && root._listLayoutProfile.list ? root._listLayoutProfile.list.cardSideMargin : Sizing.pctW(5)
         anchors.top: topStrip.bottom
-        anchors.topMargin: Sizing.pctH(2)
+        anchors.topMargin: root._listLayoutProfile && root._listLayoutProfile.list ? root._listLayoutProfile.list.cardTopMargin : Sizing.pctH(2)
         anchors.bottom: parent.bottom
-        anchors.bottomMargin: Sizing.pctH(8)
+        anchors.bottomMargin: root._listLayoutProfile && root._listLayoutProfile.list ? root._listLayoutProfile.list.cardBottomMargin : Sizing.pctH(8)
+        layoutProfile: root._listLayoutProfile
         model: root.mediaModel
         totalItemsOverride: root.totalItemsOverride
         targetVisibleRowCount: root.targetVisibleRowCount
@@ -348,17 +403,19 @@ Item {
         focused: root.gridFocused
         model: root.mediaModel
         delegate: Tile {
-            layoutProfile: root.gridLayoutProfile
+            layoutProfile: root._gridLayoutProfile
             showCaption: true
         }
-        layoutProfile: root.gridLayoutProfile
-        columnsOverride: Sizing.gamesGridColumns
-        rowsOverride: Sizing.gamesGridRows
+        layoutProfile: root._gridLayoutProfile
+        columnsOverride: root.gridColumnsOverride
+        rowsOverride: root.gridRowsOverride
         totalItemsOverride: root.gridTotalItemsOverride
         hasMorePages: root.gridHasMorePages
-        onLoadMoreRequested: {
+        coverLoadingPaused: root.detailRapidScrollActive
+        rapidRenderMode: root.detailRapidScrollActive
+        onLoadMoreRequested: urgent => {
             if (typeof root.gridLoadMoreAction === "function")
-                root.gridLoadMoreAction();
+                root.gridLoadMoreAction(urgent);
             else
                 root.mediaModel.fetch_more();
         }
@@ -436,6 +493,14 @@ Item {
         anchors.left: activeLabel.left
         anchors.leftMargin: root.pageLoadingLeftMargin
         anchors.verticalCenter: activeLabel.verticalCenter
+    }
+
+    RapidScrollIndicator {
+        visible: !root._gateHide && root._showRapidScrollIndicator && mediaGrid.itemCount > 0
+        x: Sizing.center(parent.width, width)
+        y: root._listLayout ? Sizing.center(parent.height, height) : Sizing.center(mediaGrid.height, height) + mediaGrid.y
+        title: typeof root.activeLabelTextProvider === "function" ? root.activeLabelTextProvider() : (mediaGrid.itemCount > 0 && root.mediaModel !== null ? root.mediaModel.name_at(mediaGrid.currentIndex) : "")
+        z: 20
     }
 
     ScreenStateOverlay {

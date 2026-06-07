@@ -25,7 +25,9 @@ Item {
     // the bouncing copy at exactly the same position.
     property alias logoItem: logo
     property var layoutProfile: null
+    readonly property var _headerProfile: header.layoutProfile && header.layoutProfile.header ? header.layoutProfile.header : null
     property string browseTitle: ""
+    property string browseProgressText: ""
 
     height: Sizing.headerHeight
 
@@ -44,6 +46,25 @@ Item {
         source: "qrc:/qt/qml/Zaparoo/App/resources/images/logo.png"
     }
 
+    Text {
+        id: browseProgressLabel
+
+        visible: header.browseProgressText !== ""
+        anchors.left: logo.right
+        anchors.leftMargin: Sizing.pctW(1)
+        anchors.verticalCenter: logo.verticalCenter
+        width: Math.max(0, Math.floor(parent.width / 4))
+        height: Sizing.headerRowHeight
+        elide: Text.ElideRight
+        horizontalAlignment: Text.AlignLeft
+        verticalAlignment: Text.AlignVCenter
+        text: header.browseProgressText
+        font.family: Theme.fontUi
+        font.pixelSize: Sizing.fontSize(2.9)
+        color: Theme.textPrimary
+        renderType: Text.NativeRendering
+    }
+
     TextMetrics {
         id: clockMetrics
 
@@ -60,8 +81,8 @@ Item {
     Row {
         id: topHud
 
-        anchors.top: header.layoutProfile && header.layoutProfile.headerHudBottomAligned ? undefined : parent.top
-        anchors.bottom: header.layoutProfile && header.layoutProfile.headerHudBottomAligned ? parent.bottom : undefined
+        anchors.top: header._headerProfile && header._headerProfile.hudBottomAligned ? undefined : parent.top
+        anchors.bottom: header._headerProfile && header._headerProfile.hudBottomAligned ? parent.bottom : undefined
         anchors.right: parent.right
         anchors.rightMargin: Sizing.headerSideMargin
         spacing: Sizing.pctW(1)
@@ -141,7 +162,7 @@ Item {
     Text {
         id: crtTitleLabel
 
-        visible: header.layoutProfile && header.layoutProfile.showHeaderTitleInHeader && header.browseTitle !== ""
+        visible: header._headerProfile && header._headerProfile.titleInHeader && header.browseTitle !== ""
         x: Sizing.center(parent.width, width)
         y: parent.height - height
         width: Math.min(Math.floor(parent.width / 3), Math.ceil(Math.max(crtTitleMetrics.advanceWidth, crtTitleMetrics.boundingRect.width)))
@@ -163,8 +184,8 @@ Item {
     // idle, but its slot stays reserved by the header's fixed height
     // so the logo and the surrounding layout don't shift.
     CoreStatusPill {
-        anchors.top: header.layoutProfile && header.layoutProfile.headerStatusPillPinnedTop ? parent.top : topHud.bottom
+        anchors.top: header._headerProfile && header._headerProfile.statusPillPinnedTop ? parent.top : topHud.bottom
         anchors.right: topHud.right
-        anchors.topMargin: header.layoutProfile && header.layoutProfile.headerStatusPillPinnedTop ? 0 : Sizing.headerStackGap
+        anchors.topMargin: header._headerProfile && header._headerProfile.statusPillPinnedTop ? 0 : Sizing.headerStackGap
     }
 }

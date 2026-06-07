@@ -50,6 +50,7 @@ MainLayout {
     property string _pendingLanguageSelection: ""
     property string _pendingResolutionSelection: ""
     property bool _discoverMenuPending: false
+    property bool _resumeStartupFocusPending: false
     property var _discoverParentEntries: []
     property string _pendingLauncherSystemId: ""
     property string _pendingLauncherSelectionId: ""
@@ -68,7 +69,10 @@ MainLayout {
     // visual grid pageSize and produced half-loaded pages on every
     // subsequent cursor advance.
     readonly property int _gamesListFetchSize: 30
-    readonly property int _gamesPageSize: Browse.Settings.current_browse_layout === "list" ? root._gamesListFetchSize : Sizing.gamesGridColumns * Sizing.gamesGridRows
+    readonly property var _gamesGridShape: Sizing.gamesGridShape(Sizing.screenWidth, Sizing.screenHeight)
+    readonly property int _gamesGridColumns: root._gamesGridShape.columns
+    readonly property int _gamesGridRows: root._gamesGridShape.rows
+    readonly property int _gamesPageSize: Browse.Settings.current_browse_layout === "list" ? root._gamesListFetchSize : root._gamesGridColumns * root._gamesGridRows
     on_GamesPageSizeChanged: Browse.GamesModel.page_size = root._gamesPageSize
 
     // Bind Sizing to the scene's logical dimensions, not the
@@ -105,6 +109,8 @@ MainLayout {
         const savedScreen = Browse.AppState.active_screen;
         if (savedScreen === root.screenGames || savedScreen === root.screenSystems || savedScreen === root.screenHub || savedScreen === root.screenFavorites || savedScreen === root.screenRecents || savedScreen === root.screenSettings || savedScreen === root.screenAbout)
             root.activeScreen = savedScreen;
+        Browse.FavoritesModel.cover_requests_paused = root.activeScreen !== root.screenFavorites;
+        Browse.RecentsModel.cover_requests_paused = root.activeScreen !== root.screenRecents;
         // If the catalog is already ready, fire the restore here so
         // the cascade (set_category → SystemsModel reset → seed
         // currentIndex → set_system → GamesModel reset) lands before
@@ -112,11 +118,18 @@ MainLayout {
         // Connection below fires it on first delivery.
         if (Browse.CategoriesModel.count > 0)
             root.hubScreen.restoreFromCategoriesReset();
+        if (root.activeScreen === root.screenHub) {
+            if (Browse.RecentsModel.resume_available)
+                root.hubScreen.focusResumeIfAvailable();
+            else
+                root._resumeStartupFocusPending = true;
+        }
         // Warm-start into Favorites/Recents needs the same
         // restore-on-ready dance the navigate helpers perform,
         // otherwise the grid lands on index 0 and ignores persisted
         // selected_path.
         if (savedScreen === root.screenFavorites) {
+            root._resumeFavoritesCovers();
             if (Browse.FavoritesModel.loading) {
                 root._favoritesReadyCallback = function () {
                     root.favoritesScreen.restoreSelection();
@@ -126,6 +139,7 @@ MainLayout {
             }
         }
         if (savedScreen === root.screenRecents) {
+            root._resumeRecentsCovers();
             if (Browse.RecentsModel.loading) {
                 root._recentsReadyCallback = function () {
                     root.recentsScreen.restoreSelection();
@@ -373,6 +387,14 @@ MainLayout {
             root._recentsReadyCallback = null;
             cb();
         }
+
+        function onResume_availableChanged(): void {
+            if (!root._resumeStartupFocusPending || !Browse.RecentsModel.resume_available)
+                return;
+            root._resumeStartupFocusPending = false;
+            if (root.activeScreen === root.screenHub)
+                root.hubScreen.focusResumeIfAvailable();
+        }
     }
     Connections {
         target: Browse.FavoritesModel
@@ -430,14 +452,20 @@ MainLayout {
 
     // Hub Accept routing. Empty-row passthrough preserves the committed
     // "Enter on empty hub goes to Systems" behaviour and
-    // keeps the navigation test synchronous. Otherwise: tentatively
-    // pin the destination to Systems, fill the chosen category, then
-    // either bypass to Games (MiSTer Arcade singleton) or fall
-    // through to Systems with a cover-prefetch warmup so the
-    // destination paints with logos already in QPixmapCache.
+    // keeps the navigation test synchronous. The Resume action is a
+    // hub payload rather than a category and launches the latest
+    // resumable history row. Otherwise: tentatively pin the
+    // destination to Systems, fill the chosen category, then either
+    // bypass to Games (MiSTer Arcade singleton) or fall through to
+    // Systems with a cover-prefetch warmup so the destination paints
+    // with logos already in QPixmapCache.
     function _navigateFromHub(category: string): void {
         if (category === "") {
             root._goto(root.screenSystems);
+            return;
+        }
+        if (category === "resume") {
+            Browse.RecentsModel.launch_resume();
             return;
         }
         Browse.HubState.category = category;
@@ -463,6 +491,7 @@ MainLayout {
 
     function _navigateToFavorites(): void {
         root.pendingTransition = "favorites";
+        root._resumeFavoritesCovers();
         if (!Browse.FavoritesModel.loading) {
             root.favoritesScreen.restoreSelection();
             root._completeTransition(root.screenFavorites);
@@ -481,6 +510,7 @@ MainLayout {
     // sees the centred "Loading…" cue rather than an empty grid.
     function _navigateToRecents(): void {
         root.pendingTransition = "recents";
+        root._resumeRecentsCovers();
         if (!Browse.RecentsModel.loading) {
             root.recentsScreen.restoreSelection();
             root._completeTransition(root.screenRecents);
@@ -490,6 +520,18 @@ MainLayout {
             root.recentsScreen.restoreSelection();
             root._completeTransition(root.screenRecents);
         };
+    }
+
+    function _resumeFavoritesCovers(): void {
+        Browse.FavoritesModel.cover_requests_paused = false;
+        const first = root.favoritesScreen.mediaGrid.currentPage * root.favoritesScreen.mediaGrid.pageSize;
+        Browse.FavoritesModel.refresh_cover_keys(first, root.favoritesScreen.mediaGrid.pageSize * 2);
+    }
+
+    function _resumeRecentsCovers(): void {
+        Browse.RecentsModel.cover_requests_paused = false;
+        const first = root.recentsScreen.mediaGrid.currentPage * root.recentsScreen.mediaGrid.pageSize;
+        Browse.RecentsModel.refresh_cover_keys(first, root.recentsScreen.mediaGrid.pageSize * 2);
     }
 
     // Hub → Settings transition. The Settings screen has no async
@@ -739,7 +781,7 @@ MainLayout {
         }
     }
 
-    // Pure helper — owner/entryType/hasNfc/isFavorite → list of `{id,label}` entries.
+    // Pure helper — owner/entryType/mediaCapable/hasNfc/isFavorite → list of `{id,label}` entries.
     // Empty list = no menu (caller bails out of openContextMenu).
     //
     // Annotated as `: var` (not `list<var>`): MiSTer's AOT-compiled
@@ -747,7 +789,7 @@ MainLayout {
     // caller saw `entries.length === 0` despite the function pushing 3
     // items in. Plain `var` round-trips cleanly and silences the
     // "insufficiently annotated" coercion warning at the call site.
-    function buildContextMenuEntries(owner: string, entryType: string, hasNfc: bool, isFavorite: bool, systemId: string) {
+    function buildContextMenuEntries(owner: string, entryType: string, mediaCapable: bool, hasNfc: bool, isFavorite: bool, systemId: string) {
         if (owner === "systems") {
             const entries = [
                 {
@@ -778,7 +820,7 @@ MainLayout {
             return entries;
         }
         if (owner === "games" || owner === "favorites") {
-            if (entryType === "directory" || entryType === "root")
+            if ((entryType === "directory" || entryType === "root") && !mediaCapable)
                 return [];
             const entries = [];
             entries.push({
@@ -854,6 +896,7 @@ MainLayout {
         let entryType = "";
         let isFavorite = false;
         let systemId = "";
+        let mediaCapable = false;
         if (owner === "systems") {
             if (index >= Browse.SystemsModel.count)
                 return;
@@ -862,16 +905,18 @@ MainLayout {
             if (index >= Browse.GamesModel.count)
                 return;
             entryType = Browse.GamesModel.entry_type_at(index);
+            mediaCapable = Browse.GamesModel.is_media_capable_at(index);
             isFavorite = Browse.GamesModel.is_favorite_at(index);
         } else if (owner === "favorites") {
             if (index >= Browse.FavoritesModel.count)
                 return;
+            mediaCapable = true;
             isFavorite = Browse.FavoritesModel.is_favorite_at(index);
         } else if (owner === "recents") {
             if (index >= Browse.RecentsModel.count)
                 return;
         }
-        const entries = root.buildContextMenuEntries(owner, entryType, Browse.SystemStatus.has_nfc, isFavorite, systemId);
+        const entries = root.buildContextMenuEntries(owner, entryType, mediaCapable, Browse.SystemStatus.has_nfc, isFavorite, systemId);
         if (entries.length === 0)
             return;
         root.contextMenuEntries = entries;
@@ -1292,6 +1337,8 @@ MainLayout {
             if (selectedId !== Browse.Settings.current_language)
                 root.stageSettingRestart(fieldId, selectedId);
             return;
+        } else if (fieldId === "orientation") {
+            Browse.Settings.set_orientation(selectedId);
         } else if (fieldId === "browseLayout")
             Browse.Settings.set_browse_layout(selectedId);
         else if (fieldId === "buttonLayout")
@@ -1303,6 +1350,8 @@ MainLayout {
             return;
         } else if (fieldId === "screensaverTimeout")
             Browse.Settings.set_screensaver_timeout(selectedId);
+        else if (fieldId === "mediaImageType")
+            Browse.Settings.set_media_image_type(selectedId);
         root.closeListPickerModal();
     }
     onListPickerCloseRequested: root.handleListPickerCloseRequested()
@@ -1465,6 +1514,7 @@ MainLayout {
             // above rather than leak it to the root screen.
             return;
         }
+        root._noteRapidNavigationAction(action, false);
         if (root.activeScreen === root.screenGames) {
             root.gamesScreen.handleAction(action);
         } else if (root.activeScreen === root.screenSystems) {
@@ -1482,20 +1532,24 @@ MainLayout {
         }
     }
 
-    // Hold-to-repeat for dpad directions. Qt's OS-level auto-repeat is
+    // Hold-to-repeat for navigation actions. Qt's OS-level auto-repeat is
     // dropped (see Keys.onPressed below) because it bursts unpredictably
     // on heavy UI loads and isn't tunable on MiSTer's framebuffer build.
-    // Instead, on a real press of one of the four dpad actions we start
-    // an initial-delay timer; on its first fire we hand over to a steady
+    // Instead, on a real press of a repeatable action we start an
+    // initial-delay timer; on its first fire we hand over to a steady
     // tick. Both fire `handleAction(heldAction)`, which means the existing
     // transition gate, modal routing, and screen dispatch all apply
     // unchanged — repeats land on whichever screen / modal is currently
     // active, just like fresh presses.
     readonly property int _repeatInitialMs: 350
     readonly property int _repeatTickMs: 90
+    readonly property int _rapidNavigationQuietMs: 260
     property string _heldAction: ""
     property int _heldKey: 0
-    readonly property bool _listDetailRapidScrollActive: root._repeatTicking && (root._heldAction === "up" || root._heldAction === "down")
+    property bool rapidNavigationActive: false
+    property bool rapidNavigationIndicatorActive: false
+    property string rapidNavigationAction: ""
+    property int _rapidNavigationTapCount: 0
     // Aliased so tst_navigation.qml can observe the repeat state machine
     // — child Timer ids are file-scoped and aren't reachable otherwise.
     property alias _repeatPending: repeatInitial.running
@@ -1519,23 +1573,84 @@ MainLayout {
     Binding {
         target: root.gamesScreen
         property: "detailRapidScrollActive"
-        value: root.activeScreen === root.screenGames && root._listDetailRapidScrollActive
+        value: root.activeScreen === root.screenGames && root.rapidNavigationActive
+    }
+
+    Binding {
+        target: root.gamesScreen
+        property: "detailRapidIndicatorActive"
+        value: root.activeScreen === root.screenGames && root.rapidNavigationIndicatorActive
+    }
+
+    Binding {
+        target: root.gamesScreen
+        property: "detailRapidScrollAction"
+        value: root.activeScreen === root.screenGames ? root.rapidNavigationAction : ""
     }
 
     Binding {
         target: root.favoritesScreen
         property: "detailRapidScrollActive"
-        value: root.activeScreen === root.screenFavorites && root._listDetailRapidScrollActive
+        value: root.activeScreen === root.screenFavorites && root.rapidNavigationActive
+    }
+
+    Binding {
+        target: root.favoritesScreen
+        property: "detailRapidIndicatorActive"
+        value: root.activeScreen === root.screenFavorites && root.rapidNavigationIndicatorActive
+    }
+
+    Binding {
+        target: root.favoritesScreen
+        property: "detailRapidScrollAction"
+        value: root.activeScreen === root.screenFavorites ? root.rapidNavigationAction : ""
     }
 
     Binding {
         target: root.recentsScreen
         property: "detailRapidScrollActive"
-        value: root.activeScreen === root.screenRecents && root._listDetailRapidScrollActive
+        value: root.activeScreen === root.screenRecents && root.rapidNavigationActive
+    }
+
+    Binding {
+        target: root.recentsScreen
+        property: "detailRapidIndicatorActive"
+        value: root.activeScreen === root.screenRecents && root.rapidNavigationIndicatorActive
+    }
+
+    Binding {
+        target: root.recentsScreen
+        property: "detailRapidScrollAction"
+        value: root.activeScreen === root.screenRecents ? root.rapidNavigationAction : ""
+    }
+
+    function _isRapidNavigationAction(action: string): bool {
+        return action === "up" || action === "down" || action === "page_prev" || action === "page_next";
+    }
+
+    function _noteRapidNavigationAction(action: string, forceActive: bool): void {
+        if (!root._isRapidNavigationAction(action))
+            return;
+        const sameBurst = rapidNavigationQuiet.running && root.rapidNavigationAction === action;
+        root._rapidNavigationTapCount = sameBurst ? root._rapidNavigationTapCount + 1 : 1;
+        root.rapidNavigationAction = action;
+        if (forceActive || rapidNavigationQuiet.running)
+            root.rapidNavigationActive = true;
+        if (forceActive || action === "page_prev" || action === "page_next" || root._rapidNavigationTapCount >= 3)
+            root.rapidNavigationIndicatorActive = true;
+        rapidNavigationQuiet.restart();
+    }
+
+    function _resetRapidNavigation(): void {
+        rapidNavigationQuiet.stop();
+        root.rapidNavigationActive = false;
+        root.rapidNavigationIndicatorActive = false;
+        root.rapidNavigationAction = "";
+        root._rapidNavigationTapCount = 0;
     }
 
     function _isRepeatableAction(action: string): bool {
-        return action === "up" || action === "down" || action === "left" || action === "right";
+        return action === "up" || action === "down" || action === "left" || action === "right" || action === "page_prev" || action === "page_next";
     }
 
     // State-machine half of handleKey: records the held key/action and
@@ -1683,6 +1798,7 @@ MainLayout {
     }
 
     function _handleRepeatAction(): void {
+        root._noteRapidNavigationAction(root._heldAction, true);
         root.handleAction(root._heldAction);
     }
 
@@ -1691,6 +1807,18 @@ MainLayout {
         interval: 1500
         repeat: false
         onTriggered: root.hideCardWriteModal()
+    }
+
+    Timer {
+        id: rapidNavigationQuiet
+        interval: root._rapidNavigationQuietMs
+        repeat: false
+        onTriggered: {
+            root.rapidNavigationActive = false;
+            root.rapidNavigationIndicatorActive = false;
+            root.rapidNavigationAction = "";
+            root._rapidNavigationTapCount = 0;
+        }
     }
 
     Timer {

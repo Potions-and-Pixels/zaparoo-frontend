@@ -76,25 +76,17 @@ const CACHE_CAP_BYTES: usize = 64 * 1024 * 1024;
 const MAX_FETCH_ATTEMPTS: u8 = 3;
 
 /// Number of fetch worker tasks pulling from the shared LIFO queue.
-/// Keep this single-flight against Core: fast list scrolling on `MiSTer`
-/// can otherwise stack multiple large `media.image` bulk requests on
-/// top of Core's image handler and reset the WebSocket. The queue is
-/// already LIFO and capped, so one in-flight batch is enough to keep
-/// the visible work moving without turning cover fetches into a Core
-/// `DoS` vector.
-const FETCH_DRIVER_WORKERS: usize = 1;
+/// Two workers let visible pages fill more than one cover at a time
+/// while keeping Core/WebSocket pressure low on `MiSTer`. If runtime
+/// logs show resets or media.image rate-limit errors, drop this back
+/// to one before trying any broader queue changes.
+const FETCH_DRIVER_WORKERS: usize = 2;
 
-/// Hard cap on pending enqueues in the LIFO fetch queue. New pushes
-/// spill the **oldest** entry off the front, on the assumption that
-/// whatever the user enqueued ~2 pages ago is no longer interesting
-/// (re-fetch on scroll-back is cheap, and the model's role-data path
-/// re-enqueues uncached visible tiles automatically). Combined with
-/// LIFO drain, this means the queue always reflects the user's recent
-/// navigation, not their entire session — older requests neither
-/// block the wire nor accumulate memory. Sized at 2× a typical
-/// 30-tile page so a full look-ahead prefetch can overlap the
-/// current page without dropping anything.
-const MAX_QUEUE_LEN: usize = 60;
+/// Hard cap on pending enqueues in the fetch queue. Sized for three
+/// dense visual pages (current, next, previous) plus margin, so an
+/// explicit page-window rebuild does not drop the previous-page warm
+/// on a 30-tile layout while still bounding stale queue memory.
+const MAX_QUEUE_LEN: usize = 96;
 
 /// MIME content-type → on-disk extension for the formats we are willing
 /// to cache. Falls back to inspecting `MediaImageResult.extension` when
@@ -108,6 +100,39 @@ const SUPPORTED_EXTS: &[(&str, &str)] = &[
 ];
 
 const SUPPORTED_PLAIN_EXTS: &[&str] = &["png", "jpg", "jpeg", "webp"];
+const CORE_DEFAULT_IMAGE_TYPES: &[&str] = &[
+    "image",
+    "thumbnail",
+    "boxart",
+    "boxart3d",
+    "screenshot",
+    "wheel",
+    "titleshot",
+    "map",
+    "marquee",
+    "fanart",
+];
+const COVER_PREF_PREFIX: &str = "__pref:";
+
+fn current_cover_preference_marker() -> Option<Arc<str>> {
+    let value = crate::models::try_with_persist_read(|s| s.settings.media_image_type.clone())?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed == "auto" {
+        return None;
+    }
+    Some(Arc::from(format!("{COVER_PREF_PREFIX}{trimmed}")))
+}
+
+fn preferred_image_types(preference: &str) -> Vec<String> {
+    let mut out = Vec::with_capacity(CORE_DEFAULT_IMAGE_TYPES.len() + 1);
+    out.push(preference.to_string());
+    for image_type in CORE_DEFAULT_IMAGE_TYPES {
+        if *image_type != preference {
+            out.push((*image_type).to_string());
+        }
+    }
+    out
+}
 
 fn ext_for_content_type(content_type: &str) -> Option<&'static str> {
     let head = content_type.split(';').next()?.trim().to_ascii_lowercase();
@@ -167,6 +192,24 @@ impl MediaKey {
             media_id: Some(media_id),
             image_type: None,
         }
+    }
+
+    pub fn with_current_cover_preference(mut self) -> Self {
+        if let Some(pref) = current_cover_preference_marker() {
+            self.image_type = Some(pref);
+        }
+        self
+    }
+
+    fn cover_preference(&self) -> Option<&str> {
+        self.image_type
+            .as_deref()
+            .and_then(|t| t.strip_prefix(COVER_PREF_PREFIX))
+            .filter(|t| !t.is_empty())
+    }
+
+    pub fn is_cover_key(&self) -> bool {
+        self.image_type.is_none() || self.cover_preference().is_some()
     }
 
     pub fn with_image_type(
@@ -545,29 +588,13 @@ impl CacheState {
 pub struct MediaImageCache {
     state: Arc<RwLock<CacheState>>,
     /// LIFO queue of pending fetches. `enqueue` pushes to the back,
-    /// the fetch driver pops from the back: newest enqueues drain
-    /// first, while enqueues from a page the user has already
-    /// navigated past wait at the front rather than blocking the
-    /// work the user can see. Plain `std::sync::Mutex` because every
-    /// critical section is a single `push_back`/`pop_back` with no
+    /// the fetch driver pops from the back: newest ad-hoc enqueues
+    /// drain first. Games page prefetch uses
+    /// `replace_pending_requests_ordered`, which clears queued stale
+    /// work and pushes the supplied page window in reverse so public
+    /// order is still drain order. Plain `std::sync::Mutex` because
+    /// every critical section is a bounded queue mutation with no
     /// awaits in between.
-    ///
-    /// **Look-ahead intentionally rides the same queue at the same
-    /// priority.** Under Core's current ~250–400 ms serial cadence
-    /// for `media.image`, the LIFO drain order ends up servicing
-    /// page N+1's prefetched covers between page N's first burst
-    /// (the visual top of the page, enqueued in reverse so it pops
-    /// first) and page N's tail (the bottom rows the user is least
-    /// likely to read before paginating). By the time the user
-    /// navigates forward, page N+1 is warm; the few unfilled tiles
-    /// at the bottom of page N continue to land in the background.
-    /// Treating look-ahead as a "low priority" lane that drains
-    /// *after* the visible page strictly worsens the experience: the
-    /// visible page consumes the entire serial throughput in front
-    /// of the user (which reads as "covers loading slowly one at a
-    /// time"), and page N+1 doesn't start until the visible page is
-    /// fully cached, which is well after a fast-moving user has
-    /// already paginated. Don't reintroduce a priority split here.
     queue: Arc<Mutex<VecDeque<QueueEntry>>>,
     /// Single-permit signal that wakes the driver when a fresh key
     /// hits the queue. Drained by `notified().await` and rearmed by
@@ -692,6 +719,105 @@ impl MediaImageCache {
         page_size: u32,
     ) {
         self.enqueue_with_policy(key, media_id, page_size, NoImagePolicy::SoftMiss);
+    }
+
+    /// Drop queued-but-not-in-flight cover requests. Cached bytes,
+    /// negative memos, and the single request currently being fetched
+    /// stay untouched. Drained keys leave `pending` so final-page
+    /// prefetch after rapid navigation can re-enqueue them.
+    pub fn clear_pending_requests(&self) {
+        let drained = self.drain_queue();
+        if drained.is_empty() {
+            return;
+        }
+        self.release_drained_pending(&drained);
+        debug!(
+            dropped = drained.len(),
+            "media_image_cache: cleared queued cover requests"
+        );
+    }
+
+    /// Replace queued-but-not-in-flight cover requests with an explicit
+    /// ordered page window. `entries` is public drain order: the first
+    /// key supplied is the next key the driver should fetch after any
+    /// current in-flight request finishes.
+    pub fn replace_pending_requests_ordered(
+        &self,
+        entries: Vec<(MediaKey, Option<i64>)>,
+        page_size: u32,
+    ) {
+        let drained = self.drain_queue();
+        if !drained.is_empty() {
+            self.release_drained_pending(&drained);
+        }
+
+        let page_size = page_size.max(1);
+        let mut queued = Vec::new();
+        let mut seen = HashSet::new();
+        {
+            #[allow(clippy::unwrap_used, reason = "RwLock poisoning is unrecoverable")]
+            let mut guard = self.state.write().unwrap();
+            for (mut key, media_id) in entries.into_iter().take(MAX_QUEUE_LEN) {
+                if key.media_id.is_none() {
+                    if let Some(id) = media_id {
+                        key.media_id = Some(id);
+                    }
+                }
+                if key.system_id.is_empty() || key.path.is_empty() || !seen.insert(key.clone()) {
+                    continue;
+                }
+                if let Some(id) = media_id.or(key.media_id) {
+                    guard.media_ids.insert(key.clone(), id);
+                }
+                if guard.map.contains_key(&key)
+                    || guard.negative.contains(&key)
+                    || guard.pending.contains(&key)
+                {
+                    continue;
+                }
+                guard.attempts.remove(&key);
+                guard.pending.insert(key.clone());
+                queued.push(QueueEntry {
+                    key,
+                    page_size,
+                    no_image_policy: NoImagePolicy::Memoize,
+                });
+            }
+        }
+        if queued.is_empty() {
+            return;
+        }
+        let queued_len = queued.len();
+        {
+            #[allow(clippy::unwrap_used, reason = "Mutex poisoning is unrecoverable")]
+            let mut q = self.queue.lock().unwrap();
+            for entry in queued.into_iter().rev() {
+                q.push_back(entry);
+            }
+        }
+        debug!(
+            dropped = drained.len(),
+            queued = queued_len,
+            "media_image_cache: replaced queued cover requests"
+        );
+        for _ in 0..FETCH_DRIVER_WORKERS {
+            self.queue_notify.notify_one();
+        }
+    }
+
+    fn drain_queue(&self) -> Vec<MediaKey> {
+        #[allow(clippy::unwrap_used, reason = "Mutex poisoning is unrecoverable")]
+        let mut q = self.queue.lock().unwrap();
+        q.drain(..).map(|entry| entry.key).collect::<Vec<_>>()
+    }
+
+    fn release_drained_pending(&self, drained: &[MediaKey]) {
+        #[allow(clippy::unwrap_used, reason = "RwLock poisoning is unrecoverable")]
+        let mut guard = self.state.write().unwrap();
+        for key in drained {
+            guard.pending.remove(key);
+            guard.attempts.remove(key);
+        }
     }
 
     fn enqueue_with_policy(
@@ -881,13 +1007,11 @@ fn process_batch_outcomes(
                 *counter
             };
             if attempts < MAX_FETCH_ATTEMPTS {
-                // Re-enter `pending` and re-enqueue at the back,
-                // preserving the original `page_size` so the retry
-                // batches alongside its own page. The next batch
-                // picks it up alongside whatever the user has
-                // enqueued in the meantime; LIFO drain order means
-                // the fresh page lands first while this retry tags
-                // along behind it.
+                // Re-enter `pending` and re-enqueue at the front,
+                // preserving the original `page_size` while keeping
+                // retries behind any freshly-installed ordered page
+                // window. The driver pops from the back, so front-side
+                // retries cannot jump ahead of current-page work.
                 {
                     #[allow(clippy::unwrap_used, reason = "RwLock poisoning is unrecoverable")]
                     let mut s = state.write().unwrap();
@@ -896,7 +1020,7 @@ fn process_batch_outcomes(
                 let dropped = {
                     #[allow(clippy::unwrap_used, reason = "Mutex poisoning is unrecoverable")]
                     let mut q = queue.lock().unwrap();
-                    q.push_back(entry);
+                    q.push_front(entry);
                     // Mirror the `enqueue_with_media_id` cap: a
                     // long-running burst of transient failures can
                     // push the queue past `MAX_QUEUE_LEN` if we
@@ -949,7 +1073,7 @@ fn process_batch_outcomes(
         }
         if let Some(update) = update {
             if let Some(ext) = update.ext {
-                info!(
+                debug!(
                     system_id = %key.system_id,
                     path = %key.path,
                     ext,
@@ -962,14 +1086,14 @@ fn process_batch_outcomes(
                 let soft_no_image = guard.soft_no_image.contains(&key);
                 let search_seen = guard.search_seen.contains(&key);
                 if negative {
-                    info!(
+                    debug!(
                         system_id = %key.system_id,
                         path = %key.path,
                         search_seen,
                         "media_image_cache: no image (negative memo)",
                     );
                 } else {
-                    info!(
+                    debug!(
                         system_id = %key.system_id,
                         path = %key.path,
                         policy = ?entry.no_image_policy,
@@ -1026,7 +1150,9 @@ async fn fetch_one(
             ),
         }
     };
-    if let Some(image_type) = key.image_type.as_ref() {
+    if let Some(preference) = key.cover_preference() {
+        params.image_types = preferred_image_types(preference);
+    } else if let Some(image_type) = key.image_type.as_ref() {
         params.image_types.push(image_type.to_string());
     }
     debug!(
@@ -1064,22 +1190,23 @@ fn classify_single_media_image_error(
         );
         return FetchOutcome::ConnectionDown;
     }
+    if is_stable_media_image_miss(message) {
+        debug!(
+            system_id = %key.system_id,
+            path = %key.path,
+            had_id_hint,
+            "media_image_cache: media.image stable miss: {message}",
+        );
+        return FetchOutcome::NoImage;
+    }
     if had_id_hint && !key.system_id.is_empty() && !key.path.is_empty() {
-        info!(
+        debug!(
             system_id = %key.system_id,
             path = %key.path,
             media_id = ?key.media_id,
             "media_image_cache: media.image error with media_id hint: {message} (transient, will retry with system/path)",
         );
         return FetchOutcome::Transient;
-    }
-    if is_stable_media_image_miss(message) {
-        debug!(
-            system_id = %key.system_id,
-            path = %key.path,
-            "media_image_cache: media.image stable miss: {message}",
-        );
-        return FetchOutcome::NoImage;
     }
     info!(
         system_id = %key.system_id,
@@ -1292,7 +1419,7 @@ pub unsafe extern "C" fn zaparoo_media_image_bytes_for(
     };
     let cache = global_media_image_cache();
     if let Some(bytes) = cache.get_bytes(&key) {
-        info!(
+        debug!(
             system_id = %key.system_id,
             path = %key.path,
             cache_hit = true,
@@ -1301,7 +1428,7 @@ pub unsafe extern "C" fn zaparoo_media_image_bytes_for(
         );
         callback(user_data, bytes.as_ptr(), bytes.len());
     } else {
-        info!(
+        debug!(
             system_id = %key.system_id,
             path = %key.path,
             cache_hit = false,
@@ -1321,9 +1448,10 @@ mod tests {
     )]
 
     use super::{
-        ext_for_content_type, ext_from_extension_field, finish_fetch, is_connection_down_error,
-        pop_one, CacheState, FetchOutcome, MediaImageCache, MediaImageUpdate, MediaKey,
-        NegativeMemo, NoImagePolicy, QueueEntry, MAX_QUEUE_LEN, NEGATIVE_MEMO_CAP,
+        classify_single_media_image_error, ext_for_content_type, ext_from_extension_field,
+        finish_fetch, is_connection_down_error, pop_one, process_batch_outcomes, CacheState,
+        FetchOutcome, MediaImageCache, MediaImageUpdate, MediaKey, NegativeMemo, NoImagePolicy,
+        QueueEntry, MAX_QUEUE_LEN, NEGATIVE_MEMO_CAP,
     };
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex, RwLock};
@@ -1345,6 +1473,56 @@ mod tests {
             queue_notify,
             updates_tx,
         }
+    }
+
+    #[test]
+    fn clear_pending_requests_drops_queue_and_releases_pending_keys() {
+        let cache = cache_for_test();
+        let first = key("SNES", "/old");
+        let second = key("NES", "/new");
+        cache.enqueue_with_media_id(first.clone(), None, 1);
+        cache.enqueue_with_media_id(second.clone(), None, 1);
+
+        cache.clear_pending_requests();
+
+        assert!(cache.queue.lock().unwrap().is_empty());
+        let guard = cache.state.read().unwrap();
+        assert!(!guard.pending.contains(&first));
+        assert!(!guard.pending.contains(&second));
+        drop(guard);
+        cache.enqueue_with_media_id(first.clone(), None, 1);
+        assert_eq!(cache.queue.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn replace_pending_requests_ordered_drops_stale_and_preserves_public_order() {
+        let cache = cache_for_test();
+        let stale = key("NES", "/stale");
+        let first = key("NES", "/first");
+        let second = key("NES", "/second");
+        let third = key("NES", "/third");
+        cache.enqueue_with_media_id(stale.clone(), None, 1);
+
+        cache.replace_pending_requests_ordered(
+            vec![
+                (first.clone(), None),
+                (second.clone(), None),
+                (third.clone(), None),
+            ],
+            1,
+        );
+
+        let guard = cache.state.read().unwrap();
+        assert!(!guard.pending.contains(&stale));
+        assert!(guard.pending.contains(&first));
+        assert!(guard.pending.contains(&second));
+        assert!(guard.pending.contains(&third));
+        drop(guard);
+
+        assert_eq!(pop_one(&cache.queue).expect("first").key, first);
+        assert_eq!(pop_one(&cache.queue).expect("second").key, second);
+        assert_eq!(pop_one(&cache.queue).expect("third").key, third);
+        assert!(pop_one(&cache.queue).is_none());
     }
 
     #[test]
@@ -1445,6 +1623,37 @@ mod tests {
         assert_eq!(decoded.system_id.as_ref(), "SNES");
         assert_eq!(decoded.path.as_ref(), "/p");
         assert_eq!(decoded.image_type.as_deref(), Some("boxart"));
+    }
+
+    #[test]
+    fn stable_media_image_miss_with_id_hint_is_not_retried() {
+        let key = MediaKey::with_media_id("Arcade", "/media/fat/_Arcade/Computer Space.mra", 14912);
+
+        let outcome = classify_single_media_image_error(
+            &key,
+            "no image found for media: system=\"Arcade\" path=\"/media/fat/_Arcade/Computer Space.mra\"",
+            true,
+        );
+
+        assert!(matches!(outcome, FetchOutcome::NoImage));
+    }
+
+    #[test]
+    fn non_stable_media_id_error_still_retries_without_hint() {
+        let key = MediaKey::with_media_id("SNES", "/p", 42);
+
+        let outcome = classify_single_media_image_error(&key, "stale media id", true);
+
+        assert!(matches!(outcome, FetchOutcome::Transient));
+    }
+
+    #[test]
+    fn connection_down_error_does_not_retry_immediately() {
+        let key = MediaKey::with_media_id("SNES", "/p", 42);
+
+        let outcome = classify_single_media_image_error(&key, "connection reset by peer", true);
+
+        assert!(matches!(outcome, FetchOutcome::ConnectionDown));
     }
 
     fn key(s: &str, p: &str) -> MediaKey {
@@ -1915,6 +2124,48 @@ mod tests {
         assert!(!g.negative.contains(&k), "no negative memo on Transient");
         assert!(!g.pending.contains(&k), "pending must be cleared");
         assert_eq!(g.total_bytes, 0);
+    }
+
+    #[test]
+    fn transient_retry_queues_behind_ordered_window() {
+        let state = Arc::new(RwLock::new(CacheState::new()));
+        let queue: Arc<Mutex<VecDeque<QueueEntry>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let queue_notify = Arc::new(Notify::new());
+        let (updates_tx, _) = broadcast::channel::<MediaImageUpdate>(64);
+        let first = key("NES", "/first");
+        let second = key("NES", "/second");
+        let retry = QueueEntry {
+            key: key("NES", "/retry"),
+            page_size: 15,
+            no_image_policy: NoImagePolicy::Memoize,
+        };
+        {
+            let mut q = queue.lock().unwrap();
+            q.push_back(QueueEntry {
+                key: second.clone(),
+                page_size: 15,
+                no_image_policy: NoImagePolicy::Memoize,
+            });
+            q.push_back(QueueEntry {
+                key: first.clone(),
+                page_size: 15,
+                no_image_policy: NoImagePolicy::Memoize,
+            });
+        }
+        state.write().unwrap().pending.insert(retry.key.clone());
+
+        process_batch_outcomes(
+            &state,
+            usize::MAX,
+            &updates_tx,
+            &queue,
+            &queue_notify,
+            vec![(retry.clone(), FetchOutcome::Transient)],
+        );
+
+        assert_eq!(pop_one(&queue).expect("first").key, first);
+        assert_eq!(pop_one(&queue).expect("second").key, second);
+        assert_eq!(pop_one(&queue).expect("retry").key, retry.key);
     }
 
     #[test]

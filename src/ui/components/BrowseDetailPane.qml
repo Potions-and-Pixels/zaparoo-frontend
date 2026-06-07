@@ -21,24 +21,54 @@ Item {
     property bool detailSuppressed: false
     property bool showChrome: true
     property string loadingText: qsTr("Loading…")
+    property var layoutProfile: null
 
-    readonly property int _cardPaddingX: Sizing.pctW(2)
-    readonly property int _cardPaddingY: Sizing.pctH(2)
+    readonly property var _detail: root.layoutProfile && root.layoutProfile.detail ? root.layoutProfile.detail : null
+    readonly property var _surface: root.layoutProfile && root.layoutProfile.surface ? root.layoutProfile.surface : null
+    readonly property int _panePaddingLeft: root._detail ? root._detail.panePaddingLeft : Sizing.pctW(2)
+    readonly property int _panePaddingRight: root._detail ? root._detail.panePaddingRight : Sizing.pctW(2)
+    readonly property int _panePaddingTop: root._detail ? root._detail.panePaddingTop : Sizing.pctH(2)
+    readonly property int _panePaddingBottom: root._detail ? root._detail.panePaddingBottom : Sizing.pctH(2)
+    readonly property int _imagePaddingLeft: root._detail ? root._detail.imagePaddingLeft : 0
+    readonly property int _imagePaddingRight: root._detail ? root._detail.imagePaddingRight : 0
+    readonly property int _imagePaddingTop: root._detail ? root._detail.imagePaddingTop : 0
+    readonly property int _imagePaddingBottom: root._detail ? root._detail.imagePaddingBottom : 0
+    readonly property int _metadataPaddingLeft: root._detail ? root._detail.metadataPaddingLeft : 0
+    readonly property int _metadataPaddingRight: root._detail ? root._detail.metadataPaddingRight : 0
+    readonly property int _metadataPaddingTop: root._detail ? root._detail.metadataPaddingTop : 0
+    readonly property int _metadataPaddingBottom: root._detail ? root._detail.metadataPaddingBottom : 0
+    readonly property int _metadataTopMargin: root._detail && root._detail.metadataTopMargin !== undefined ? root._detail.metadataTopMargin : 0
+    readonly property int _metadataLeftMargin: root._detail && root._detail.metadataLeftMargin !== undefined ? root._detail.metadataLeftMargin : 0
+    readonly property int _metadataRightMargin: root._detail && root._detail.metadataRightMargin !== undefined ? root._detail.metadataRightMargin : 0
+    readonly property int _metadataHeightAdjustment: root._detail && root._detail.metadataHeightAdjustment !== undefined ? root._detail.metadataHeightAdjustment : 0
+    readonly property int _sectionGap: root._detail ? root._detail.sectionGap : Sizing.pctH(2)
+    readonly property bool _horizontalSections: root._detail && root._detail.contentAxis === "horizontal"
+    readonly property real _imageShare: root._detail && root._detail.imageShare !== undefined ? root._detail.imageShare : 1
+    readonly property real _metadataShare: root._detail && root._detail.metadataShare !== undefined ? root._detail.metadataShare : 1
+    readonly property real _shareTotal: Math.max(1, root._imageShare + root._metadataShare)
+    readonly property int _tagRowHeight: root._detail ? root._detail.tagRowHeight : Sizing.pctH(3)
+    readonly property int _tagRowSpacing: root._detail ? root._detail.tagRowSpacing : Sizing.pctH(0.55)
+    readonly property bool _metadataBottomAligned: root._detail && root._detail.metadataBottomAligned === true
+    readonly property int _titleBottomMargin: root._detail ? root._detail.titleBottomMargin : Sizing.pctH(2)
+    readonly property real _imageHeightRatioWithTitle: root._detail && root._detail.imageHeightRatioWithTitle !== undefined ? root._detail.imageHeightRatioWithTitle : 48
+    readonly property int _imageReservedWidth: root._detail && root._detail.imageReservedWidth !== undefined ? root._detail.imageReservedWidth : 0
+    readonly property int _imageReservedHeight: root._detail && root._detail.imageReservedHeight !== undefined ? root._detail.imageReservedHeight : 0
+    readonly property int _imageBottomMargin: root._detail && root._detail.imageBottomMargin !== undefined ? root._detail.imageBottomMargin : 0
+    readonly property int _cardRadius: root._surface ? root._surface.cornerRadius : Sizing.cornerRadius
     readonly property int _carouselGutter: (canPreviousImage || canNextImage) ? Sizing.pctW(4) : 0
-    property int _labelColumnWidth: 0
-    readonly property int _tagTextSize: Sizing.fontSize(2.2)
-    readonly property int _tagLabelGap: Sizing.pctW(1.4)
-    readonly property var _detailRows: _parseDetailTags(detailTags)
-    readonly property int _tagRowCount: _detailRows.length
-    readonly property int _tagRowHeight: Sizing.pctH(3)
-    readonly property int _tagRowSpacing: Sizing.pctH(0.55)
-    readonly property int _metadataNaturalHeight: _tagRowCount <= 0 ? 0 : (_tagRowCount * _tagRowHeight) + ((_tagRowCount - 1) * _tagRowSpacing)
-    readonly property int _compactDetailHeight: Math.min(Sizing.px(content.height * 0.38), _metadataNaturalHeight)
     readonly property bool _coverPending: coverKey === "icons/Loading"
     readonly property url _coverSource: _coverPending ? "" : Resources.coverUrl(coverKey)
     readonly property bool _paneLoading: root.loading
     readonly property bool _detailVisible: !root._paneLoading && !root.detailSuppressed
     readonly property bool _suppressedPlaceholderCover: root.detailSuppressed && coverKey.startsWith("icons/") && root._coverSource !== ""
+    readonly property var _detailRows: _parseDetailTags(detailTags)
+    readonly property int _tagRowCount: _detailRows.length
+    readonly property int _tagTextSize: Sizing.fontSize(2.2)
+    readonly property int _tagLabelGap: Sizing.pctW(1.4)
+    readonly property int _metadataNaturalHeight: _tagRowCount <= 0 ? 0 : (_tagRowCount * _tagRowHeight) + ((_tagRowCount - 1) * _tagRowSpacing)
+    readonly property int _compactMetadataHeight: Math.min(Sizing.px(content.height * 0.38), _metadataNaturalHeight)
+
+    property int _labelColumnWidth: 0
 
     onDetailTagsChanged: root._labelColumnWidth = 0
 
@@ -83,7 +113,7 @@ Item {
         color: Theme.surfaceCard
         border.width: Sizing.stroke(1)
         border.color: Theme.borderMid
-        radius: Sizing.cornerRadius
+        radius: root._cardRadius
         visible: root.showChrome
     }
 
@@ -91,47 +121,76 @@ Item {
         id: content
 
         anchors.fill: parent
-        anchors.leftMargin: root._cardPaddingX
-        anchors.rightMargin: root._cardPaddingX
-        anchors.topMargin: root._cardPaddingY
-        anchors.bottomMargin: root._cardPaddingY
+        anchors.leftMargin: root._panePaddingLeft
+        anchors.rightMargin: root._panePaddingRight
+        anchors.topMargin: root._panePaddingTop
+        anchors.bottomMargin: root._panePaddingBottom
         clip: true
+
+        readonly property int primarySpan: root._horizontalSections ? Math.floor((width - root._sectionGap) * root._imageShare / root._shareTotal) : Math.floor((height - root._sectionGap) * root._imageShare / root._shareTotal)
+        readonly property int secondarySpan: root._horizontalSections ? Math.max(0, width - primarySpan - root._sectionGap) : Math.max(0, height - imageSlotHeight - root._sectionGap)
+        readonly property int imageSlotX: root._horizontalSections ? root._carouselGutter : root._imagePaddingLeft + root._carouselGutter
+        readonly property int imageSlotY: 0
+        readonly property int imageSlotWidth: {
+            if (root._horizontalSections)
+                return Math.max(0, primarySpan - (2 * root._carouselGutter));
+            const availableWidth = Math.max(0, width - (2 * root._carouselGutter) - root._imagePaddingLeft - root._imagePaddingRight);
+            const maxWidth = Math.max(0, width - root._imagePaddingLeft - root._imagePaddingRight);
+            return Math.max(0, Math.min(maxWidth, availableWidth + root._imageReservedWidth));
+        }
+        readonly property int imageSlotHeight: {
+            if (root._horizontalSections)
+                return height;
+            const availableWidth = Math.max(0, width - (2 * root._carouselGutter) - root._imagePaddingLeft - root._imagePaddingRight);
+            const imageLimit = titleText.visible ? Math.floor((height * root._imageHeightRatioWithTitle) / 100) : Math.max(0, height - root._compactMetadataHeight - root._imageBottomMargin);
+            return Math.max(0, Math.min(height, Math.min(availableWidth, imageLimit) + root._imageReservedHeight));
+        }
+        readonly property int metadataX: root._horizontalSections ? primarySpan + root._sectionGap : 0
+        readonly property int metadataY: root._horizontalSections ? 0 : imageSlotHeight + root._sectionGap
+        readonly property int metadataWidth: root._horizontalSections ? secondarySpan : width
+        readonly property int metadataHeight: root._horizontalSections ? height : secondarySpan
 
         Item {
             id: imageSlot
 
-            readonly property int availableWidth: Math.max(0, parent.width - (2 * root._carouselGutter))
-            readonly property int availableHeight: Math.max(0, root.showTitle ? Sizing.px(parent.height * 0.48) : detailBody.y - Sizing.pctH(1))
-            readonly property int slotSize: Math.min(availableWidth, availableHeight)
+            x: content.imageSlotX
+            y: content.imageSlotY
+            width: content.imageSlotWidth
+            height: content.imageSlotHeight
+            clip: true
 
-            x: root._carouselGutter + Sizing.center(availableWidth, width)
-            anchors.top: parent.top
-            width: slotSize
-            height: slotSize
-
-            Image {
-                id: cover
+            Item {
                 anchors.fill: parent
-                source: root._coverSource
-                fillMode: Image.PreserveAspectFit
-                sourceSize.width: 512
-                smooth: true
-                asynchronous: true
-                visible: !root._paneLoading && root._coverSource !== "" && status === Image.Ready && (!root.detailSuppressed || root._suppressedPlaceholderCover)
-            }
+                anchors.leftMargin: root._horizontalSections ? root._imagePaddingLeft : 0
+                anchors.rightMargin: root._horizontalSections ? root._imagePaddingRight : 0
+                anchors.topMargin: root._imagePaddingTop
+                anchors.bottomMargin: root._imagePaddingBottom
 
-            Image {
-                x: Sizing.center(parent.width, width)
-                y: Sizing.center(parent.height, height)
-                width: Math.min(Sizing.pctH(10), parent.width, parent.height)
-                height: width
-                source: Resources.iconUrl(root._coverPending || cover.status === Image.Loading ? "Loading" : "File")
-                sourceSize.width: Sizing.px(width)
-                sourceSize.height: Sizing.px(height)
-                fillMode: Image.PreserveAspectFit
-                smooth: true
-                asynchronous: false
-                visible: !root._paneLoading && !root._suppressedPlaceholderCover && (root.detailSuppressed || root._coverPending || cover.status === Image.Loading || root._coverSource === "" || cover.status === Image.Error)
+                Image {
+                    id: cover
+
+                    anchors.fill: parent
+                    source: root._coverSource
+                    fillMode: Image.PreserveAspectFit
+                    sourceSize.width: 512
+                    smooth: true
+                    asynchronous: true
+                    visible: !root._paneLoading && root._coverSource !== "" && status === Image.Ready && (!root.detailSuppressed || root._suppressedPlaceholderCover)
+                }
+
+                Image {
+                    x: Sizing.center(parent.width, width)
+                    y: Sizing.center(parent.height, height)
+                    width: Math.min(Sizing.pctH(10), parent.width, parent.height)
+                    height: width
+                    source: Resources.iconUrl(root._coverPending || cover.status === Image.Loading ? "Loading" : "File")
+                    sourceSize.width: Sizing.px(width)
+                    sourceSize.height: Sizing.px(height)
+                    fillMode: Image.PreserveAspectFit
+                    smooth: true
+                    asynchronous: false
+                    visible: !root._paneLoading && !root._suppressedPlaceholderCover && (root.detailSuppressed || root._coverPending || cover.status === Image.Loading || root._coverSource === "" || cover.status === Image.Error)
+                }
             }
         }
 
@@ -157,101 +216,128 @@ Item {
             visible: root._detailVisible && root.canNextImage
         }
 
-        Text {
-            id: titleText
-
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.top: imageSlot.bottom
-            anchors.topMargin: Sizing.pctH(2)
-            text: root.title
-            color: Theme.textPrimary
-            font.family: Theme.fontUi
-            font.pixelSize: Sizing.fontSize(3.2)
-            wrapMode: Text.Wrap
-            maximumLineCount: 3
-            elide: Text.ElideRight
-            horizontalAlignment: Text.AlignLeft
-            renderType: Text.NativeRendering
-            visible: root._detailVisible && root.showTitle && root.title !== ""
-        }
-
         Item {
-            id: detailBody
+            id: metadataSlot
 
-            readonly property int _bodyY: Math.round(root.showTitle ? (titleText.visible ? titleText.y + titleText.height : imageSlot.y + imageSlot.height) + Sizing.pctH(2) : parent.height - height)
-
-            x: 0
-            y: _bodyY
-            width: parent.width
-            height: root.showTitle ? Math.round(Math.max(0, parent.height - _bodyY)) : root._compactDetailHeight
+            x: content.metadataX
+            y: content.metadataY
+            width: content.metadataWidth
+            height: content.metadataHeight
             clip: true
 
-            Column {
-                id: tagTable
+            Item {
+                id: metadataInner
 
-                visible: root._detailVisible && root._detailRows.length > 0
                 anchors.fill: parent
-                spacing: root._tagRowSpacing
+                anchors.leftMargin: root._horizontalSections ? root._metadataPaddingLeft : root._metadataLeftMargin
+                anchors.rightMargin: root._horizontalSections ? root._metadataPaddingRight : root._metadataRightMargin
+                anchors.topMargin: root._horizontalSections ? root._metadataPaddingTop : 0
+                anchors.bottomMargin: root._horizontalSections ? root._metadataPaddingBottom : 0
                 clip: true
 
-                Repeater {
-                    model: root._detailRows
+                Text {
+                    id: titleText
 
-                    delegate: Item {
-                        id: tagRow
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.top: parent.top
+                    text: root.title
+                    color: Theme.textPrimary
+                    font.family: Theme.fontUi
+                    font.pixelSize: Sizing.fontSize(3.2)
+                    wrapMode: Text.Wrap
+                    maximumLineCount: 3
+                    elide: Text.ElideRight
+                    horizontalAlignment: Text.AlignLeft
+                    renderType: Text.NativeRendering
+                    visible: root._detailVisible && root.showTitle && root.title !== ""
+                }
 
-                        required property var modelData
+                Item {
+                    id: detailBody
 
-                        width: tagTable.width
-                        height: root._tagRowHeight
+                    readonly property int _bodyTopOffset: titleText.visible ? titleText.y + titleText.height + root._titleBottomMargin : 0
+                    readonly property bool _bottomAlignedCompactMetadata: !titleText.visible && !root._horizontalSections && root._metadataBottomAligned
 
-                        readonly property string rawLabel: modelData.rawLabel ?? ""
-                        readonly property string label: modelData.label ?? ""
-                        readonly property string value: modelData.value ?? ""
+                    x: 0
+                    y: _bodyTopOffset + (_bottomAlignedCompactMetadata ? 0 : root._metadataTopMargin)
+                    width: parent.width
+                    height: {
+                        if (root._horizontalSections)
+                            return Math.max(0, parent.height - y);
+                        if (titleText.visible)
+                            return Math.max(0, parent.height - y + root._metadataHeightAdjustment);
+                        if (_bottomAlignedCompactMetadata)
+                            return Math.max(0, Math.min(root._compactMetadataHeight + root._metadataTopMargin, parent.height));
+                        return Math.max(0, Math.min(root._compactMetadataHeight, parent.height - y));
+                    }
+                    clip: true
 
-                        TextMetrics {
-                            id: labelMetrics
+                    Column {
+                        id: tagTable
 
-                            text: tagRow.label
-                            font.family: Theme.fontUi
-                            font.pixelSize: root._tagTextSize
-                            onAdvanceWidthChanged: root._labelColumnWidth = Math.max(root._labelColumnWidth, Math.ceil(advanceWidth))
-                        }
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        anchors.top: root._metadataBottomAligned && !titleText.visible ? undefined : parent.top
+                        anchors.bottom: root._metadataBottomAligned && !titleText.visible ? parent.bottom : undefined
+                        spacing: root._tagRowSpacing
+                        clip: true
+                        visible: root._detailVisible && root._detailRows.length > 0
 
-                        Component.onCompleted: root._labelColumnWidth = Math.max(root._labelColumnWidth, Math.ceil(labelMetrics.advanceWidth))
+                        Repeater {
+                            model: root._detailRows
 
-                        Text {
-                            id: tagType
+                            delegate: Item {
+                                id: tagRow
 
-                            anchors.left: parent.left
-                            anchors.top: parent.top
-                            width: root._labelColumnWidth
-                            text: tagRow.label
-                            color: Theme.textLabel
-                            font.family: Theme.fontUi
-                            font.pixelSize: root._tagTextSize
-                            elide: Text.ElideRight
-                            horizontalAlignment: Text.AlignRight
-                            renderType: Text.NativeRendering
-                        }
+                                required property var modelData
 
-                        Text {
-                            id: tagValue
+                                width: tagTable.width
+                                height: root._tagRowHeight
 
-                            anchors.left: parent.left
-                            anchors.leftMargin: root._labelColumnWidth + root._tagLabelGap
-                            anchors.right: parent.right
-                            anchors.top: parent.top
-                            text: tagRow.value
-                            color: Theme.textPrimary
-                            font.family: Theme.fontUi
-                            font.pixelSize: root._tagTextSize
-                            wrapMode: Text.NoWrap
-                            maximumLineCount: 1
-                            elide: Text.ElideRight
-                            horizontalAlignment: Text.AlignLeft
-                            renderType: Text.NativeRendering
+                                readonly property string label: modelData.label ?? ""
+                                readonly property string value: modelData.value ?? ""
+
+                                TextMetrics {
+                                    id: labelMetrics
+
+                                    text: tagRow.label
+                                    font.family: Theme.fontUi
+                                    font.pixelSize: root._tagTextSize
+                                    onAdvanceWidthChanged: root._labelColumnWidth = Math.max(root._labelColumnWidth, Math.ceil(advanceWidth))
+                                }
+
+                                Component.onCompleted: root._labelColumnWidth = Math.max(root._labelColumnWidth, Math.ceil(labelMetrics.advanceWidth))
+
+                                Text {
+                                    anchors.left: parent.left
+                                    anchors.top: parent.top
+                                    width: root._labelColumnWidth
+                                    text: tagRow.label
+                                    color: Theme.textLabel
+                                    font.family: Theme.fontUi
+                                    font.pixelSize: root._tagTextSize
+                                    elide: Text.ElideRight
+                                    horizontalAlignment: Text.AlignRight
+                                    renderType: Text.NativeRendering
+                                }
+
+                                Text {
+                                    anchors.left: parent.left
+                                    anchors.leftMargin: root._labelColumnWidth + root._tagLabelGap
+                                    anchors.right: parent.right
+                                    anchors.top: parent.top
+                                    text: tagRow.value
+                                    color: Theme.textPrimary
+                                    font.family: Theme.fontUi
+                                    font.pixelSize: root._tagTextSize
+                                    wrapMode: Text.NoWrap
+                                    maximumLineCount: 1
+                                    elide: Text.ElideRight
+                                    horizontalAlignment: Text.AlignLeft
+                                    renderType: Text.NativeRendering
+                                }
+                            }
                         }
                     }
                 }

@@ -19,8 +19,10 @@
 //     and the seq ticket that disarms stale callbacks.
 //
 // History is flat (no folder navigation, no auto-nav) so this model
-// stays a fraction of the size of `GamesModel`. Card-write isn't wired
-// here yet — recents launches by `run`-ing the entry's launcher route.
+// stays a fraction of the size of `GamesModel`. Rows are deduplicated
+// by exact `mediaPath`; Core returns newest-first history, so the first
+// row for a path is the one shown. Card-write isn't wired here yet —
+// recents launches by `run`-ing the entry's launcher route.
 
 use crate::media_image_cache::{global_media_image_cache, MediaImageCache, MediaKey};
 use crate::models::{global_handle, global_store};
@@ -33,6 +35,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
@@ -59,6 +62,8 @@ const FILE_STEM_ROLE: i32 = 256 + 7;
 // over-the-wire payload. Bumping this only saves a round trip — it
 // doesn't change the UI cap.
 const PAGE_SIZE: u32 = 25;
+const RESUME_MAX_AGE_DAYS: i64 = 7;
+const RESUME_FALLBACK_COVER_KEY: &str = "icons/PlayOutline";
 
 #[derive(Default)]
 #[allow(
@@ -76,9 +81,13 @@ pub struct RecentsModelRust {
     error_message: QString,
     has_next_page: bool,
     next_cursor: Option<String>,
+    resume_available: bool,
+    resume_name: QString,
+    resume_cover_key: QString,
     current_detail_loading: bool,
     current_detail_tags: QString,
     current_detail_image_key: QString,
+    cover_requests_paused: bool,
     current_detail_media_key: Option<MediaKey>,
     current_detail_media_id: Option<i64>,
     detail_seq: Arc<AtomicU64>,
@@ -135,9 +144,13 @@ pub mod ffi {
         #[qproperty(bool, loading_more)]
         #[qproperty(QString, error_message)]
         #[qproperty(bool, has_next_page)]
+        #[qproperty(bool, resume_available)]
+        #[qproperty(QString, resume_name)]
+        #[qproperty(QString, resume_cover_key)]
         #[qproperty(bool, current_detail_loading)]
         #[qproperty(QString, current_detail_tags)]
         #[qproperty(QString, current_detail_image_key)]
+        #[qproperty(bool, cover_requests_paused)]
         type RecentsModel = super::RecentsModelRust;
 
         #[qinvokable]
@@ -145,6 +158,9 @@ pub mod ffi {
 
         #[qinvokable]
         fn launch_at(self: Pin<&mut RecentsModel>, index: i32);
+
+        #[qinvokable]
+        fn launch_resume(self: Pin<&mut RecentsModel>);
 
         #[qinvokable]
         fn name_at(self: &RecentsModel, index: i32) -> QString;
@@ -160,6 +176,12 @@ pub mod ffi {
 
         #[qinvokable]
         fn clear_current_detail(self: Pin<&mut RecentsModel>);
+
+        #[qinvokable]
+        fn refresh_cover_keys(self: Pin<&mut RecentsModel>, first_row: i32, count: i32);
+
+        #[qinvokable]
+        fn clear_pending_cover_requests(self: Pin<&mut RecentsModel>);
 
         #[qinvokable]
         fn index_for_path(self: &RecentsModel, path: &QString) -> i32;
@@ -254,7 +276,10 @@ fn apply_state(
         // any in-flight `fetch_more` sees a stale ticket and bails.
         model.as_mut().rust_mut().seq.fetch_add(1, Ordering::SeqCst);
         model.as_mut().ensure_cover_subscription();
-        enqueue_recents_covers(&entries);
+        let entries = dedupe_latest_by_path(entries);
+        if !model.cover_requests_paused {
+            enqueue_recents_covers(&entries);
+        }
         let count = i32::try_from(entries.len()).unwrap_or(i32::MAX);
         clear_current_detail_state(model.as_mut());
         model.as_mut().begin_reset_model();
@@ -263,22 +288,32 @@ fn apply_state(
         model.as_mut().rust_mut().next_cursor = next_cursor;
         model.as_mut().end_reset_model();
         model.as_mut().count_changed();
+        sync_resume_state(model.as_mut());
         if model.has_next_page != has_next_page {
             model.as_mut().set_has_next_page(has_next_page);
         }
-        // Decide whether to release `loading` immediately or hold it
-        // until covers are cached. `arm_cover_gate` flips loading off
-        // itself when the page has nothing to wait on (every cover
-        // already cached, or all rows unattributed); otherwise it
-        // leaves loading=true and arms the safety timer.
-        arm_cover_gate(model.as_mut());
+        // Hidden startup binding can pause cover requests so Hub paints without
+        // Recents' off-screen cover gate. Screen entry resumes requests and
+        // refreshes visible cover roles.
+        if model.cover_requests_paused {
+            disarm_cover_gate(model.as_mut());
+            if model.loading {
+                model.as_mut().set_loading(false);
+            }
+        } else {
+            // Decide whether to release `loading` immediately or hold it until
+            // covers are cached. `arm_cover_gate` flips loading off itself when
+            // the page has nothing to wait on; otherwise it leaves loading=true
+            // and arms the safety timer.
+            arm_cover_gate(model.as_mut());
+        }
         if model.loading_more {
             model.as_mut().set_loading_more(false);
         }
         // Look-ahead prefetch: warm page 2 so the first scroll past the
         // initial page doesn't surface a "Loading more…" cue. `fetch_more`
         // is itself guarded by `has_next_page` and `loading_more`.
-        if has_next_page {
+        if has_next_page && !model.cover_requests_paused {
             model.as_mut().fetch_more();
         }
     } else if err.is_empty() {
@@ -294,6 +329,7 @@ fn apply_state(
         clear_current_detail_state(model.as_mut());
         model.as_mut().rust_mut().seq.fetch_add(1, Ordering::SeqCst);
         model.as_mut().rust_mut().next_cursor = None;
+        sync_resume_state(model.as_mut());
         if !model.loading {
             model.as_mut().set_loading(true);
         }
@@ -309,6 +345,7 @@ fn apply_state(
         clear_current_detail_state(model.as_mut());
         model.as_mut().rust_mut().seq.fetch_add(1, Ordering::SeqCst);
         model.as_mut().rust_mut().next_cursor = None;
+        sync_resume_state(model.as_mut());
         if model.loading {
             model.as_mut().set_loading(false);
         }
@@ -340,7 +377,9 @@ impl ffi::RecentsModel {
             NAME_ROLE => QVariant::from(&QString::from(entry.media_name.as_str())),
             PATH_ROLE => QVariant::from(&QString::from(entry.media_path.as_str())),
             SYSTEM_ID_ROLE => QVariant::from(&QString::from(entry.system_id.as_str())),
-            COVER_KEY_ROLE => QVariant::from(&QString::from(cover_key_for(entry).as_str())),
+            COVER_KEY_ROLE => QVariant::from(&QString::from(
+                cover_key_for(entry, !self.cover_requests_paused).as_str(),
+            )),
             LAUNCHER_ID_ROLE => QVariant::from(&QString::from(entry.launcher_id.as_str())),
             FAVORITE_ROLE => QVariant::from(&0_i32),
             FILE_STEM_ROLE => QVariant::from(&QString::from(file_stem_or_name(
@@ -392,22 +431,26 @@ impl ffi::RecentsModel {
         });
     }
 
+    fn refresh_cover_keys(mut self: Pin<&mut Self>, first_row: i32, count: i32) {
+        emit_cover_key_range(self.as_mut(), first_row, count);
+    }
+
+    fn clear_pending_cover_requests(self: Pin<&mut Self>) {
+        global_media_image_cache().clear_pending_requests();
+    }
+
     fn launch_at(self: Pin<&mut Self>, index: i32) {
         if index < 0 || index >= self.count {
             return;
         }
-        let entry = &self.entries[index as usize];
-        let text = launch_text_for(entry);
-        if text.is_empty() {
+        launch_entry(&self.entries[index as usize]);
+    }
+
+    fn launch_resume(self: Pin<&mut Self>) {
+        let Some(entry) = resume_entry(&self.entries) else {
             return;
-        }
-        let name = entry.media_name.clone();
-        let store = global_store();
-        global_handle().spawn(async move {
-            if let Err(e) = store.run_mutation::<RunMutation>(RunParams { text }).await {
-                warn!("run failed for {name}: {}", e.message);
-            }
-        });
+        };
+        launch_entry(entry);
     }
 
     fn name_at(&self, index: i32) -> QString {
@@ -453,7 +496,8 @@ impl ffi::RecentsModel {
         let detail_key = match media_id {
             Some(id) => MediaKey::with_media_id(system.clone(), path.clone(), id),
             None => MediaKey::new(system.clone(), path.clone()),
-        };
+        }
+        .with_current_cover_preference();
         self.as_mut().rust_mut().current_detail_media_key = Some(detail_key);
         self.as_mut().rust_mut().current_detail_media_id = media_id;
         sync_current_detail_image_key(self.as_mut());
@@ -531,18 +575,18 @@ impl ffi::RecentsModel {
 /// `QQuickImageProvider` resolves to RAM bytes; otherwise we enqueue a
 /// fetch (carrying the optional `mediaId` hint) and fall back to the
 /// system logo as a nicer placeholder than the generic file glyph.
-fn cover_key_for(entry: &MediaHistoryEntry) -> String {
+fn cover_key_for(entry: &MediaHistoryEntry, requests_enabled: bool) -> String {
     if entry.system_id.is_empty() {
         return "icons/File".to_string();
     }
-    let media_key = media_key_for(entry);
+    let media_key = media_key_for(entry).map(MediaKey::with_current_cover_preference);
     let cache = global_media_image_cache();
     let cached = media_key.as_ref().is_some_and(|k| cache.is_cached(k));
     let negative = media_key.as_ref().is_some_and(|k| cache.is_negative(k));
     let soft_no_image = media_key
         .as_ref()
         .is_some_and(|k| cache.is_soft_no_image(k));
-    if !cached && !negative && !soft_no_image {
+    if requests_enabled && !cached && !negative && !soft_no_image {
         // Miss-driven re-enqueue, same rationale as GamesModel's
         // `cover_key_for`: tiles re-bound after LRU eviction or stale-
         // enqueue truncation will hit this branch and re-arm the fetch.
@@ -550,7 +594,79 @@ fn cover_key_for(entry: &MediaHistoryEntry) -> String {
             cache.enqueue_search_cover_with_media_id(k.clone(), entry.media_id, PAGE_SIZE);
         }
     }
-    cover_key_for_with(entry, media_key.as_ref(), cached, negative, soft_no_image)
+    cover_key_for_with(
+        entry,
+        media_key.as_ref(),
+        cached,
+        negative,
+        soft_no_image || !requests_enabled,
+    )
+}
+
+fn resume_cover_key_for(entry: &MediaHistoryEntry, requests_enabled: bool) -> String {
+    let media_key = media_key_for(entry).map(MediaKey::with_current_cover_preference);
+    let cache = global_media_image_cache();
+    let cached = media_key.as_ref().is_some_and(|k| cache.is_cached(k));
+    let negative = media_key.as_ref().is_some_and(|k| cache.is_negative(k));
+    let soft_no_image = media_key
+        .as_ref()
+        .is_some_and(|k| cache.is_soft_no_image(k));
+    if requests_enabled && !cached && !negative && !soft_no_image {
+        if let Some(k) = media_key.as_ref() {
+            cache.enqueue_search_cover_with_media_id(k.clone(), entry.media_id, PAGE_SIZE);
+        }
+    }
+    resume_cover_key_for_with(media_key.as_ref(), cached)
+}
+
+fn resume_cover_key_for_with(key: Option<&MediaKey>, cached: bool) -> String {
+    match key {
+        Some(k) if cached => MediaImageCache::image_key_for(k),
+        _ => RESUME_FALLBACK_COVER_KEY.to_string(),
+    }
+}
+
+fn sync_resume_state(mut model: Pin<&mut ffi::RecentsModel>) {
+    let (available, name, cover_key) = match resume_entry(&model.entries) {
+        Some(entry) => (
+            true,
+            QString::from(entry.media_name.as_str()),
+            QString::from(resume_cover_key_for(entry, !model.cover_requests_paused).as_str()),
+        ),
+        None => (
+            false,
+            QString::default(),
+            QString::from(RESUME_FALLBACK_COVER_KEY),
+        ),
+    };
+    if model.resume_available != available {
+        model.as_mut().set_resume_available(available);
+    }
+    if model.resume_name != name {
+        model.as_mut().set_resume_name(name);
+    }
+    if model.resume_cover_key != cover_key {
+        model.as_mut().set_resume_cover_key(cover_key);
+    }
+}
+
+fn emit_cover_key_range(mut model: Pin<&mut ffi::RecentsModel>, first_row: i32, count: i32) {
+    if model.count <= 0 || count <= 0 || first_row >= model.count {
+        return;
+    }
+    let first = first_row.clamp(0, model.count - 1);
+    let last = first.saturating_add(count - 1).min(model.count - 1);
+    if last < first {
+        return;
+    }
+    let mut roles = QList::<i32>::default();
+    roles.append(COVER_KEY_ROLE);
+    let parent = QModelIndex::default();
+    let top_left = model.index(first, 0, &parent);
+    let bottom_right = model.index(last, 0, &parent);
+    model
+        .as_mut()
+        .data_changed(&top_left, &bottom_right, &roles);
 }
 
 /// Build the canonical `(systemId, mediaPath)` identifier for a history
@@ -708,7 +824,7 @@ fn file_stem_or_name(path: &str, name: &str) -> String {
 fn enqueue_recents_covers(entries: &[MediaHistoryEntry]) {
     let cache = global_media_image_cache();
     for entry in entries.iter().rev() {
-        if let Some(key) = media_key_for(entry) {
+        if let Some(key) = media_key_for(entry).map(MediaKey::with_current_cover_preference) {
             cache.enqueue_search_cover_with_media_id(key, entry.media_id, PAGE_SIZE);
         }
     }
@@ -728,9 +844,12 @@ fn notify_cover_update(mut model: Pin<&mut ffi::RecentsModel>, key: &MediaKey) {
         .entries
         .iter()
         .enumerate()
-        .filter(|(_, e)| match (key.media_id, e.media_id) {
-            (Some(a), Some(b)) => a == b,
-            _ => e.media_path == *key.path && e.system_id == *key.system_id,
+        .filter(|(_, e)| {
+            key.is_cover_key()
+                && match (key.media_id, e.media_id) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => e.media_path == *key.path && e.system_id == *key.system_id,
+                }
         })
         .filter_map(|(i, _)| i32::try_from(i).ok())
         .collect();
@@ -749,6 +868,14 @@ fn notify_cover_update(mut model: Pin<&mut ffi::RecentsModel>, key: &MediaKey) {
         .is_some_and(|current| current == key)
     {
         sync_current_detail_image_key(model.as_mut());
+    }
+    if resume_entry(&model.entries)
+        .and_then(media_key_for)
+        .map(MediaKey::with_current_cover_preference)
+        .as_ref()
+        .is_some_and(|current| current == key)
+    {
+        sync_resume_state(model.as_mut());
     }
     // Tick the gate's pending set down. `remove` returns false if the
     // key wasn't gated (broadcast events fire for every cache update,
@@ -810,7 +937,7 @@ where
 {
     entries
         .iter()
-        .filter_map(media_key_for)
+        .filter_map(|entry| media_key_for(entry).map(MediaKey::with_current_cover_preference))
         .filter(|k| !is_cached(k) && !is_negative(k))
         .collect()
 }
@@ -886,33 +1013,49 @@ fn release_cover_gate_after_timeout(mut model: Pin<&mut ffi::RecentsModel>) {
     }
 }
 
+fn launch_entry(entry: &MediaHistoryEntry) {
+    let text = launch_text_for(entry);
+    if text.is_empty() {
+        return;
+    }
+    let store = global_store();
+    global_handle().spawn(async move {
+        if let Err(e) = store.run_mutation::<RunMutation>(RunParams { text }).await {
+            warn!("run failed: {}", e.message);
+        }
+    });
+}
+
 /// Build the `text` payload sent to Core's `run` for a history entry.
-/// History entries don't carry a synthesised `zap_script` (Core surfaces
-/// only the raw fields), so compose `**launch:"<path>"` from the row's
-/// `mediaPath`, with `?launcher=<id>` appended when `launcherId` is known
-/// so Core picks the same launcher the entry originally ran under. An
-/// empty path yields an empty string, suppressing the run entirely —
-/// `**launch.system:<id>` would just boot the core without a game.
-///
-/// The path is always wrapped in double quotes so spaces and shell
-/// metacharacters (parens, commas) survive Core's argument parsing —
-/// real-world paths like
-/// `/media/fat/cifs/games/Genesis/1 US - A-F/B.O.B. (USA,Europe) (Rev A).md`
-/// fail to launch unquoted. Embedded backslashes and double quotes are
-/// escaped per `ZapScript`'s `parseQuotedArg` rules (backslash first so
-/// the quote-escape's leading `\` doesn't get re-escaped) — Windows-host
-/// paths and the rare filename containing a literal `"` would otherwise
-/// produce a malformed token.
+/// Runtime relaunches prefer the exact path Core recorded; portable
+/// `ZapScript` is not available on history rows and launcher affinity is
+/// less important than avoiding title-resolution ambiguity.
 fn launch_text_for(entry: &MediaHistoryEntry) -> String {
-    if entry.media_path.is_empty() {
-        return String::new();
+    entry.media_path.clone()
+}
+
+fn resume_entry(entries: &[MediaHistoryEntry]) -> Option<&MediaHistoryEntry> {
+    let now = OffsetDateTime::now_utc();
+    entries
+        .iter()
+        .find(|entry| !launch_text_for(entry).is_empty() && resume_entry_is_fresh(entry, now))
+}
+
+fn resume_entry_is_fresh(entry: &MediaHistoryEntry, now: OffsetDateTime) -> bool {
+    let timestamp = entry
+        .ended_at
+        .as_deref()
+        .unwrap_or(entry.started_at.as_str());
+    if timestamp.trim().is_empty() {
+        return false;
     }
-    let escaped = entry.media_path.replace('\\', "\\\\").replace('"', "\\\"");
-    if entry.launcher_id.is_empty() {
-        format!("**launch:\"{escaped}\"")
-    } else {
-        format!("**launch:\"{escaped}\"?launcher={}", entry.launcher_id)
+    let Ok(played_at) = OffsetDateTime::parse(timestamp, &Rfc3339) else {
+        return false;
+    };
+    if played_at > now {
+        return false;
     }
+    now - played_at <= TimeDuration::days(RESUME_MAX_AGE_DAYS)
 }
 
 fn position_of_path(entries: &[MediaHistoryEntry], needle: &str) -> i32 {
@@ -923,6 +1066,38 @@ fn position_of_path(entries: &[MediaHistoryEntry], needle: &str) -> i32 {
         .iter()
         .position(|e| e.media_path == needle)
         .map_or(-1, |i| i as i32)
+}
+
+/// Keep the newest history row for each exact, non-empty path. Core
+/// returns history newest-first, so preserving the first occurrence
+/// implements latest-wins without parsing timestamps. Empty paths are
+/// malformed/unlaunchable and stay as-is instead of all collapsing into
+/// one bucket.
+fn dedupe_latest_by_path(entries: Vec<MediaHistoryEntry>) -> Vec<MediaHistoryEntry> {
+    filter_entries_by_path(std::iter::empty::<&MediaHistoryEntry>(), entries)
+}
+
+fn filter_entries_by_path<'a, I>(
+    existing_entries: I,
+    incoming_entries: Vec<MediaHistoryEntry>,
+) -> Vec<MediaHistoryEntry>
+where
+    I: IntoIterator<Item = &'a MediaHistoryEntry>,
+{
+    let mut seen = existing_entries
+        .into_iter()
+        .filter_map(|entry| {
+            if entry.media_path.is_empty() {
+                None
+            } else {
+                Some(entry.media_path.clone())
+            }
+        })
+        .collect::<HashSet<_>>();
+    incoming_entries
+        .into_iter()
+        .filter(|entry| entry.media_path.is_empty() || seen.insert(entry.media_path.clone()))
+        .collect()
 }
 
 fn apply_append_page(
@@ -940,17 +1115,21 @@ fn apply_append_page(
         Ok(result) => {
             let has_next_page = result.has_next_page();
             let next_cursor = result.next_cursor();
-            let new_count = i32::try_from(result.entries.len()).unwrap_or(i32::MAX - model.count);
-            enqueue_recents_covers(&result.entries);
+            let entries = filter_entries_by_path(model.entries.iter(), result.entries);
+            let new_count = i32::try_from(entries.len()).unwrap_or(i32::MAX - model.count);
+            if !model.cover_requests_paused {
+                enqueue_recents_covers(&entries);
+            }
             if new_count > 0 {
                 let first = model.count;
                 let last = first.saturating_add(new_count).saturating_sub(1);
                 let parent = QModelIndex::default();
                 model.as_mut().begin_insert_rows(&parent, first, last);
-                model.as_mut().rust_mut().entries.extend(result.entries);
+                model.as_mut().rust_mut().entries.extend(entries);
                 model.as_mut().rust_mut().count = first.saturating_add(new_count);
                 model.as_mut().end_insert_rows();
                 model.as_mut().count_changed();
+                sync_resume_state(model.as_mut());
             }
             model.as_mut().rust_mut().next_cursor = next_cursor;
             model.as_mut().set_has_next_page(has_next_page);
@@ -976,11 +1155,16 @@ mod tests {
     )]
 
     use super::{
-        compute_unresolved_keys, cover_key_for_with, launch_text_for, media_key_for,
-        position_of_path, project,
+        compute_unresolved_keys, cover_key_for_with, dedupe_latest_by_path, filter_entries_by_path,
+        launch_text_for, media_key_for, position_of_path, project, resume_cover_key_for_with,
+        resume_entry, resume_entry_is_fresh, RESUME_FALLBACK_COVER_KEY,
     };
     use crate::media_image_cache::{MediaImageCache, MediaKey};
     use std::collections::HashSet;
+    use time::{
+        format_description::well_known::Rfc3339, macros::datetime, Duration as TimeDuration,
+        OffsetDateTime,
+    };
     use zaparoo_core::media_types::{MediaHistoryEntry, MediaHistoryResult, Pagination};
     use zaparoo_core::remote_resource::ResourceStatus;
 
@@ -992,6 +1176,83 @@ mod tests {
             launcher_id: launcher_id.into(),
             ..MediaHistoryEntry::default()
         }
+    }
+
+    #[test]
+    fn resume_entry_requires_launchable_entry() {
+        assert!(resume_entry(&[]).is_none());
+        let e = entry("ghost", "", "NES", "NES");
+        assert!(resume_entry(&[e]).is_none());
+    }
+
+    #[test]
+    fn resume_entry_skips_stale_or_malformed_entries() {
+        let now = OffsetDateTime::now_utc();
+        let mut stale = entry("old", "/p/old", "NES", "NES");
+        stale.started_at = (now - TimeDuration::days(30)).format(&Rfc3339).unwrap();
+        let mut malformed = entry("bad", "/p/bad", "NES", "NES");
+        malformed.started_at = "not-a-date".into();
+        let mut recent = entry("smb", "/p/smb", "NES", "NES");
+        recent.started_at = (now - TimeDuration::days(1)).format(&Rfc3339).unwrap();
+        assert_eq!(
+            resume_entry(&[stale, malformed, recent]).map(|entry| entry.media_name.as_str()),
+            Some("smb")
+        );
+    }
+
+    #[test]
+    fn resume_entry_freshness_accepts_recent_started_at() {
+        let mut e = entry("smb", "/p/smb", "NES", "NES");
+        e.started_at = "2026-06-01T00:00:00Z".into();
+        assert!(resume_entry_is_fresh(&e, datetime!(2026-06-03 00:00 UTC)));
+    }
+
+    #[test]
+    fn resume_entry_freshness_rejects_old_started_at() {
+        let mut e = entry("smb", "/p/smb", "NES", "NES");
+        e.started_at = "2026-05-01T00:00:00Z".into();
+        assert!(!resume_entry_is_fresh(&e, datetime!(2026-06-03 00:00 UTC)));
+    }
+
+    #[test]
+    fn resume_entry_freshness_prefers_ended_at() {
+        let mut e = entry("smb", "/p/smb", "NES", "NES");
+        e.started_at = "2026-05-01T00:00:00Z".into();
+        e.ended_at = Some("2026-06-01T00:00:00Z".into());
+        assert!(resume_entry_is_fresh(&e, datetime!(2026-06-03 00:00 UTC)));
+    }
+
+    #[test]
+    fn resume_entry_freshness_rejects_missing_or_malformed_timestamp() {
+        let mut e = entry("smb", "/p/smb", "NES", "NES");
+        assert!(!resume_entry_is_fresh(&e, datetime!(2026-06-03 00:00 UTC)));
+        e.started_at = "not-a-date".into();
+        assert!(!resume_entry_is_fresh(&e, datetime!(2026-06-03 00:00 UTC)));
+    }
+
+    #[test]
+    fn resume_entry_freshness_rejects_future_timestamp() {
+        let mut e = entry("smb", "/p/smb", "NES", "NES");
+        e.started_at = "2026-06-04T00:00:00Z".into();
+        assert!(!resume_entry_is_fresh(&e, datetime!(2026-06-03 00:00 UTC)));
+    }
+
+    #[test]
+    fn resume_cover_key_uses_play_outline_unless_cached() {
+        let e = entry("smb", "/p/smb", "NES", "NES");
+        let key = media_key_for(&e).expect("media has key");
+        assert_eq!(
+            resume_cover_key_for_with(Some(&key), false),
+            RESUME_FALLBACK_COVER_KEY
+        );
+        assert_eq!(
+            resume_cover_key_for_with(None, false),
+            RESUME_FALLBACK_COVER_KEY
+        );
+        assert_eq!(
+            resume_cover_key_for_with(Some(&key), true),
+            MediaImageCache::image_key_for(&key)
+        );
     }
 
     #[test]
@@ -1063,54 +1324,86 @@ mod tests {
     }
 
     #[test]
-    fn launch_text_uses_launch_with_launcher_override_when_known() {
+    fn launch_text_uses_raw_media_path_when_launcher_known() {
         let e = entry("smb", "/p/smb.nes", "NES", "NES");
-        assert_eq!(launch_text_for(&e), "**launch:\"/p/smb.nes\"?launcher=NES");
+        assert_eq!(launch_text_for(&e), "/p/smb.nes");
     }
 
     #[test]
-    fn launch_text_falls_back_to_bare_launch_when_launcher_missing() {
+    fn launch_text_uses_raw_media_path_when_launcher_missing() {
         let e = entry("smb", "/p/smb.nes", "NES", "");
-        assert_eq!(launch_text_for(&e), "**launch:\"/p/smb.nes\"");
+        assert_eq!(launch_text_for(&e), "/p/smb.nes");
     }
 
     #[test]
-    fn launch_text_quotes_path_with_spaces_and_metacharacters() {
-        // Real-world path that fails to launch unquoted because of
-        // spaces, parens, and commas — exactly the regression the
-        // user reported when running from Recently Played.
-        let e = entry(
-            "bob",
-            "/media/fat/cifs/games/Genesis/1 US - A-F/B.O.B. (USA,Europe) (Rev A).md",
-            "Genesis",
-            "Genesis",
-        );
-        assert_eq!(
-            launch_text_for(&e),
-            "**launch:\"/media/fat/cifs/games/Genesis/1 US - A-F/B.O.B. (USA,Europe) (Rev A).md\"?launcher=Genesis"
-        );
+    fn launch_text_preserves_path_with_spaces_and_metacharacters() {
+        let path = "/media/fat/cifs/games/Genesis/1 US - A-F/B.O.B. (USA,Europe) (Rev A).md";
+        let e = entry("bob", path, "Genesis", "Genesis");
+        assert_eq!(launch_text_for(&e), path);
     }
 
     #[test]
-    fn launch_text_escapes_backslashes_and_quotes_in_path() {
-        // Windows-host paths reach Core with backslash separators, and
-        // a stray `"` in a filename would otherwise close the quoted
-        // arg early. Both must be ZapScript-escaped so
-        // `parseQuotedArg` decodes them back to the original path.
-        let e = entry("weird", r#"C:\Games\say "hi".rom"#, "DOS", "DOS");
-        assert_eq!(
-            launch_text_for(&e),
-            r#"**launch:"C:\\Games\\say \"hi\".rom"?launcher=DOS"#
-        );
+    fn launch_text_preserves_backslashes_and_quotes_in_path() {
+        let path = r#"C:\Games\say "hi".rom"#;
+        let e = entry("weird", path, "DOS", "DOS");
+        assert_eq!(launch_text_for(&e), path);
     }
 
     #[test]
     fn launch_text_is_empty_when_path_missing_and_launcher_present() {
-        // A history row with a launcher id but no path is malformed —
-        // `**launch:?launcher=NES` would just confuse Core. Empty here
-        // suppresses the run entirely.
+        // A history row with a launcher id but no path is malformed.
+        // Empty here suppresses the run entirely.
         let e = entry("ghost", "", "NES", "NES");
         assert_eq!(launch_text_for(&e), "");
+    }
+
+    #[test]
+    fn dedupe_latest_by_path_keeps_first_matching_path() {
+        let entries = dedupe_latest_by_path(vec![
+            entry("latest smb", "/p/smb", "NES", "NES"),
+            entry("zelda", "/p/zelda", "NES", "NES"),
+            entry("older smb", "/p/smb", "NES", "NES"),
+            entry("metroid", "/p/metroid", "NES", "NES"),
+        ]);
+        let names = entries
+            .iter()
+            .map(|entry| entry.media_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["latest smb", "zelda", "metroid"]);
+    }
+
+    #[test]
+    fn filter_entries_by_path_skips_existing_and_later_incoming_duplicates() {
+        let existing = [entry("latest smb", "/p/smb", "NES", "NES")];
+        let entries = filter_entries_by_path(
+            existing.iter(),
+            vec![
+                entry("older smb", "/p/smb", "NES", "NES"),
+                entry("latest zelda", "/p/zelda", "NES", "NES"),
+                entry("older zelda", "/p/zelda", "NES", "NES"),
+                entry("metroid", "/p/metroid", "NES", "NES"),
+            ],
+        );
+        let names = entries
+            .iter()
+            .map(|entry| entry.media_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["latest zelda", "metroid"]);
+    }
+
+    #[test]
+    fn dedupe_latest_by_path_preserves_empty_paths() {
+        let entries = dedupe_latest_by_path(vec![
+            entry("ghost one", "", "NES", "NES"),
+            entry("smb", "/p/smb", "NES", "NES"),
+            entry("ghost two", "", "NES", "NES"),
+            entry("older smb", "/p/smb", "NES", "NES"),
+        ]);
+        let names = entries
+            .iter()
+            .map(|entry| entry.media_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["ghost one", "smb", "ghost two"]);
     }
 
     #[test]

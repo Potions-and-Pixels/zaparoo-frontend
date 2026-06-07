@@ -66,8 +66,15 @@ pub struct MediaStatusState {
     pub scrape_matched: i32,
     pub scrape_skipped: i32,
     pub scrape_total_scraped: i32,
+    pub scrape_force: bool,
+    pub scrape_force_known: bool,
     pub scrape_system_id: String,
     pub scrape_scraper_id: String,
+    pub scrape_state: String,
+    pub scrape_error: String,
+    pub scrape_current_step: i32,
+    pub scrape_total_steps: i32,
+    pub scrape_current_step_display: String,
 }
 
 impl MediaStatusState {
@@ -96,8 +103,19 @@ impl MediaStatusState {
         self.scrape_matched = status.matched;
         self.scrape_skipped = status.skipped;
         self.scrape_total_scraped = status.total_scraped;
+        self.scrape_force = status.force.unwrap_or(false);
+        self.scrape_force_known = status.force.is_some();
         self.scrape_system_id.clone_from(&status.system_id);
         self.scrape_scraper_id.clone_from(&status.scraper_id);
+        self.scrape_state.clone_from(&status.state);
+        self.scrape_error.clone_from(&status.error);
+        self.scrape_current_step = status.current_step.unwrap_or(0);
+        self.scrape_total_steps = status.total_steps.unwrap_or(0);
+        status
+            .current_step_display
+            .as_deref()
+            .unwrap_or_default()
+            .clone_into(&mut self.scrape_current_step_display);
     }
 }
 
@@ -359,8 +377,10 @@ mod tests {
         let tx = Arc::new(tx);
         let payload = json!({
             "scraperId": "screenscraper", "systemId": "SNES",
+            "state": "running", "currentStep": 2, "totalSteps": 5,
+            "currentStepDisplay": "Super Nintendo",
             "processed": 12, "total": 200, "matched": 10, "skipped": 2,
-            "totalScraped": 50, "scraping": true, "done": false, "paused": false
+            "totalScraped": 50, "force": true, "scraping": true, "done": false, "paused": false
         });
         fold_notification(
             &Notification {
@@ -373,10 +393,36 @@ mod tests {
         assert!(snapshot.scraping);
         assert_eq!(snapshot.scrape_processed, 12);
         assert_eq!(snapshot.scrape_total, 200);
+        assert!(snapshot.scrape_force);
+        assert!(snapshot.scrape_force_known);
         assert_eq!(snapshot.scrape_system_id, "SNES");
+        assert_eq!(snapshot.scrape_state, "running");
+        assert_eq!(snapshot.scrape_current_step, 2);
+        assert_eq!(snapshot.scrape_total_steps, 5);
+        assert_eq!(snapshot.scrape_current_step_display, "Super Nintendo");
         // `scraped`-side notifications must not flip the indexing
         // `seeded` flag — that's the `media` query's job.
         assert!(!snapshot.seeded);
+    }
+
+    #[test]
+    fn fold_notification_keeps_scrape_force_unknown_when_missing() {
+        let (tx, rx) = watch::channel(MediaStatusState::default());
+        let tx = Arc::new(tx);
+        fold_notification(
+            &Notification {
+                method: "media.scraping".into(),
+                params: json!({
+                    "scraperId": "screenscraper", "scraping": true,
+                    "done": false, "paused": false
+                }),
+            },
+            &tx,
+        );
+        let snapshot = rx.borrow().clone();
+        assert!(snapshot.scraping);
+        assert!(!snapshot.scrape_force);
+        assert!(!snapshot.scrape_force_known);
     }
 
     #[test]

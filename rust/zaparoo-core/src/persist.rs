@@ -97,6 +97,8 @@ pub struct FavoritesState {
 pub struct SettingsState {
     pub resolution: String,
     pub language: String,
+    #[serde(default = "default_orientation")]
+    pub orientation: String,
     #[serde(default = "default_browse_layout")]
     pub browse_layout: String,
     #[serde(default = "default_button_layout")]
@@ -109,6 +111,8 @@ pub struct SettingsState {
     pub debug_logging: bool,
     #[serde(default = "default_screensaver_timeout")]
     pub screensaver_timeout: String,
+    #[serde(default = "default_media_image_type")]
+    pub media_image_type: String,
 }
 
 impl Default for SettingsState {
@@ -116,14 +120,20 @@ impl Default for SettingsState {
         Self {
             resolution: String::new(),
             language: String::new(),
+            orientation: default_orientation(),
             browse_layout: default_browse_layout(),
             button_layout: default_button_layout(),
             mouse_enabled: default_mouse_enabled(),
             discover_arcade_alternate_versions: false,
             debug_logging: false,
             screensaver_timeout: default_screensaver_timeout(),
+            media_image_type: default_media_image_type(),
         }
     }
+}
+
+fn default_orientation() -> String {
+    "horizontal".into()
 }
 
 fn default_browse_layout() -> String {
@@ -143,6 +153,10 @@ fn default_mouse_enabled() -> bool {
 
 fn default_screensaver_timeout() -> String {
     "300".into()
+}
+
+fn default_media_image_type() -> String {
+    "auto".into()
 }
 
 pub fn load() -> PersistedState {
@@ -270,12 +284,14 @@ mod tests {
             settings: SettingsState {
                 resolution: "1920x1080".into(),
                 language: "it_IT".into(),
+                orientation: "cw".into(),
                 browse_layout: "list".into(),
                 button_layout: "b".into(),
                 mouse_enabled: false,
                 discover_arcade_alternate_versions: true,
                 debug_logging: true,
                 screensaver_timeout: "300".into(),
+                media_image_type: "auto".into(),
             },
         };
         save_to(&path, &original);

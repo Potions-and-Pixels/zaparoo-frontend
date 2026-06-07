@@ -40,6 +40,7 @@ TestCase {
         // run in microseconds, so the pending fire would land on the
         // next test if we didn't reset it here.
         main._stopRepeat();
+        main._resetRapidNavigation();
     }
 
     function test_initial_state_is_hub(): void {
@@ -289,6 +290,8 @@ TestCase {
         compare(main._isRepeatableAction("down"), true);
         compare(main._isRepeatableAction("left"), true);
         compare(main._isRepeatableAction("right"), true);
+        compare(main._isRepeatableAction("page_prev"), true);
+        compare(main._isRepeatableAction("page_next"), true);
     // qmllint enable compiler
     }
 
@@ -296,8 +299,6 @@ TestCase {
         // qmllint disable compiler
         compare(main._isRepeatableAction("accept"), false);
         compare(main._isRepeatableAction("cancel"), false);
-        compare(main._isRepeatableAction("page_prev"), false);
-        compare(main._isRepeatableAction("page_next"), false);
         compare(main._isRepeatableAction("write_card"), false);
         compare(main._isRepeatableAction(""), false);
     // qmllint enable compiler
@@ -311,7 +312,7 @@ TestCase {
         compare(main._repeatTicking, false, "Steady tick must not start before the initial delay");
     }
 
-    function test_arm_repeat_with_non_dpad_action_is_noop(): void {
+    function test_arm_repeat_with_non_repeatable_action_is_noop(): void {
         main._armRepeat("accept", Qt.Key_Return);
         compare(main._heldAction, "");
         compare(main._heldKey, 0);
@@ -357,6 +358,38 @@ TestCase {
         compare(main._repeatPending, true, "Re-arm restarts the initial-delay timer");
     }
 
+    function test_rapid_navigation_taps_activate_on_second_press(): void {
+        // qmllint disable compiler
+        main._noteRapidNavigationAction("down", false);
+        compare(main.rapidNavigationAction, "down", "rapid action tracks latest rapid input even before active mode");
+        compare(main.rapidNavigationActive, false, "single isolated press should not enter rapid mode");
+        main._noteRapidNavigationAction("down", false);
+        compare(main.rapidNavigationActive, true, "second press inside quiet window enters rapid mode");
+        wait(main._rapidNavigationQuietMs + 40);
+        compare(main.rapidNavigationActive, false, "rapid mode clears after quiet window");
+        compare(main.rapidNavigationAction, "", "quiet reset clears rapid action");
+    // qmllint enable compiler
+    }
+
+    function test_rapid_navigation_ignores_non_rapid_action(): void {
+        // qmllint disable compiler
+        main._noteRapidNavigationAction("accept", true);
+        compare(main.rapidNavigationActive, false);
+        compare(main.rapidNavigationAction, "");
+    // qmllint enable compiler
+    }
+
+    function test_repeat_tick_forces_rapid_navigation_active(): void {
+        // qmllint disable compiler
+        main._armRepeat("page_next", Qt.Key_R);
+        main._handleRepeatAction();
+        compare(main.rapidNavigationActive, true, "held page action should enter rapid mode on first repeat tick");
+        main._stopRepeat();
+        wait(main._rapidNavigationQuietMs + 40);
+        compare(main.rapidNavigationActive, false);
+    // qmllint enable compiler
+    }
+
     // Context-menu builder. Drives the pure helper directly per the QML
     // test isolation rule — no real menu opening, no handleAction.
     // Compares only the entry id sequence; labels are qsTr() and asserted
@@ -372,7 +405,7 @@ TestCase {
 
     function test_context_menu_systems_owner_is_single_launch_core(): void {
         // qmllint disable compiler
-        const entries = main.buildContextMenuEntries("systems", "", false, false);
+        const entries = main.buildContextMenuEntries("systems", "", false, false, false, "");
         compare(_idsOf(entries), ["launch_system"], "Systems context menu is just Launch core regardless of has_nfc");
         verify(entries[0].label.length > 0, "Launch core label is set (not asserted in English for translation)");
     // qmllint enable compiler
@@ -380,62 +413,62 @@ TestCase {
 
     function test_context_menu_systems_has_nfc_does_not_add_entries(): void {
         // qmllint disable compiler
-        const entries = main.buildContextMenuEntries("systems", "", true, false);
+        const entries = main.buildContextMenuEntries("systems", "", false, true, false, "");
         compare(_idsOf(entries), ["launch_system"], "has_nfc must not affect the systems menu");
     // qmllint enable compiler
     }
 
     function test_context_menu_games_directory_returns_empty(): void {
         // qmllint disable compiler
-        compare(main.buildContextMenuEntries("games", "directory", true, false), [], "Folder tiles have no context menu, even with reader attached");
+        compare(main.buildContextMenuEntries("games", "directory", false, true, false, ""), [], "Folder tiles have no context menu, even with reader attached");
     // qmllint enable compiler
     }
 
     function test_context_menu_games_root_returns_empty(): void {
         // qmllint disable compiler
-        compare(main.buildContextMenuEntries("games", "root", true, false), []);
+        compare(main.buildContextMenuEntries("games", "root", false, true, false, ""), []);
     // qmllint enable compiler
     }
 
     function test_context_menu_games_no_reader_omits_write_card(): void {
         // qmllint disable compiler
-        const entries = main.buildContextMenuEntries("games", "media", false, false);
+        const entries = main.buildContextMenuEntries("games", "media", true, false, false, "");
         compare(_idsOf(entries), ["toggle_favorite", "qr_code", "launch_game"], "Write to NFC token must be hidden when no reader is reported");
     // qmllint enable compiler
     }
 
     function test_context_menu_games_with_reader_includes_write_card(): void {
         // qmllint disable compiler
-        const entries = main.buildContextMenuEntries("games", "media", true, false);
+        const entries = main.buildContextMenuEntries("games", "media", true, true, false, "");
         compare(_idsOf(entries), ["toggle_favorite", "write_card", "qr_code", "launch_game"]);
     // qmllint enable compiler
     }
 
     function test_context_menu_favorites_matches_games_media_entries(): void {
         // qmllint disable compiler
-        const entries = main.buildContextMenuEntries("favorites", "", true, true);
+        const entries = main.buildContextMenuEntries("favorites", "", true, true, true, "");
         compare(_idsOf(entries), ["toggle_favorite", "write_card", "qr_code", "launch_game"]);
     // qmllint enable compiler
     }
 
     function test_context_menu_favorites_no_reader_omits_write_card(): void {
         // qmllint disable compiler
-        const entries = main.buildContextMenuEntries("favorites", "", false, true);
+        const entries = main.buildContextMenuEntries("favorites", "", true, false, true, "");
         compare(_idsOf(entries), ["toggle_favorite", "qr_code", "launch_game"]);
     // qmllint enable compiler
     }
 
     function test_context_menu_recents_omits_more_info(): void {
         // qmllint disable compiler
-        const entries = main.buildContextMenuEntries("recents", "", false, false);
+        const entries = main.buildContextMenuEntries("recents", "", false, false, false, "");
         compare(_idsOf(entries), ["launch_game"]);
     // qmllint enable compiler
     }
 
     function test_context_menu_games_favorite_label_toggles(): void {
         // qmllint disable compiler
-        const addEntries = main.buildContextMenuEntries("games", "media", false, false);
-        const removeEntries = main.buildContextMenuEntries("games", "media", false, true);
+        const addEntries = main.buildContextMenuEntries("games", "media", true, false, false, "");
+        const removeEntries = main.buildContextMenuEntries("games", "media", true, false, true, "");
         compare(addEntries[0].id, "toggle_favorite");
         compare(removeEntries[0].id, "toggle_favorite");
         verify(addEntries[0].label.length > 0);
@@ -446,7 +479,7 @@ TestCase {
 
     function test_context_menu_unknown_owner_returns_empty(): void {
         // qmllint disable compiler
-        compare(main.buildContextMenuEntries("nope", "", true, false), [], "Unknown owners get no entries — safe default");
+        compare(main.buildContextMenuEntries("nope", "", false, true, false, ""), [], "Unknown owners get no entries — safe default");
     // qmllint enable compiler
     }
 

@@ -50,14 +50,17 @@ Item {
     // Defaults to true so call sites that don't care keep working
     // untouched.
     property bool focused: true
+    property bool coverLoadingPaused: false
+    property bool rapidRenderMode: false
     property var layoutProfile: null
+    readonly property var _gridProfile: root.layoutProfile && root.layoutProfile.grid ? root.layoutProfile.grid : null
 
     // Emitted when the user is sitting on the last loaded page after a
     // selection move. Models with more data fetch the next page in
     // response; models without ignore it. The grid does not know
     // whether the model has more data — that is a model concern, kept
     // out of this component so it stays generic.
-    signal loadMoreRequested
+    signal loadMoreRequested(bool urgent)
     // Mouse entry points. Screens own persistence and activation side
     // effects, so the grid only updates its focused index and reports the
     // row the pointer targeted.
@@ -67,15 +70,13 @@ Item {
     signal emptyRightClicked
     signal pageWheelRequested(int delta)
 
-    // Per-instance shape overrides. -1 means "use the global Sizing
-    // default" — Systems screen leaves these alone so the systems grid
-    // stays at gridColumns × gridRows; Games screen wires them to
-    // gamesGridColumns × gamesGridRows so its taller cover art gets the
-    // vertical room a 3-row layout would starve.
+    // Per-instance shape overrides. -1 means "use the shared browse-grid
+    // default". Real browse screens now override explicitly, but the
+    // fallback stays useful for generic callers and tests.
     property int columnsOverride: -1
     property int rowsOverride: -1
-    readonly property int columns: columnsOverride > 0 ? columnsOverride : Sizing.gridColumns
-    readonly property int rows: rowsOverride > 0 ? rowsOverride : Sizing.gridRows
+    readonly property int columns: columnsOverride > 0 ? columnsOverride : Sizing.systemsGridColumns
+    readonly property int rows: rowsOverride > 0 ? rowsOverride : Sizing.systemsGridRows
 
     // Pages of buffer to keep ahead of the user's current page before
     // firing `loadMoreRequested`. With `loadAheadPages: 2` the trigger
@@ -164,22 +165,23 @@ Item {
     // not as another cell, so a full inter-cell gap looks like wasted
     // space next to it. The gutter stays reserved on a single page
     // (just hidden) so cells don't reflow when paging activates.
-    readonly property int leftInset: root.layoutProfile ? root.layoutProfile.gridLeftInset : Sizing.pctW(5)
-    readonly property int rightInset: root.layoutProfile ? root.layoutProfile.gridRightInset : Sizing.pctW(5)
-    readonly property int gutterWidth: root.layoutProfile ? root.layoutProfile.gridGutterWidth : Sizing.pctW(3)
-    readonly property int gutterGap: root.layoutProfile ? root.layoutProfile.gridGutterGap : Sizing.pctW(1.5)
-    readonly property int scrollThumbWidth: root.layoutProfile ? root.layoutProfile.scrollThumbWidth : Sizing.pctW(1.2)
-    readonly property int scrollThumbRightInset: root.layoutProfile ? root.layoutProfile.scrollThumbRightInset : 0
-    readonly property int scrollArrowSize: root.layoutProfile ? root.layoutProfile.scrollArrowSize : Math.min(gutterWidth, Sizing.pctH(4))
-    readonly property int topInset: root.layoutProfile ? root.layoutProfile.gridTopInset : Sizing.pctH(2)
-    readonly property int bottomInset: root.layoutProfile ? root.layoutProfile.gridBottomInset : Sizing.pctH(2)
-    readonly property int cellSpacingX: root.layoutProfile ? root.layoutProfile.gridColumnGap : Sizing.pctW(3)
-    readonly property int cellSpacingY: root.layoutProfile ? root.layoutProfile.gridRowGap : Sizing.pctH(4)
+    readonly property int leftInset: root._gridProfile ? root._gridProfile.leftInset : Sizing.pctW(5)
+    readonly property int rightInset: root._gridProfile ? root._gridProfile.rightInset : Sizing.pctW(5)
+    readonly property int gutterWidth: root._gridProfile ? root._gridProfile.gutterWidth : Sizing.pctW(3)
+    readonly property int gutterGap: root._gridProfile ? root._gridProfile.gutterGap : Sizing.pctW(1.5)
+    readonly property int scrollThumbWidth: root._gridProfile ? root._gridProfile.scrollThumbWidth : Sizing.pctW(1.2)
+    readonly property int scrollThumbRightInset: root._gridProfile ? root._gridProfile.scrollThumbRightInset : 0
+    readonly property bool scrollThumbRightAligned: root._gridProfile && root._gridProfile.scrollThumbRightAligned !== undefined ? root._gridProfile.scrollThumbRightAligned : false
+    readonly property int scrollArrowSize: root._gridProfile ? root._gridProfile.scrollArrowSize : Math.min(gutterWidth, Sizing.pctH(4))
+    readonly property int topInset: root._gridProfile ? root._gridProfile.topInset : Sizing.pctH(2)
+    readonly property int bottomInset: root._gridProfile ? root._gridProfile.bottomInset : Sizing.pctH(2)
+    readonly property int cellSpacingX: root._gridProfile ? root._gridProfile.columnGap : Sizing.pctW(3)
+    readonly property int cellSpacingY: root._gridProfile ? root._gridProfile.rowGap : Sizing.pctH(4)
     readonly property int _contentWidth: root.columns * root.cellWidth + (root.columns - 1) * root.cellSpacingX
-    readonly property int _scrollGutterX: root.layoutProfile && root.layoutProfile.packHorizontalRemainderAfterGutter ? root.leftInset + root._contentWidth + root.gutterGap : width - root.rightInset - root.gutterWidth
+    readonly property int _scrollGutterX: root._gridProfile && root._gridProfile.gutterFollowsContentWidth ? root.leftInset + root._contentWidth + root.gutterGap : width - root.rightInset - root.gutterWidth
 
     // Computed cell dimensions — fill the available area, divided by
-    // gridColumns × gridRows. Callers don't override. The cell area
+    // columns × rows. The cell area
     // also reserves `gutterGap + gutterWidth` on the right for the
     // tight-gap-then-scrollbar layout described above.
     readonly property int _availableWidth: Math.max(0, width - leftInset - rightInset - gutterGap - gutterWidth)
@@ -234,7 +236,7 @@ Item {
             root._pendingTargetPage = targetPage;
             root._pendingTargetRow = root.currentRow;
             root._pendingTargetCol = root.currentColumn;
-            root.loadMoreRequested();
+            root.loadMoreRequested(true);
             return false;
         }
         root._pendingTargetPage = -1;
@@ -250,7 +252,7 @@ Item {
         // `loadAheadPages` of the loaded edge, kick a fetch so the next
         // page boundary lands on freshly loaded rows.
         if (root.currentPage >= root.pageCount - root.loadAheadPages - 1)
-            root.loadMoreRequested();
+            root.loadMoreRequested(false);
         return true;
     }
 
@@ -282,7 +284,7 @@ Item {
                 // Keep the chain going; `fetch_more` is debounced
                 // model-side via `loading_more`, so a redundant emit
                 // is cheap.
-                root.loadMoreRequested();
+                root.loadMoreRequested(true);
                 return;
             }
             // Model says no more pages are coming. Settle on the
@@ -382,7 +384,7 @@ Item {
                     root._pendingTargetPage = targetPage;
                     root._pendingTargetRow = root.rows - 1;
                     root._pendingTargetCol = root.currentColumn;
-                    root.loadMoreRequested();
+                    root.loadMoreRequested(true);
                     return false;
                 }
                 newPage = targetPage;
@@ -394,7 +396,7 @@ Item {
                     root._pendingTargetPage = targetPage;
                     root._pendingTargetRow = 0;
                     root._pendingTargetCol = root.currentColumn;
-                    root.loadMoreRequested();
+                    root.loadMoreRequested(true);
                     return false;
                 }
                 newPage = targetPage;
@@ -422,7 +424,7 @@ Item {
             // fetch more so a subsequent press can land on freshly-
             // loaded rows.
             if (root.currentPage >= root.pageCount - root.loadAheadPages - 1)
-                root.loadMoreRequested();
+                root.loadMoreRequested(false);
             return false;
         }
         // Successful directional move clears any pending wrap-target;
@@ -436,7 +438,7 @@ Item {
         // model's own debounce (`loading_more` guard) collapses
         // repeated emissions while a fetch is in flight.
         if (root.currentPage >= root.pageCount - root.loadAheadPages - 1)
-            root.loadMoreRequested();
+            root.loadMoreRequested(false);
         return true;
     }
 
@@ -522,11 +524,10 @@ Item {
                 // row at construction. Two-tier gate, both anchored on
                 // distance from `root.currentPage`:
                 //
-                //   - request range (±2 pages): cells inside this
-                //     radius fire image-provider requests. Bounds the
-                //     initial fanout to a fixed ~50 covers while still
-                //     pre-decoding pages N+1 and N+2 so a forward PgDn
-                //     lands on already-cached pixmaps.
+                //   - request range (current page only): visible cells
+                //     fire image-provider requests. Rust owns ordered
+                //     current/next/previous page prefetch so hidden QML
+                //     delegates do not fight the explicit queue.
                 //   - retention range (±5 pages): cells inside this
                 //     radius keep their TileLoader.active=true so the
                 //     Tile delegate stays materialised, AND cells that
@@ -553,8 +554,8 @@ Item {
                 // after crossing past the retention edge runs at
                 // nice +10 (see media_image_provider.cpp) and is
                 // invisible to the renderer.
-                readonly property bool _coverInRange: Math.abs(cellPage - root.currentPage) <= 2
-                readonly property bool _coverInRetentionRange: Math.abs(cellPage - root.currentPage) <= 5
+                readonly property bool _coverInRange: !root.rapidRenderMode && cellPage === root.currentPage
+                readonly property bool _coverInRetentionRange: !root.rapidRenderMode && Math.abs(cellPage - root.currentPage) <= (root.coverLoadingPaused ? 1 : 5)
                 property bool _coverEverRequested: false
                 Binding on _coverEverRequested {
                     when: cellItem._coverInRange
@@ -590,7 +591,9 @@ Item {
                 Rectangle {
                     anchors.fill: parent
                     radius: Sizing.cornerRadius
-                    color: Theme.surfaceCard
+                    color: cellItem.isSelected && root.rapidRenderMode ? Theme.selectionSurface : Theme.surfaceCard
+                    border.width: cellItem.isSelected && root.rapidRenderMode ? Sizing.stroke(2) : 0
+                    border.color: Theme.accent
                 }
 
                 TileLoader {
@@ -606,7 +609,7 @@ Item {
                     // ~110 active tiles instead of N, per-press
                     // binding cost stays roughly constant as the
                     // dataset grows.
-                    active: cellItem._coverInRetentionRange
+                    active: cellItem._coverInRetentionRange && !root.rapidRenderMode
                     // Incubate Tile construction on background frames
                     // so a retention-edge crossing (10 cells flipping
                     // active) doesn't block the main thread. The
@@ -717,8 +720,9 @@ Item {
             anchors.topMargin: root.scrollArrowSize + Sizing.pctH(1)
             anchors.bottom: parent.bottom
             anchors.bottomMargin: root.scrollArrowSize + Sizing.pctH(1)
-            anchors.right: parent.right
-            anchors.rightMargin: root.scrollThumbRightInset
+            anchors.right: root.scrollThumbRightAligned ? parent.right : undefined
+            anchors.rightMargin: root.scrollThumbRightAligned ? root.scrollThumbRightInset : 0
+            anchors.horizontalCenter: root.scrollThumbRightAligned ? undefined : parent.horizontalCenter
             width: root.scrollThumbWidth
 
             // Standard paginated-scrollbar formulas (cf. Qt
@@ -735,7 +739,8 @@ Item {
                 id: scrollThumb
                 width: root.scrollThumbWidth
                 height: scrollRegion._thumbHeight
-                anchors.right: parent.right
+                anchors.right: root.scrollThumbRightAligned ? parent.right : undefined
+                anchors.horizontalCenter: root.scrollThumbRightAligned ? undefined : parent.horizontalCenter
                 y: scrollRegion._thumbY
                 color: Theme.textPrimary
                 radius: Sizing.half(width)
