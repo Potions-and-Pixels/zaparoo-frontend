@@ -119,6 +119,16 @@ pub struct SettingsRust {
     current_debug_logging: bool,
     available_screensaver_timeouts: QStringList,
     current_screensaver_timeout: QString,
+    // ----- Kiosk lockdown -----
+    // READ + CONSTANT: set once at Initialize from `frontend.toml`,
+    // never mutated from QML. Hiding the Settings screen (which
+    // would be the natural place to expose toggles) is one of the
+    // things these flags do, so admin-only-via-config is the
+    // intended scope.
+    current_hide_settings: bool,
+    current_hide_favorites: bool,
+    current_hide_recents: bool,
+    current_hide_resume: bool,
 }
 
 #[cxx_qt::bridge]
@@ -148,6 +158,12 @@ pub mod ffi {
         #[qproperty(bool, current_debug_logging, READ, WRITE = set_debug_logging, NOTIFY)]
         #[qproperty(QStringList, available_screensaver_timeouts, READ, CONSTANT)]
         #[qproperty(QString, current_screensaver_timeout, READ, WRITE = set_screensaver_timeout, NOTIFY)]
+        // Kiosk lockdown flags — READ + CONSTANT, admin-set via
+        // frontend.toml. See SettingsRust doc comment.
+        #[qproperty(bool, current_hide_settings, READ, CONSTANT)]
+        #[qproperty(bool, current_hide_favorites, READ, CONSTANT)]
+        #[qproperty(bool, current_hide_recents, READ, CONSTANT)]
+        #[qproperty(bool, current_hide_resume, READ, CONSTANT)]
         type Settings = super::SettingsRust;
 
         #[qinvokable]
@@ -210,6 +226,19 @@ impl Initialize for ffi::Settings {
         self.as_mut().rust_mut().available_screensaver_timeouts = screensaver_timeouts();
         self.as_mut().rust_mut().current_screensaver_timeout =
             QString::from(merged.screensaver_timeout.as_str());
+        // Kiosk lockdown flags — read straight from Config, no
+        // persist/state.toml involvement (they're not user-toggleable;
+        // there's no UI to toggle them from since `hide_settings`
+        // would hide that very UI). Defaults to `false` when absent
+        // from frontend.toml, matching the existing-deployment-
+        // friendly "no change to behavior" contract.
+        self.as_mut().rust_mut().current_hide_settings =
+            config.settings.hide_settings.unwrap_or(false);
+        self.as_mut().rust_mut().current_hide_favorites =
+            config.settings.hide_favorites.unwrap_or(false);
+        self.as_mut().rust_mut().current_hide_recents =
+            config.settings.hide_recents.unwrap_or(false);
+        self.as_mut().rust_mut().current_hide_resume = config.settings.hide_resume.unwrap_or(false);
     }
 }
 

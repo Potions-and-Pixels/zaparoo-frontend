@@ -49,6 +49,22 @@ pub struct SettingsConfig {
     pub mouse_enabled: Option<bool>,
     pub discover_arcade_alternate_versions: Option<bool>,
     pub screensaver_timeout: Option<String>,
+    /// Kiosk lockdown — hide the Settings tile on the Hub action row.
+    /// `None`/`Some(false)` leave it visible (default). `Some(true)`
+    /// removes it; the screen stays accessible programmatically but
+    /// has no UI affordance. Intended for deployments where an operator
+    /// manages the cabinet remotely and end-users shouldn't alter
+    /// frontend settings. Set via `[settings] hide_settings = true`
+    /// in `frontend.toml` — there's no in-UI toggle (the Settings
+    /// screen this would hide is precisely what we'd put the toggle in).
+    pub hide_settings: Option<bool>,
+    /// Kiosk lockdown — hide the Favorites tile on the Hub action row.
+    pub hide_favorites: Option<bool>,
+    /// Kiosk lockdown — hide the Recently Played tile on the Hub action row.
+    pub hide_recents: Option<bool>,
+    /// Kiosk lockdown — hide the Resume Game tile on the Hub action row
+    /// (it normally appears only when Core has a resumable session).
+    pub hide_resume: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +152,10 @@ struct RawSettings {
     mouse_enabled: Option<bool>,
     discover_arcade_alternate_versions: Option<bool>,
     screensaver_timeout: Option<String>,
+    hide_settings: Option<bool>,
+    hide_favorites: Option<bool>,
+    hide_recents: Option<bool>,
+    hide_resume: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -215,6 +235,10 @@ pub fn load_config(path: &Path) -> Config {
             .settings
             .screensaver_timeout
             .map(|value| value.trim().to_string()),
+        hide_settings: raw.settings.hide_settings,
+        hide_favorites: raw.settings.hide_favorites,
+        hide_recents: raw.settings.hide_recents,
+        hide_resume: raw.settings.hide_resume,
     };
     cfg.notice = NoticeConfig {
         commercial_ack: raw.notice.commercial_ack.unwrap_or(false),
