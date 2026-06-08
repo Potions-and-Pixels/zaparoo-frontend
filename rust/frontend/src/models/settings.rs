@@ -81,6 +81,7 @@ const MISTER_RESOLUTIONS: &[&str] = &[
     "",
     "1280x720",
     "1920x1080",
+    "2560x1440",
     "1920x1200",
     "1920x1440",
     "640x480",
@@ -153,6 +154,16 @@ pub struct SettingsRust {
     current_screensaver_timeout: QString,
     available_media_image_types: QStringList,
     current_media_image_type: QString,
+    // ----- Kiosk lockdown -----
+    // READ + CONSTANT: set once at Initialize from `frontend.toml`,
+    // never mutated from QML. Hiding the Settings screen (which
+    // would be the natural place to expose toggles) is one of the
+    // things these flags do, so admin-only-via-config is the
+    // intended scope.
+    current_hide_settings: bool,
+    current_hide_favorites: bool,
+    current_hide_recents: bool,
+    current_hide_resume: bool,
 }
 
 #[cxx_qt::bridge]
@@ -186,6 +197,12 @@ pub mod ffi {
         #[qproperty(QString, current_screensaver_timeout, READ, WRITE = set_screensaver_timeout, NOTIFY)]
         #[qproperty(QStringList, available_media_image_types, READ, CONSTANT)]
         #[qproperty(QString, current_media_image_type, READ, WRITE = set_media_image_type, NOTIFY)]
+        // Kiosk lockdown flags — READ + CONSTANT, admin-set via
+        // frontend.toml. See SettingsRust doc comment.
+        #[qproperty(bool, current_hide_settings, READ, CONSTANT)]
+        #[qproperty(bool, current_hide_favorites, READ, CONSTANT)]
+        #[qproperty(bool, current_hide_recents, READ, CONSTANT)]
+        #[qproperty(bool, current_hide_resume, READ, CONSTANT)]
         type Settings = super::SettingsRust;
 
         #[qinvokable]
@@ -261,6 +278,21 @@ impl Initialize for ffi::Settings {
         self.as_mut().rust_mut().available_media_image_types = media_image_types();
         self.as_mut().rust_mut().current_media_image_type =
             QString::from(merged.media_image_type.as_str());
+        // Kiosk lockdown flags — read straight from Config, no
+        // persist/state.toml involvement (they're not user-toggleable;
+        // there's no UI to toggle them from since `hide_settings`
+        // would hide that very UI). Defaults to `false` when absent
+        // from frontend.toml, matching the existing-deployment-
+        // friendly "no change to behavior" contract.
+        self.as_mut().rust_mut().current_hide_settings =
+            config.settings.hide_settings.unwrap_or(false);
+        self.as_mut().rust_mut().current_hide_favorites =
+            config.settings.hide_favorites.unwrap_or(false);
+        self.as_mut().rust_mut().current_hide_recents =
+            config.settings.hide_recents.unwrap_or(false);
+        self.as_mut().rust_mut().current_hide_resume = config.settings.hide_resume.unwrap_or(false);
+        // Keep the startup trace as the LAST line of initialize() so
+        // its duration measurement covers every field init above it.
         crate::startup_trace(format!(
             "rust:model Settings init end dur_ms={}",
             started.elapsed().as_millis()
@@ -666,12 +698,13 @@ mod tests {
     }
 
     #[test]
-    fn curated_list_contains_720p_and_1080p() {
+    fn curated_list_contains_common_16_9_resolutions() {
         // Mostly a sanity guard — if a future edit silently drops the
-        // two most-likely-to-work resolutions, this test catches it.
+        // most-likely-to-work 16:9 resolutions, this test catches it.
         let collected: Vec<&str> = MISTER_RESOLUTIONS.to_vec();
         assert!(collected.contains(&"1280x720"));
         assert!(collected.contains(&"1920x1080"));
+        assert!(collected.contains(&"2560x1440"));
     }
 
     #[test]

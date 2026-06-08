@@ -124,9 +124,19 @@ Item {
     // is unknown; hide it only after Recents proves there is nothing
     // resumable. The tile always uses the play icon so startup never
     // waits on a game cover for the Hub's primary action.
+    //
+    // Each tile is also independently gated by a `hide_*` setting in
+    // `frontend.toml` (see `SettingsConfig` in
+    // `zaparoo-core/src/config.rs` and the matching `current_hide_*`
+    // qproperties in `models/settings.rs`). Defaults to visible —
+    // operators opting into kiosk lockdown set any subset of
+    // `hide_settings`, `hide_favorites`, `hide_recents`, `hide_resume`
+    // to `true`. When every tile is hidden, the action row is empty
+    // and the Hub renders system-grid-only — the intended kiosk
+    // experience.
     readonly property var actionEntries: {
         const entries = [];
-        if (hub.resumeActionVisible) {
+        if (hub.resumeActionVisible && !Browse.Settings.current_hide_resume) {
             const resumeName = Browse.RecentsModel.resume_name;
             entries.push({
                 id: "resume",
@@ -134,21 +144,27 @@ Item {
                 text: resumeName.length > 0 ? resumeName : qsTr("Resume")
             });
         }
-        entries.push({
-            id: "favorites",
-            coverKey: "icons/HeartOutline",
-            text: qsTr("Favorites")
-        });
-        entries.push({
-            id: "recents",
-            coverKey: "icons/History",
-            text: qsTr("Recently Played")
-        });
-        entries.push({
-            id: "settings",
-            coverKey: "icons/Settings",
-            text: qsTr("Settings")
-        });
+        if (!Browse.Settings.current_hide_favorites) {
+            entries.push({
+                id: "favorites",
+                coverKey: "icons/HeartOutline",
+                text: qsTr("Favorites")
+            });
+        }
+        if (!Browse.Settings.current_hide_recents) {
+            entries.push({
+                id: "recents",
+                coverKey: "icons/History",
+                text: qsTr("Recently Played")
+            });
+        }
+        if (!Browse.Settings.current_hide_settings) {
+            entries.push({
+                id: "settings",
+                coverKey: "icons/Settings",
+                text: qsTr("Settings")
+            });
+        }
         return entries;
     }
 
