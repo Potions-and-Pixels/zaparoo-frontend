@@ -25,6 +25,9 @@ qt_add_qml_module(
         AboutScreen.qml
         CreditsScreen.qml
         SponsorsScreen.qml
+        DevTeamScreen.qml
+        ArtistsScreen.qml
+        PotionsPixelsScreen.qml
     IMPORTS
         Zaparoo.Ui
         Zaparoo.Theme

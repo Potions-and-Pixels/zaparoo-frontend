@@ -124,6 +124,12 @@ MainLayout {
             root.creditsScreenRequested = true;
         else if (screen === root.screenSponsors)
             root.sponsorsScreenRequested = true;
+        else if (screen === root.screenDevTeam)
+            root.devTeamScreenRequested = true;
+        else if (screen === root.screenArtists)
+            root.artistsScreenRequested = true;
+        else if (screen === root.screenPotionsPixels)
+            root.potionsPixelsScreenRequested = true;
     }
 
     function _primeStartupRestoreScreen(screen: string): void {
@@ -156,6 +162,12 @@ MainLayout {
             return root.creditsScreen;
         if (screen === root.screenSponsors)
             return root.sponsorsScreen;
+        if (screen === root.screenDevTeam)
+            return root.devTeamScreen;
+        if (screen === root.screenArtists)
+            return root.artistsScreen;
+        if (screen === root.screenPotionsPixels)
+            return root.potionsPixelsScreen;
         return root.hubScreen;
     }
 
@@ -253,7 +265,7 @@ MainLayout {
     }
 
     function _validStartupScreen(screen: string): string {
-        if (screen === root.screenHub || screen === root.screenSystems || screen === root.screenGames || screen === root.screenFavorites || screen === root.screenRecents || screen === root.screenSettings || screen === root.screenAbout || screen === root.screenCredits || screen === root.screenSponsors)
+        if (screen === root.screenHub || screen === root.screenSystems || screen === root.screenGames || screen === root.screenFavorites || screen === root.screenRecents || screen === root.screenSettings || screen === root.screenAbout || screen === root.screenCredits || screen === root.screenSponsors || screen === root.screenDevTeam || screen === root.screenArtists || screen === root.screenPotionsPixels)
             return screen;
         return "";
     }
@@ -781,6 +793,29 @@ MainLayout {
         });
     }
 
+    // Credits → Dev Team / Artists / Potions & Pixels transitions.
+    // Each cancels back to Credits via the corresponding screen's
+    // `requestCreditsScreen` signal — wired in the Connections block
+    // further down. Same _whenScreenReady → _goto shape as the other
+    // Credits-stack screens.
+    function _navigateToDevTeam(): void {
+        root._whenScreenReady(root.screenDevTeam, function () {
+            root._goto(root.screenDevTeam);
+        });
+    }
+
+    function _navigateToArtists(): void {
+        root._whenScreenReady(root.screenArtists, function () {
+            root._goto(root.screenArtists);
+        });
+    }
+
+    function _navigateToPotionsPixels(): void {
+        root._whenScreenReady(root.screenPotionsPixels, function () {
+            root._goto(root.screenPotionsPixels);
+        });
+    }
+
     // Credits → About transition. The catch on first entry: the
     // aboutScreen Loader is lazy, so on the very first time we
     // navigate here from the Credits path, `root.aboutScreen` is
@@ -1088,6 +1123,9 @@ MainLayout {
     onAboutScreenChanged: root._flushScreenReady(root.screenAbout)
     onCreditsScreenChanged: root._flushScreenReady(root.screenCredits)
     onSponsorsScreenChanged: root._flushScreenReady(root.screenSponsors)
+    onDevTeamScreenChanged: root._flushScreenReady(root.screenDevTeam)
+    onArtistsScreenChanged: root._flushScreenReady(root.screenArtists)
+    onPotionsPixelsScreenChanged: root._flushScreenReady(root.screenPotionsPixels)
 
     Connections {
         target: root.hubScreen
@@ -1176,6 +1214,12 @@ MainLayout {
         function onRequestAccept(action: string): void {
             if (action === "sponsors") {
                 root._navigateToSponsors();
+            } else if (action === "devTeam") {
+                root._navigateToDevTeam();
+            } else if (action === "artists") {
+                root._navigateToArtists();
+            } else if (action === "potionsPixels") {
+                root._navigateToPotionsPixels();
             } else if (action === "aboutLicense") {
                 // Use the Credits-specific navigator — it defers
                 // the `openedFromCredits = true` flag set into the
@@ -1194,6 +1238,24 @@ MainLayout {
         // Sponsors → Credits return path. Only one navigable
         // signal emitted from the sponsors screen (cancel); accept
         // is a no-op on the static card view.
+        function onRequestCreditsScreen(): void {
+            root._goto(root.screenCredits);
+        }
+    }
+    Connections {
+        target: root.devTeamScreen
+        function onRequestCreditsScreen(): void {
+            root._goto(root.screenCredits);
+        }
+    }
+    Connections {
+        target: root.artistsScreen
+        function onRequestCreditsScreen(): void {
+            root._goto(root.screenCredits);
+        }
+    }
+    Connections {
+        target: root.potionsPixelsScreen
         function onRequestCreditsScreen(): void {
             root._goto(root.screenCredits);
         }
@@ -2113,6 +2175,15 @@ MainLayout {
         } else if (root.activeScreen === root.screenSponsors) {
             if (root.sponsorsScreen !== null)
                 root.sponsorsScreen.handleAction(action);
+        } else if (root.activeScreen === root.screenDevTeam) {
+            if (root.devTeamScreen !== null)
+                root.devTeamScreen.handleAction(action);
+        } else if (root.activeScreen === root.screenArtists) {
+            if (root.artistsScreen !== null)
+                root.artistsScreen.handleAction(action);
+        } else if (root.activeScreen === root.screenPotionsPixels) {
+            if (root.potionsPixelsScreen !== null)
+                root.potionsPixelsScreen.handleAction(action);
         } else {
             root.hubScreen.handleAction(action);
         }

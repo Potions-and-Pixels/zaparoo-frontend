@@ -8,46 +8,48 @@ import Zaparoo.Theme
 import Zaparoo.Ui
 
 // Credits menu — top-level entry under the Hub's "Credits" tile.
-// Two navigable rows, both routing to dedicated scrollable screens:
+// Five navigable rows, each routing to a dedicated scrollable
+// screen:
 //
-//   1. "Sponsors" → SponsorsScreen — column-stacked sponsor cards
-//      rendered from /media/fat/zaparoo/credits/<slug>/.
-//
-//   2. "About/License" → AboutScreen — Zaparoo dev attribution +
-//      PolyForm license. Reused (with AboutScreen.openedFromCredits
-//      set in Main.qml) so cancel returns here instead of Settings.
+//   1. "Sponsors"          → SponsorsScreen — dynamic, per-sponsor folders
+//   2. "Dev Team"          → DevTeamScreen — static ArtCade dev attribution
+//   3. "Artists"           → ArtistsScreen — dynamic, per-artist folders
+//   4. "Potions & Pixels"  → PotionsPixelsScreen — static client mission
+//   5. "About/License"     → AboutScreen — Zaparoo dev attribution + license
 //
 // Pure input dispatcher: emits `requestAccept(actionId)` with the
-// row's id ("sponsors" or "aboutLicense") on Accept, and
-// `requestHubScreen()` on Cancel. All cross-screen orchestration
-// lives in Main.qml.
+// row's id on Accept, `requestHubScreen()` on Cancel.
 Item {
     id: credits
 
     Component.onCompleted: console.debug("startup/qml component CreditsScreen completed")
 
-    // Bound by MainLayout to `root.pendingTransition !== ""`. Credits
-    // is a destination, never a source — kept for parity with the
-    // other screens.
     property bool transitioning: false
 
     signal requestHubScreen
     signal requestAccept(action: string)
 
-    // Focus index between the two menu rows. 0 = Sponsors, 1 =
-    // About/License. The screen has exactly two navigable items;
-    // hardcoding the bound rather than threading a model.length is
-    // simpler and matches the actual UI.
+    // Single source of truth for the menu rows. Adding a row here is
+    // sufficient — focus bounds + Accept routing both derive from
+    // `_menu.length` and the row's `action` field, no extra changes
+    // needed. Order in this list is the display order.
+    readonly property var _menu: [
+        { label: qsTr("Sponsors"), action: "sponsors" },
+        { label: qsTr("Dev Team"), action: "devTeam" },
+        { label: qsTr("Artists"), action: "artists" },
+        { label: qsTr("Potions & Pixels"), action: "potionsPixels" },
+        { label: qsTr("About/License"), action: "aboutLicense" }
+    ]
+
     property int focusIndex: 0
-    readonly property int _itemCount: 2
 
     function handleAction(action: string): void {
         if (action === "up")
             credits.focusIndex = Math.max(0, credits.focusIndex - 1);
         else if (action === "down")
-            credits.focusIndex = Math.min(credits._itemCount - 1, credits.focusIndex + 1);
+            credits.focusIndex = Math.min(credits._menu.length - 1, credits.focusIndex + 1);
         else if (action === "accept")
-            credits.requestAccept(credits.focusIndex === 0 ? "sponsors" : "aboutLicense");
+            credits.requestAccept(credits._menu[credits.focusIndex].action);
         else if (action === "cancel")
             credits.requestHubScreen();
     // left/right are no-ops on a single-column menu.
@@ -76,8 +78,7 @@ Item {
         anchors.bottom: parent.bottom
         anchors.bottomMargin: Sizing.pctH(8)
         anchors.horizontalCenter: parent.horizontalCenter
-        // Match AboutScreen / SponsorsScreen's narrow cap for visual
-        // continuity across the Credits stack.
+        // Match the rest of the Credits stack for visual continuity.
         width: Math.min(parent.width - Sizing.pctW(10), Sizing.pctW(50))
         color: Theme.surfaceCard
         radius: Sizing.cornerRadius
@@ -90,84 +91,52 @@ Item {
             anchors.fill: parent
             anchors.leftMargin: Sizing.pctW(3)
             anchors.rightMargin: Sizing.pctW(3)
-            anchors.topMargin: Sizing.pctH(4)
-            anchors.bottomMargin: Sizing.pctH(4)
-            spacing: Sizing.pctH(2)
+            anchors.topMargin: Sizing.pctH(3)
+            anchors.bottomMargin: Sizing.pctH(3)
+            spacing: Sizing.pctH(1.5)
 
-            // ── "Sponsors" entry ───────────────────────────────────
-            Rectangle {
-                id: sponsorsEntry
+            Repeater {
+                id: menuRepeater
+                model: credits._menu
 
-                width: parent.width
-                height: Sizing.pctH(8)
-                color: Theme.surfaceCard
-                radius: Sizing.cornerRadius
-                border.color: credits.focusIndex === 0 ? Theme.accent : Theme.borderMid
-                border.width: credits.focusIndex === 0 ? Sizing.stroke(2) : Sizing.stroke(1)
+                Rectangle {
+                    id: menuRow
 
-                Row {
-                    anchors.fill: parent
-                    anchors.leftMargin: Sizing.pctW(2)
-                    anchors.rightMargin: Sizing.pctW(2)
-                    spacing: Sizing.pctW(2)
+                    required property int index
+                    required property var modelData
 
-                    Text {
-                        anchors.verticalCenter: parent.verticalCenter
-                        text: qsTr("Sponsors")
-                        color: Theme.textPrimary
-                        font.family: Theme.fontUi
-                        font.pixelSize: Sizing.fontSize(2.8)
-                        renderType: Text.NativeRendering
-                        width: sponsorsEntry.width - Sizing.pctW(8)
-                        elide: Text.ElideRight
-                    }
+                    width: body.width
+                    height: Sizing.pctH(7)
+                    color: Theme.surfaceCard
+                    radius: Sizing.cornerRadius
+                    border.color: credits.focusIndex === menuRow.index ? Theme.accent : Theme.borderMid
+                    border.width: credits.focusIndex === menuRow.index ? Sizing.stroke(2) : Sizing.stroke(1)
 
-                    Text {
-                        anchors.verticalCenter: parent.verticalCenter
-                        text: "›"
-                        color: Theme.textLabel
-                        font.family: Theme.fontUi
-                        font.pixelSize: Sizing.fontSize(4)
-                        renderType: Text.NativeRendering
-                    }
-                }
-            }
+                    Row {
+                        anchors.fill: parent
+                        anchors.leftMargin: Sizing.pctW(2)
+                        anchors.rightMargin: Sizing.pctW(2)
+                        spacing: Sizing.pctW(2)
 
-            // ── "About/License" entry ─────────────────────────────
-            Rectangle {
-                id: aboutEntry
+                        Text {
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: menuRow.modelData.label
+                            color: Theme.textPrimary
+                            font.family: Theme.fontUi
+                            font.pixelSize: Sizing.fontSize(2.8)
+                            renderType: Text.NativeRendering
+                            width: menuRow.width - Sizing.pctW(8)
+                            elide: Text.ElideRight
+                        }
 
-                width: parent.width
-                height: Sizing.pctH(8)
-                color: Theme.surfaceCard
-                radius: Sizing.cornerRadius
-                border.color: credits.focusIndex === 1 ? Theme.accent : Theme.borderMid
-                border.width: credits.focusIndex === 1 ? Sizing.stroke(2) : Sizing.stroke(1)
-
-                Row {
-                    anchors.fill: parent
-                    anchors.leftMargin: Sizing.pctW(2)
-                    anchors.rightMargin: Sizing.pctW(2)
-                    spacing: Sizing.pctW(2)
-
-                    Text {
-                        anchors.verticalCenter: parent.verticalCenter
-                        text: qsTr("About/License")
-                        color: Theme.textPrimary
-                        font.family: Theme.fontUi
-                        font.pixelSize: Sizing.fontSize(2.8)
-                        renderType: Text.NativeRendering
-                        width: aboutEntry.width - Sizing.pctW(8)
-                        elide: Text.ElideRight
-                    }
-
-                    Text {
-                        anchors.verticalCenter: parent.verticalCenter
-                        text: "›"
-                        color: Theme.textLabel
-                        font.family: Theme.fontUi
-                        font.pixelSize: Sizing.fontSize(4)
-                        renderType: Text.NativeRendering
+                        Text {
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: "›"
+                            color: Theme.textLabel
+                            font.family: Theme.fontUi
+                            font.pixelSize: Sizing.fontSize(4)
+                            renderType: Text.NativeRendering
+                        }
                     }
                 }
             }

@@ -37,6 +37,9 @@ ApplicationWindow {
     // ArtCade-fork: Credits & Acknowledgements.
     readonly property string screenCredits: ScreenManager.screenCredits
     readonly property string screenSponsors: ScreenManager.screenSponsors
+    readonly property string screenDevTeam: ScreenManager.screenDevTeam
+    readonly property string screenArtists: ScreenManager.screenArtists
+    readonly property string screenPotionsPixels: ScreenManager.screenPotionsPixels
 
     // Runtime state. `activeScreen` mirrors ScreenManager's property
     // (two-way synced below so direct assignment from tests still
@@ -91,6 +94,11 @@ ApplicationWindow {
     // aboutScreenRequested pattern. Sponsors is the destination
     // sibling of About reached from the Credits menu.
     property bool sponsorsScreenRequested: false
+    // ArtCade-fork: the three additional leaf screens added under
+    // the Credits menu. Same lifecycle as sponsorsScreenRequested.
+    property bool devTeamScreenRequested: false
+    property bool artistsScreenRequested: false
+    property bool potionsPixelsScreenRequested: false
     property bool cardWriteModalRequested: false
     property bool settingNeedsRestartModalRequested: false
     property bool contextMenuRequested: false
@@ -260,6 +268,9 @@ ApplicationWindow {
     // Connections + handleAction dispatch.
     property var creditsScreen: creditsScreenLoader.item
     property var sponsorsScreen: sponsorsScreenLoader.item
+    property var devTeamScreen: devTeamScreenLoader.item
+    property var artistsScreen: artistsScreenLoader.item
+    property var potionsPixelsScreen: potionsPixelsScreenLoader.item
     property var cardWriteModal: cardWriteModalLoader.item
     property var contextMenu: contextMenuLoader.item
     property var qrCodeModal: qrCodeModalLoader.item
@@ -708,6 +719,45 @@ ApplicationWindow {
                     visible: status === Loader.Ready && root.activeScreen === root.screenSponsors
                     sourceComponent: Component {
                         SponsorsScreen {
+                            anchors.fill: parent
+                            transitioning: root.pendingTransition !== ""
+                        }
+                    }
+                }
+
+                // ArtCade-fork: Dev Team / Artists / Potions & Pixels
+                // Loaders. Same lifecycle as sponsorsScreenLoader.
+                Loader {
+                    id: devTeamScreenLoader
+                    anchors.fill: parent
+                    active: root.devTeamScreenRequested
+                    visible: status === Loader.Ready && root.activeScreen === root.screenDevTeam
+                    sourceComponent: Component {
+                        DevTeamScreen {
+                            anchors.fill: parent
+                            transitioning: root.pendingTransition !== ""
+                        }
+                    }
+                }
+                Loader {
+                    id: artistsScreenLoader
+                    anchors.fill: parent
+                    active: root.artistsScreenRequested
+                    visible: status === Loader.Ready && root.activeScreen === root.screenArtists
+                    sourceComponent: Component {
+                        ArtistsScreen {
+                            anchors.fill: parent
+                            transitioning: root.pendingTransition !== ""
+                        }
+                    }
+                }
+                Loader {
+                    id: potionsPixelsScreenLoader
+                    anchors.fill: parent
+                    active: root.potionsPixelsScreenRequested
+                    visible: status === Loader.Ready && root.activeScreen === root.screenPotionsPixels
+                    sourceComponent: Component {
+                        PotionsPixelsScreen {
                             anchors.fill: parent
                             transitioning: root.pendingTransition !== ""
                         }
