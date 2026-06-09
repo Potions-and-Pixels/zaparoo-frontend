@@ -106,6 +106,9 @@ Item {
     signal requestFavoritesScreen
     signal requestRecentsScreen
     signal requestSettingsScreen
+    // ArtCade-fork: Credits & Acknowledgements screen — see CreditsScreen.qml
+    // and the Credits tile added to actionEntries below.
+    signal requestCreditsScreen
 
     // Vertically center the (categories row + actions row + activeLabel)
     // block in the band between the HeaderBar bottom (Sizing.headerBottom)
@@ -165,6 +168,20 @@ Item {
                 text: qsTr("Settings")
             });
         }
+        // ArtCade-fork: Credits & Acknowledgements tile. Always
+        // visible — no `hide_*` gate — because Credits is how the
+        // About / License entry stays reachable on kiosk cabinets
+        // that hide the Settings tile (legal-compliance posture:
+        // the Wizzo copyright notice + PolyForm license text must
+        // remain reachable in the distribution).
+        //
+        // Icon: filled Heart.svg — sponsor recognition / gratitude
+        // semantic. Distinct from Favorites' HeartOutline.svg.
+        entries.push({
+            id: "credits",
+            coverKey: "icons/Heart",
+            text: qsTr("Credits")
+        });
         return entries;
     }
 
@@ -423,6 +440,8 @@ Item {
             hub.requestRecentsScreen();
         else if (id === "settings")
             hub.requestSettingsScreen();
+        else if (id === "credits")
+            hub.requestCreditsScreen();
     }
 
     function handleAction(action: string): void {

@@ -14,6 +14,7 @@ const MODEL_FILES: &[&str] = &[
     "src/models/browse.rs",
     "src/models/app_state.rs",
     "src/models/build_info.rs",
+    "src/models/credits.rs",
     "src/models/app_status.rs",
     "src/models/hub_state.rs",
     "src/models/systems_state.rs",

@@ -23,6 +23,8 @@ qt_add_qml_module(
         RecentsScreen.qml
         SettingsScreen.qml
         AboutScreen.qml
+        CreditsScreen.qml
+        SponsorsScreen.qml
     IMPORTS
         Zaparoo.Ui
         Zaparoo.Theme

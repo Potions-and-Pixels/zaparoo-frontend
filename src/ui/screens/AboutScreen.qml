@@ -32,7 +32,17 @@ Item {
     // screens.
     property bool transitioning: false
 
+    // ArtCade-fork: dual-source navigation. AboutScreen can now be
+    // reached from EITHER Settings → About/License (the upstream
+    // path, `openedFromCredits === false`, default) OR from the
+    // Hub → Credits → "Zaparoo About & License" entry. Main.qml
+    // sets `openedFromCredits = true` before navigating to about
+    // from Credits, and the credits-side Connection resets it on
+    // arrival back at Credits — see Main.qml's about wiring.
+    property bool openedFromCredits: false
+
     signal requestSettingsScreen
+    signal requestCreditsScreen
 
     // True when the body Column overflows the Flickable viewport, so
     // the help bar can show the Up/Down scroll cue only when it's
@@ -56,8 +66,15 @@ Item {
             about._scrollBy(-Sizing.pctH(8));
         else if (action === "down")
             about._scrollBy(Sizing.pctH(8));
-        else if (action === "cancel")
-            about.requestSettingsScreen();
+        else if (action === "cancel") {
+            // Route back to whichever screen opened us. Settings is
+            // the upstream-compat default; Credits is set by
+            // Main.qml when navigating from the Hub → Credits path.
+            if (about.openedFromCredits)
+                about.requestCreditsScreen();
+            else
+                about.requestSettingsScreen();
+        }
     // accept and left/right are no-ops on a static page.
     }
 

@@ -120,6 +120,10 @@ MainLayout {
             root.settingsScreenRequested = true;
         else if (screen === root.screenAbout)
             root.aboutScreenRequested = true;
+        else if (screen === root.screenCredits)
+            root.creditsScreenRequested = true;
+        else if (screen === root.screenSponsors)
+            root.sponsorsScreenRequested = true;
     }
 
     function _primeStartupRestoreScreen(screen: string): void {
@@ -148,6 +152,10 @@ MainLayout {
             return root.settingsScreen;
         if (screen === root.screenAbout)
             return root.aboutScreen;
+        if (screen === root.screenCredits)
+            return root.creditsScreen;
+        if (screen === root.screenSponsors)
+            return root.sponsorsScreen;
         return root.hubScreen;
     }
 
@@ -245,7 +253,7 @@ MainLayout {
     }
 
     function _validStartupScreen(screen: string): string {
-        if (screen === root.screenHub || screen === root.screenSystems || screen === root.screenGames || screen === root.screenFavorites || screen === root.screenRecents || screen === root.screenSettings || screen === root.screenAbout)
+        if (screen === root.screenHub || screen === root.screenSystems || screen === root.screenGames || screen === root.screenFavorites || screen === root.screenRecents || screen === root.screenSettings || screen === root.screenAbout || screen === root.screenCredits || screen === root.screenSponsors)
             return screen;
         return "";
     }
@@ -753,6 +761,51 @@ MainLayout {
         });
     }
 
+    // Hub → Credits transition. Top-level Credits menu (two rows:
+    // "Sponsors" + "About/License"). Same shape as _navigateToAbout
+    // — no catalog gating since the menu rows are qsTr() statics.
+    function _navigateToCredits(): void {
+        root._whenScreenReady(root.screenCredits, function () {
+            root._goto(root.screenCredits);
+        });
+    }
+
+    // Credits → Sponsors transition. Scrollable card view rendered
+    // from /media/fat/zaparoo/credits/<slug>/ per-sponsor folders;
+    // cancel returns to Credits (sponsors screen's `cancel` signal
+    // is `requestCreditsScreen` — wired in the Connections block
+    // further down).
+    function _navigateToSponsors(): void {
+        root._whenScreenReady(root.screenSponsors, function () {
+            root._goto(root.screenSponsors);
+        });
+    }
+
+    // Credits → About transition. The catch on first entry: the
+    // aboutScreen Loader is lazy, so on the very first time we
+    // navigate here from the Credits path, `root.aboutScreen` is
+    // null at the moment we want to set `openedFromCredits = true`
+    // — by the time the Loader actually instantiates AboutScreen,
+    // the property has defaulted back to `false`, and cancel emits
+    // `requestSettingsScreen` instead of `requestCreditsScreen`.
+    // User-visible symptom (2026-06-08 dev cabinet): Credits →
+    // About → Cancel landed on Settings on the first round-trip
+    // even though the Credits-side connection had already set the
+    // flag.
+    //
+    // Fix: defer the flag set into the `_whenScreenReady` callback
+    // so it runs AFTER the Loader has materialized the AboutScreen
+    // item, not before. Subsequent entries (when the Loader is
+    // already active) still hit the same code path — the redundant
+    // assignment is cheap and keeps the entry idempotent.
+    function _navigateToAboutFromCredits(): void {
+        root._whenScreenReady(root.screenAbout, function () {
+            if (root.aboutScreen !== null)
+                root.aboutScreen.openedFromCredits = true;
+            root._goto(root.screenAbout);
+        });
+    }
+
     function _restoreSystemsScreenSelection(): void {
         const savedSystem = root.activeScreen === root.screenGames ? (Browse.GamesState.system_id !== "" ? Browse.GamesState.system_id : Browse.SystemsState.system_id) : Browse.SystemsState.system_id;
         const idx = savedSystem === "" ? -1 : Browse.SystemsModel.index_for_system_id(savedSystem);
@@ -1033,6 +1086,8 @@ MainLayout {
     onRecentsScreenChanged: root._flushScreenReady(root.screenRecents)
     onSettingsScreenChanged: root._flushScreenReady(root.screenSettings)
     onAboutScreenChanged: root._flushScreenReady(root.screenAbout)
+    onCreditsScreenChanged: root._flushScreenReady(root.screenCredits)
+    onSponsorsScreenChanged: root._flushScreenReady(root.screenSponsors)
 
     Connections {
         target: root.hubScreen
@@ -1050,6 +1105,9 @@ MainLayout {
         }
         function onRequestSettingsScreen(): void {
             root._navigateToSettings();
+        }
+        function onRequestCreditsScreen(): void {
+            root._navigateToCredits();
         }
     }
     Connections {
@@ -1089,6 +1147,55 @@ MainLayout {
         target: root.aboutScreen
         function onRequestSettingsScreen(): void {
             root._goto(root.screenSettings);
+        }
+        // ArtCade-fork: dual-source cancel routing. When About was
+        // opened from Credits (Credits-side accept handler sets
+        // `aboutScreen.openedFromCredits = true` before navigating),
+        // it emits requestCreditsScreen on cancel instead of
+        // requestSettingsScreen. Reset the flag here so a subsequent
+        // entry via Settings → About goes back to Settings as expected.
+        function onRequestCreditsScreen(): void {
+            if (root.aboutScreen !== null)
+                root.aboutScreen.openedFromCredits = false;
+            root._goto(root.screenCredits);
+        }
+    }
+    Connections {
+        target: root.creditsScreen
+        function onRequestHubScreen(): void {
+            root._goto(root.screenHub);
+        }
+        // Qt 6 typed signal handlers match the signal's parameter
+        // by NAME (not positional), so the param has to be `action`
+        // to align with CreditsScreen's `signal requestAccept(action: string)`.
+        // Using `actionId` silently never bound the handler — observed
+        // 2026-06-09 as "About/License entry can't be selected" on
+        // dev-simon-zap-03: Accept reached CreditsScreen.handleAction,
+        // the signal emitted, but the handler never fired because
+        // the parameter name mismatch broke the typed-handler match.
+        function onRequestAccept(action: string): void {
+            if (action === "sponsors") {
+                root._navigateToSponsors();
+            } else if (action === "aboutLicense") {
+                // Use the Credits-specific navigator — it defers
+                // the `openedFromCredits = true` flag set into the
+                // `_whenScreenReady` callback so the lazy About
+                // Loader has instantiated before the property is
+                // touched. Setting it on the null aboutScreen here
+                // (as we did pre-fix) silently no-ops on first
+                // entry → cancel returns to Settings instead of
+                // Credits.
+                root._navigateToAboutFromCredits();
+            }
+        }
+    }
+    Connections {
+        target: root.sponsorsScreen
+        // Sponsors → Credits return path. Only one navigable
+        // signal emitted from the sponsors screen (cancel); accept
+        // is a no-op on the static card view.
+        function onRequestCreditsScreen(): void {
+            root._goto(root.screenCredits);
         }
     }
     Connections {
@@ -2000,6 +2107,12 @@ MainLayout {
         } else if (root.activeScreen === root.screenAbout) {
             if (root.aboutScreen !== null)
                 root.aboutScreen.handleAction(action);
+        } else if (root.activeScreen === root.screenCredits) {
+            if (root.creditsScreen !== null)
+                root.creditsScreen.handleAction(action);
+        } else if (root.activeScreen === root.screenSponsors) {
+            if (root.sponsorsScreen !== null)
+                root.sponsorsScreen.handleAction(action);
         } else {
             root.hubScreen.handleAction(action);
         }

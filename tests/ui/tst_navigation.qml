@@ -191,15 +191,19 @@ TestCase {
     }
 
     // Bottom row wraps left/right. During optimistic boot the Hub has
-    // four placeholder categories and four actions (Resume still
-    // visible until history proves otherwise), so Down from top[0]
-    // lands at bottom[0].
+    // four placeholder categories and the action row has Resume
+    // (visible until history proves otherwise), Favorites, Recents,
+    // Settings, and the ArtCade-fork's Credits tile. With 5 actions
+    // vs 4 categories the centered visual-nearest map shifts Down
+    // from top[0] to bottom[1] (Math.round(0 - (4 - 5) / 2) === 1),
+    // so the wrap tests reset currentIndex explicitly to bottom[0]
+    // before exercising the wrap edges — keeps the assertion
+    // invariant of tile-row count.
     function test_bottom_row_right_wraps_to_first(): void {
         main.hubScreen.currentRow = 0;
         main.hubScreen.currentIndex = 0;
         main.handleKey(Qt.Key_Down);
         compare(main.hubScreen.currentRow, 1);
-        compare(main.hubScreen.currentIndex, 0, "Centered map of top[0] lands at bottom[0] while placeholder categories are visible");
         main.hubScreen.currentIndex = main.hubScreen.actionEntries.length - 1;
         main.handleKey(Qt.Key_Right);
         compare(main.hubScreen.currentIndex, 0, "Right at last bottom-row index wraps to first");
@@ -210,7 +214,9 @@ TestCase {
         main.hubScreen.currentIndex = 0;
         main.handleKey(Qt.Key_Down);
         compare(main.hubScreen.currentRow, 1);
-        compare(main.hubScreen.currentIndex, 0);
+        // Explicitly seed bottom[0] regardless of the visual map's
+        // landing — see the comment block above.
+        main.hubScreen.currentIndex = 0;
         main.handleKey(Qt.Key_Left);
         compare(main.hubScreen.currentIndex, main.hubScreen.actionEntries.length - 1, "Left at first bottom-row index wraps to last");
     }
@@ -284,10 +290,12 @@ TestCase {
         const moved = main.hubScreen._crossRow();
         verify(moved);
         compare(main.hubScreen.currentRow, 1);
-        // Optimistic Hub exposes four placeholder categories during
-        // test cold-start, and the action row has four entries while
-        // Resume is still unknown, so the visual map lands at bottom[0].
-        compare(main.hubScreen.currentIndex, 0, "Out-of-range saved index falls back to the visual map");
+        // Optimistic Hub exposes 4 placeholder categories on the top
+        // row and 5 action tiles on the bottom (Resume + Favorites +
+        // Recents + Settings + ArtCade-fork Credits). The centered
+        // visual map for top[0] is Math.round(0 - (4 - 5) / 2) === 1.
+        const expected = main.hubScreen._mapCrossRow(0, main.hubScreen.visibleCategoryEntries.length, main.hubScreen.actionEntries.length);
+        compare(main.hubScreen.currentIndex, expected, "Out-of-range saved index falls back to the visual map");
     }
 
     // resetFocus is the test-harness reset and the cold-launch state.

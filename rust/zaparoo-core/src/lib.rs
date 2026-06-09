@@ -4,6 +4,7 @@
 
 pub mod client;
 pub mod config;
+pub mod credits;
 pub mod endpoints;
 pub mod input_actions;
 pub mod logger;

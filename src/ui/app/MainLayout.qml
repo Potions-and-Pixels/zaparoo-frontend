@@ -34,6 +34,9 @@ ApplicationWindow {
     readonly property string screenRecents: ScreenManager.screenRecents
     readonly property string screenSettings: ScreenManager.screenSettings
     readonly property string screenAbout: ScreenManager.screenAbout
+    // ArtCade-fork: Credits & Acknowledgements.
+    readonly property string screenCredits: ScreenManager.screenCredits
+    readonly property string screenSponsors: ScreenManager.screenSponsors
 
     // Runtime state. `activeScreen` mirrors ScreenManager's property
     // (two-way synced below so direct assignment from tests still
@@ -81,6 +84,13 @@ ApplicationWindow {
     property bool recentsScreenRequested: false
     property bool settingsScreenRequested: false
     property bool aboutScreenRequested: false
+    // ArtCade-fork: lazy Loader gate for CreditsScreen. Mirrors the
+    // aboutScreenRequested pattern.
+    property bool creditsScreenRequested: false
+    // ArtCade-fork: lazy Loader gate for SponsorsScreen. Mirrors the
+    // aboutScreenRequested pattern. Sponsors is the destination
+    // sibling of About reached from the Credits menu.
+    property bool sponsorsScreenRequested: false
     property bool cardWriteModalRequested: false
     property bool settingNeedsRestartModalRequested: false
     property bool contextMenuRequested: false
@@ -246,6 +256,10 @@ ApplicationWindow {
     property var recentsScreen: recentsScreenLoader.item
     property var settingsScreen: settingsScreenLoader.item
     property var aboutScreen: aboutScreenLoader.item
+    // ArtCade-fork: expose CreditsScreen instance for Main.qml's
+    // Connections + handleAction dispatch.
+    property var creditsScreen: creditsScreenLoader.item
+    property var sponsorsScreen: sponsorsScreenLoader.item
     property var cardWriteModal: cardWriteModalLoader.item
     property var contextMenu: contextMenuLoader.item
     property var qrCodeModal: qrCodeModalLoader.item
@@ -660,6 +674,40 @@ ApplicationWindow {
                     visible: status === Loader.Ready && root.activeScreen === root.screenAbout
                     sourceComponent: Component {
                         AboutScreen {
+                            anchors.fill: parent
+                            transitioning: root.pendingTransition !== ""
+                        }
+                    }
+                }
+
+                // ArtCade-fork: Credits screen Loader. Mirrors the
+                // aboutScreenLoader pattern above — same lifecycle
+                // (lazy on first request, visible only when active).
+                Loader {
+                    id: creditsScreenLoader
+                    anchors.fill: parent
+                    active: root.creditsScreenRequested
+                    visible: status === Loader.Ready && root.activeScreen === root.screenCredits
+                    sourceComponent: Component {
+                        CreditsScreen {
+                            anchors.fill: parent
+                            transitioning: root.pendingTransition !== ""
+                        }
+                    }
+                }
+
+                // ArtCade-fork: Sponsors screen Loader. Sibling
+                // destination of CreditsScreen reached from the
+                // Credits menu's first row. Cancel returns to
+                // Credits, not the Hub — same dual-routing pattern
+                // AboutScreen uses for openedFromCredits.
+                Loader {
+                    id: sponsorsScreenLoader
+                    anchors.fill: parent
+                    active: root.sponsorsScreenRequested
+                    visible: status === Loader.Ready && root.activeScreen === root.screenSponsors
+                    sourceComponent: Component {
+                        SponsorsScreen {
                             anchors.fill: parent
                             transitioning: root.pendingTransition !== ""
                         }

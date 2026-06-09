@@ -63,6 +63,22 @@ pub fn state_file_path() -> PathBuf {
     }
 }
 
+/// Directory containing per-sponsor folders (see `credits` module).
+/// On `MiSTer` this is the install-bundled (or agent-synced) location
+/// alongside `frontend.toml`. On dev hosts it lands next to the
+/// dev config directory so contributors can manually drop a credits
+/// dir there to test the Credits screen without a real cabinet.
+pub fn credits_dir_path() -> PathBuf {
+    if runtime::current().is_mister() {
+        PathBuf::from("/media/fat/zaparoo/credits")
+    } else {
+        dirs_next::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("zaparoo")
+            .join("credits")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
