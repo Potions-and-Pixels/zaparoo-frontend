@@ -56,10 +56,12 @@ impl Initialize for ffi::DevTeam {
     fn initialize(mut self: Pin<&mut Self>) {
         let dev_team_dir = dev_team_dir_path();
         // load_credits reused — on-disk schema is identical (slug
-        // folder + metadata.toml + logo.png). Returned `Sponsor`
-        // entries hold the same name/blurb/logo_path fields the
-        // QML side wants.
-        let members = load_credits(&dev_team_dir);
+        // folder + metadata.toml + image file). Dev team members
+        // use `logo.png` (organisation/signature mark) like
+        // sponsors do, NOT `photo.png` like artists — preserves the
+        // existing on-disk layout the installer's bundled
+        // devteam/example/logo.png ships.
+        let members = load_credits(&dev_team_dir, "logo.png");
 
         info!(
             dev_team_dir = %dev_team_dir.display(),
@@ -74,7 +76,7 @@ impl Initialize for ffi::DevTeam {
 
         for member in members {
             names.append(QString::from(member.name.as_str()));
-            logos.append(QString::from(member.logo_path.to_string_lossy().as_ref()));
+            logos.append(QString::from(member.image_path.to_string_lossy().as_ref()));
             blurbs.append(QString::from(member.blurb.as_str()));
         }
 

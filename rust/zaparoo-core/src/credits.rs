@@ -2,11 +2,15 @@
 // Copyright (c) 2026 Wizzo Pty Ltd and the Zaparoo Project contributors.
 // SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0
 //
-// Credits / sponsorship loader. Reads per-sponsor folders from a
-// credits dir (canonically `/media/fat/zaparoo/credits/` on a MiSTer
-// cabinet) and returns a sorted `Vec<Sponsor>` for the QML side to
-// render. Each sponsor lives in its own folder with a `metadata.toml`
-// and a `logo.png`:
+// Credits loader — generic over Sponsor + Artist + future CreditEntry
+// surfaces. Reads per-entry folders from a directory (canonically
+// `/media/fat/zaparoo/{credits,artists}/` on a MiSTer cabinet) and
+// returns a sorted `Vec<Sponsor>` for the QML side to render. Each
+// entry lives in its own folder with a `metadata.toml` and a single
+// image file whose filename is configured per-caller:
+//
+//   - sponsors use `logo.png`
+//   - artists use `photo.png`
 //
 //     credits/
 //     ├── acme/
@@ -17,33 +21,45 @@
 //     │   └── logo.png
 //     └── ...
 //
-// The per-folder layout means adding a sponsor is "drop a folder" and
+//     artists/
+//     ├── jane-doe/
+//     │   ├── metadata.toml
+//     │   └── photo.png
+//     └── ...
+//
+// The per-folder layout means adding an entry is "drop a folder" and
 // removing is "rm the folder" — no central index file to keep in sync.
-// Phase-2 (CMS-managed sponsors with agent sync) writes the same
-// layout, so the frontend code stays identical across phases.
+// Phase-2 (CMS-managed entries with agent sync) writes the same
+// layout, so the frontend code stays identical across phases. The
+// struct field is `image_path` rather than `logo_path` so both
+// sponsors and artists round-trip cleanly through the same loader.
 
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use tracing::warn;
 
-/// One sponsor read from the credits dir. `logo_path` is the absolute
-/// path to `<credits>/<folder>/logo.png` regardless of whether the
-/// file exists — QML's `Image` element will gracefully render nothing
-/// for a missing source, which is the right behavior for the
+/// One credit entry read from disk. `image_path` is the absolute path
+/// to `<dir>/<folder>/<image_filename>` (i.e. `logo.png` for sponsors,
+/// `photo.png` for artists) regardless of whether the file exists —
+/// QML's `Image` element will gracefully render nothing for a
+/// missing source, which is the right behavior for the
 /// metadata-only case.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sponsor {
-    /// Subfolder name (`"acme"`, `"lowes"`, etc.). Stable across syncs;
-    /// used as the alphabetical-fallback sort key when `display_order`
-    /// is missing or tied.
+    /// Subfolder name (`"acme"`, `"jane-doe"`, etc.). Stable across
+    /// syncs; used as the alphabetical-fallback sort key when
+    /// `display_order` is missing or tied.
     pub folder: String,
     pub name: String,
     pub blurb: String,
     /// Optional explicit ordering. Lower values come first. `None`
-    /// sorts after every `Some(_)` (i.e. unordered sponsors at the
+    /// sorts after every `Some(_)` (i.e. unordered entries at the
     /// bottom of the list).
     pub display_order: Option<i64>,
-    pub logo_path: PathBuf,
+    /// Absolute path to the per-entry image file. The filename is
+    /// passed to `load_credits` as the `image_filename` parameter —
+    /// `logo.png` for sponsors, `photo.png` for artists.
+    pub image_path: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -53,32 +69,36 @@ struct RawSponsor {
     display_order: Option<i64>,
 }
 
-/// Walk `credits_dir`, parse every `<subdir>/metadata.toml`, and return
-/// the resulting sponsors sorted by `display_order` (ascending,
-/// `None` last) with alphabetical folder name as the tiebreak.
+/// Walk `dir`, parse every `<subdir>/metadata.toml`, and return the
+/// resulting entries sorted by `display_order` (ascending, `None`
+/// last) with alphabetical folder name as the tiebreak.
+///
+/// `image_filename` is the per-entry image basename to look for
+/// (e.g. `"logo.png"` for sponsors, `"photo.png"` for artists).
+/// The path is computed as `<dir>/<folder>/<image_filename>`
+/// regardless of whether the file actually exists — QML's `Image`
+/// renders nothing for a missing source, which is the right default
+/// when the operator dropped a metadata-only folder.
 ///
 /// Failure modes are all soft:
-/// - Missing `credits_dir` → empty vec. That's the right default for
-///   a non-ArtCade install of the fork (no credits content shipped).
+/// - Missing `dir` → empty vec. That's the right default for a
+///   non-ArtCade install of the fork (no content shipped).
 /// - Subdir without a `metadata.toml` → skip silently. Lets operators
-///   stash README files, screenshots, etc. in the credits dir without
-///   them being mistaken for sponsors.
-/// - Malformed `metadata.toml` → skip + `warn!`. One bad sponsor
+///   stash README files, screenshots, etc. in the dir without them
+///   being mistaken for entries.
+/// - Malformed `metadata.toml` → skip + `warn!`. One bad entry
 ///   shouldn't blank the whole screen.
 ///
 /// Reading errors (permission denied on the dir, etc.) are also
 /// returned as empty + warn. Anything more aggressive would create
 /// an unrecoverable startup failure for a screen that's supposed
 /// to be informational.
-pub fn load_credits(credits_dir: &Path) -> Vec<Sponsor> {
-    let entries = match std::fs::read_dir(credits_dir) {
+pub fn load_credits(dir: &Path, image_filename: &str) -> Vec<Sponsor> {
+    let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(err) => {
             if err.kind() != std::io::ErrorKind::NotFound {
-                warn!(
-                    "credits dir read failed at {}: {err}",
-                    credits_dir.display()
-                );
+                warn!("credit dir read failed at {}: {err}", dir.display());
             }
             return Vec::new();
         }
@@ -98,7 +118,7 @@ pub fn load_credits(credits_dir: &Path) -> Vec<Sponsor> {
             if folder.starts_with('.') {
                 return None;
             }
-            load_sponsor(&path, folder)
+            load_entry(&path, folder, image_filename)
         })
         .collect();
 
@@ -117,17 +137,17 @@ pub fn load_credits(credits_dir: &Path) -> Vec<Sponsor> {
     sponsors
 }
 
-fn load_sponsor(folder_path: &Path, folder: String) -> Option<Sponsor> {
+fn load_entry(folder_path: &Path, folder: String, image_filename: &str) -> Option<Sponsor> {
     let metadata_path = folder_path.join("metadata.toml");
     let src = match std::fs::read_to_string(&metadata_path) {
         Ok(s) => s,
         Err(err) => {
             // Only `warn!` if the file exists but we can't read it —
             // a subdir with no metadata.toml is the legitimate "this
-            // isn't a sponsor folder" case (README dir, screenshots,
+            // isn't a credit folder" case (README dir, screenshots,
             // operator notes, etc.).
             if err.kind() != std::io::ErrorKind::NotFound {
-                warn!("credits/{folder}: could not read metadata.toml ({err})");
+                warn!("{folder}: could not read metadata.toml ({err})");
             }
             return None;
         }
@@ -135,13 +155,13 @@ fn load_sponsor(folder_path: &Path, folder: String) -> Option<Sponsor> {
     let raw: RawSponsor = match toml::from_str(&src) {
         Ok(r) => r,
         Err(err) => {
-            warn!("credits/{folder}: malformed metadata.toml — sponsor skipped ({err})");
+            warn!("{folder}: malformed metadata.toml — entry skipped ({err})");
             return None;
         }
     };
     let trimmed_name = raw.name.trim();
     if trimmed_name.is_empty() {
-        warn!("credits/{folder}: metadata.toml has empty `name` — sponsor skipped");
+        warn!("{folder}: metadata.toml has empty `name` — entry skipped");
         return None;
     }
     Some(Sponsor {
@@ -149,7 +169,7 @@ fn load_sponsor(folder_path: &Path, folder: String) -> Option<Sponsor> {
         name: trimmed_name.to_string(),
         blurb: raw.blurb.trim().to_string(),
         display_order: raw.display_order,
-        logo_path: folder_path.join("logo.png"),
+        image_path: folder_path.join(image_filename),
     })
 }
 
@@ -179,14 +199,14 @@ mod tests {
     #[test]
     fn missing_credits_dir_returns_empty_vec() {
         let tmp = TempDir::new().unwrap();
-        let result = load_credits(&tmp.path().join("nonexistent"));
+        let result = load_credits(&tmp.path().join("nonexistent"), "logo.png");
         assert_eq!(result, vec![]);
     }
 
     #[test]
     fn empty_credits_dir_returns_empty_vec() {
         let tmp = TempDir::new().unwrap();
-        let result = load_credits(tmp.path());
+        let result = load_credits(tmp.path(), "logo.png");
         assert_eq!(result, vec![]);
     }
 
@@ -215,13 +235,13 @@ mod tests {
             "#,
             true,
         );
-        let result = load_credits(tmp.path());
+        let result = load_credits(tmp.path(), "logo.png");
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].folder, "acme");
         assert_eq!(result[0].name, "Acme Foundation");
         assert_eq!(result[0].display_order, Some(1));
         assert_eq!(
-            result[0].logo_path,
+            result[0].image_path,
             tmp.path().join("acme").join("logo.png")
         );
         assert_eq!(result[1].folder, "lowes");
@@ -248,7 +268,7 @@ mod tests {
             "name = \"Ordered\"\nblurb = \"\"\ndisplay_order = 5\n",
             false,
         );
-        let result = load_credits(tmp.path());
+        let result = load_credits(tmp.path(), "logo.png");
         assert_eq!(
             result.iter().map(|s| s.folder.as_str()).collect::<Vec<_>>(),
             vec!["ordered", "alpha", "zeta"],
@@ -274,7 +294,7 @@ mod tests {
             "name = \"Alpha\"\nblurb = \"\"\ndisplay_order = 1\n",
             false,
         );
-        let result = load_credits(tmp.path());
+        let result = load_credits(tmp.path(), "logo.png");
         assert_eq!(
             result.iter().map(|s| s.folder.as_str()).collect::<Vec<_>>(),
             vec!["alpha", "beta"]
@@ -291,7 +311,7 @@ mod tests {
         fs::create_dir(tmp.path().join("docs")).unwrap();
         fs::write(tmp.path().join("docs").join("README.md"), "notes").unwrap();
         make_sponsor(tmp.path(), "acme", "name = \"Acme\"\nblurb = \"\"\n", true);
-        let result = load_credits(tmp.path());
+        let result = load_credits(tmp.path(), "logo.png");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].folder, "acme");
     }
@@ -309,7 +329,7 @@ mod tests {
             false,
         );
         make_sponsor(tmp.path(), "good", "name = \"Good\"\nblurb = \"\"\n", false);
-        let result = load_credits(tmp.path());
+        let result = load_credits(tmp.path(), "logo.png");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].folder, "good");
     }
@@ -326,7 +346,7 @@ mod tests {
             "name = \"   \"\nblurb = \"x\"\n",
             false,
         );
-        let result = load_credits(tmp.path());
+        let result = load_credits(tmp.path(), "logo.png");
         assert_eq!(result, vec![]);
     }
 
@@ -344,7 +364,7 @@ mod tests {
         )
         .unwrap();
         make_sponsor(tmp.path(), "real", "name = \"Real\"\nblurb = \"\"\n", false);
-        let result = load_credits(tmp.path());
+        let result = load_credits(tmp.path(), "logo.png");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].folder, "real");
     }
@@ -359,7 +379,7 @@ mod tests {
         fs::write(tmp.path().join("README.md"), "hi").unwrap();
         fs::write(tmp.path().join("notes.txt"), "hi").unwrap();
         make_sponsor(tmp.path(), "acme", "name = \"Acme\"\nblurb = \"\"\n", false);
-        let result = load_credits(tmp.path());
+        let result = load_credits(tmp.path(), "logo.png");
         assert_eq!(result.len(), 1);
     }
 
@@ -377,14 +397,14 @@ mod tests {
             "name = \"Acme\"\nblurb = \"\"\n",
             false, // no logo file
         );
-        let result = load_credits(tmp.path());
+        let result = load_credits(tmp.path(), "logo.png");
         assert_eq!(result.len(), 1);
         assert_eq!(
-            result[0].logo_path,
+            result[0].image_path,
             tmp.path().join("acme").join("logo.png")
         );
         assert!(
-            !result[0].logo_path.exists(),
+            !result[0].image_path.exists(),
             "the path is computed even when the file is absent"
         );
     }

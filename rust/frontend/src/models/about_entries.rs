@@ -61,8 +61,10 @@ impl Initialize for ffi::About {
         // load_credits reused — on-disk schema is identical. The
         // returned `Sponsor::name` maps to the section TITLE here
         // and `Sponsor::blurb` to the section BODY (just a naming
-        // difference on the QML side; same underlying data).
-        let sections = load_credits(&about_dir);
+        // difference on the QML side; same underlying data). About
+        // sections use `logo.png` for the optional section image
+        // (matches the installer-bundled about/example/logo.png).
+        let sections = load_credits(&about_dir, "logo.png");
 
         info!(
             about_dir = %about_dir.display(),
@@ -77,7 +79,7 @@ impl Initialize for ffi::About {
 
         for section in sections {
             titles.append(QString::from(section.name.as_str()));
-            logos.append(QString::from(section.logo_path.to_string_lossy().as_ref()));
+            logos.append(QString::from(section.image_path.to_string_lossy().as_ref()));
             bodies.append(QString::from(section.blurb.as_str()));
         }
 

@@ -66,7 +66,8 @@ pub mod ffi {
 impl Initialize for ffi::Credits {
     fn initialize(mut self: Pin<&mut Self>) {
         let credits_dir = credits_dir_path();
-        let sponsors = load_credits(&credits_dir);
+        // Sponsors use `logo.png` per the long-standing convention.
+        let sponsors = load_credits(&credits_dir, "logo.png");
 
         // Surfaced in /tmp/zaparoo/frontend.log on MiSTer. Lets us
         // diagnose "no sponsors shown" cases by SSH'ing in and
@@ -94,7 +95,7 @@ impl Initialize for ffi::Credits {
             // and the lossy fallback would only matter if an operator
             // dropped a folder with non-UTF-8 bytes (which their host
             // filesystem already rejects on macOS/Linux).
-            logos.append(QString::from(sponsor.logo_path.to_string_lossy().as_ref()));
+            logos.append(QString::from(sponsor.image_path.to_string_lossy().as_ref()));
             blurbs.append(QString::from(sponsor.blurb.as_str()));
         }
 

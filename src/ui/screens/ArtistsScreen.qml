@@ -148,8 +148,8 @@ Item {
                                     anchors.centerIn: parent
                                     width: parent.width
                                     height: parent.height
-                                    source: Browse.Artists.artist_logo_paths[artistCard.index]
-                                            ? "file://" + Browse.Artists.artist_logo_paths[artistCard.index]
+                                    source: Browse.Artists.artist_photo_paths[artistCard.index]
+                                            ? "file://" + Browse.Artists.artist_photo_paths[artistCard.index]
                                             : ""
                                     fillMode: Image.PreserveAspectFit
                                     asynchronous: true

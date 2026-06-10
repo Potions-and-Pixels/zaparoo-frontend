@@ -5,9 +5,17 @@
 // `Browse.Artists` — per-artist contributors surfaced to QML for the
 // Artists subscreen of Credits. Same shape as `Browse.Credits`
 // (sponsors): index-aligned `QStringList`s populated at `Initialize`
-// time from disk. The data shape is literally identical, so we reuse
-// the `zaparoo_core::credits::load_credits` loader and just hand it
-// a different dir (`/media/fat/zaparoo/artists/`).
+// time from disk. Reuses the `zaparoo_core::credits::load_credits`
+// loader with a different dir (`/media/fat/zaparoo/artists/`) and a
+// different per-entry image filename (`photo.png`).
+//
+// User-facing field naming differs from sponsors — artists have a
+// "photo" (portrait/headshot) rather than a "logo" (organizational
+// mark). The QML qproperty names + on-disk filename reflect that:
+//   - Browse.Artists.artist_photo_paths    (this file)
+//   - /media/fat/zaparoo/artists/<slug>/photo.png   (on-disk)
+//   - CMS Artists collection's `photo` Media field  (CMS side)
+//   - operational endpoint serves `photoUrl`        (wire)
 //
 // READ + CONSTANT — same lifecycle as `Browse.Credits` (and
 // `Browse.BuildInfo`). Operators editing the artists dir on the
@@ -28,7 +36,7 @@ use zaparoo_core::platform_paths::artists_dir_path;
 #[derive(Default)]
 pub struct ArtistsRust {
     artist_names: QStringList,
-    artist_logo_paths: QStringList,
+    artist_photo_paths: QStringList,
     artist_blurbs: QStringList,
 }
 
@@ -49,7 +57,7 @@ pub mod ffi {
         // — see ArtistsScreen.qml. READ + CONSTANT + FINAL because the
         // lists are seeded once at Initialize from disk and never mutate.
         #[qproperty(QStringList, artist_names, READ, CONSTANT, FINAL)]
-        #[qproperty(QStringList, artist_logo_paths, READ, CONSTANT, FINAL)]
+        #[qproperty(QStringList, artist_photo_paths, READ, CONSTANT, FINAL)]
         #[qproperty(QStringList, artist_blurbs, READ, CONSTANT, FINAL)]
         type Artists = super::ArtistsRust;
     }
@@ -60,11 +68,11 @@ pub mod ffi {
 impl Initialize for ffi::Artists {
     fn initialize(mut self: Pin<&mut Self>) {
         let artists_dir = artists_dir_path();
-        // load_credits is intentionally reused — the on-disk schema
-        // is identical to the sponsors layout. The returned vec has
-        // `folder` / `name` / `blurb` / `logo_path` regardless of
-        // whether the source is sponsors or artists.
-        let artists = load_credits(&artists_dir);
+        // load_credits reused — the on-disk schema is identical to
+        // sponsors. We pass `photo.png` as the per-entry image
+        // filename so the loader picks up the artist portrait at
+        // `<slug>/photo.png` rather than the sponsor `logo.png`.
+        let artists = load_credits(&artists_dir, "photo.png");
 
         info!(
             artists_dir = %artists_dir.display(),
@@ -74,7 +82,7 @@ impl Initialize for ffi::Artists {
         );
 
         let mut names = QStringList::default();
-        let mut logos = QStringList::default();
+        let mut photos = QStringList::default();
         let mut blurbs = QStringList::default();
 
         for artist in artists {
@@ -82,13 +90,13 @@ impl Initialize for ffi::Artists {
             // Absolute path; QML `Image { source: ... }` resolves it
             // automatically. `to_string_lossy` is correct here —
             // FAT32 + ext4 artist folder names are ASCII in practice.
-            logos.append(QString::from(artist.logo_path.to_string_lossy().as_ref()));
+            photos.append(QString::from(artist.image_path.to_string_lossy().as_ref()));
             blurbs.append(QString::from(artist.blurb.as_str()));
         }
 
         let mut rust = self.as_mut().rust_mut();
         rust.artist_names = names;
-        rust.artist_logo_paths = logos;
+        rust.artist_photo_paths = photos;
         rust.artist_blurbs = blurbs;
     }
 }
