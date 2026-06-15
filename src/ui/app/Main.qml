@@ -459,6 +459,14 @@ MainLayout {
     property string _pendingFolderBackTargetPath: ""
     property string _pendingFolderBackSystemId: ""
     property var _folderBackReadyCallback: null
+    // System-cover prefetch gate. `_prefetchSystemCovers` populates
+    // `_systemCoverPrefetchUrls` with the first-page logos and stores the
+    // completion callback in `_systemCoverPrefetchCallback`. When every
+    // Image signals Ready/Error (or `systemCoverPrefetchTimer` expires),
+    // `_completePrefetchSystemCovers` fires the callback and clears state.
+    property var _systemCoverPrefetchUrls: []
+    property var _systemCoverPrefetchCallback: null
+    property int _systemCoverPrefetchPending: 0
 
     function _catalogStillBooting(): bool {
         return !Browse.CategoriesModel.loaded && (Browse.CategoriesModel.error_message ?? "") === "";
@@ -622,12 +630,9 @@ MainLayout {
     // populated — a re-Accept after Esc-back); the set_category call
     // is still made for parity with the prior behaviour even though
     // Rust early-returns when the category already matches. Async
-    // path waits for loadingChanged. When replacing an already-populated
-    // SystemsModel during a transition, defer until the delayed loading cue
-    // has had one frame to paint; otherwise set_category's synchronous
-    // delegate teardown can freeze the GUI before any feedback appears.
-    // Qt.callLater is not enough; it fires inside the same event loop
-    // iteration before the next render polish/sync pass.
+    // path waits for loadingChanged. The timer keeps the loadingChanged
+    // bookkeeping on the same asynchronous path without deliberately
+    // holding the transition long enough to show the global loading cue.
     function _ensureCategory(category: string, cb, waitForCatalog): void {
         if (waitForCatalog && root._catalogStillBooting()) {
             root._startupTrace("startup/qml catalog wait arm", "category=" + category);
@@ -645,7 +650,7 @@ MainLayout {
         root._categoryReadyCallback = cb;
         root._deferredCategoryPending = true;
         deferredCategorySetTimer.targetCategory = category;
-        deferredCategorySetTimer.interval = root.pendingTransition !== "" && Browse.SystemsModel.count > 0 ? root.loadingIndicatorDelayMs + 50 : 50;
+        deferredCategorySetTimer.interval = 1;
         deferredCategorySetTimer.restart();
     }
 
@@ -1380,10 +1385,12 @@ MainLayout {
         }
         if (owner === "categories") {
             const mediaBusy = Browse.MediaStatus.indexing || Browse.MediaStatus.optimizing || Browse.MediaStatus.scraping;
-            const entries = [{
-                id: "toggle_hide_category",
-                label: isHidden ? qsTr("Unhide") : qsTr("Hide")
-            }];
+            const entries = [
+                {
+                    id: "toggle_hide_category",
+                    label: isHidden ? qsTr("Unhide") : qsTr("Hide")
+                }
+            ];
             if (!mediaBusy) {
                 entries.push({
                     id: "index_category",
@@ -2606,104 +2613,71 @@ MainLayout {
                 }
             }
         }
-    }
 
-    // Hidden cover-decode loop driven by `_prefetchSystemCovers`.
-    // While `active`, mounts an Image per SystemsModel row using
-    // the same `source` / `sourceSize.width` / `cache` /
-    // `asynchronous` settings as Tile.qml's cover Image so the
-    // prefetch and the visible Tile share a QPixmapCache slot.
-    // As each Image hits Ready or Error, the delegate calls back
-    // into `_onCoverDecoded`, which fires the doneCallback and
-    // unwinds once every cover is counted. Without this warmup
-    // the destination SystemsScreen paints with each Tile showing
-    // its procedural text fallback for tens of ms while the PNG
-    // decodes — the visible "text → logo pop-in" the deferred
-    // flip alone can't fix.
-    //
-    // Bounded by `systemsCoverPrefetchTimeout` so a missing PNG
-    // (silent decode failure that doesn't emit Image.Error) or a
-    // genuinely stuck async load never strands the user on the
-    // loading overlay.
-    Item {
-        id: systemsCoverPrefetcher
-        visible: false
-        property bool active: false
-        property var doneCallback: null
-        property int total: 0
-        property int done: 0
-
-        function _markDone(): void {
-            systemsCoverPrefetcher.done++;
-            if (systemsCoverPrefetcher.done >= systemsCoverPrefetcher.total) {
-                systemsCoverPrefetcher.active = false;
-                systemsCoverPrefetchTimeout.stop();
-                const cb = systemsCoverPrefetcher.doneCallback;
-                systemsCoverPrefetcher.doneCallback = null;
-                if (cb !== null)
-                    cb();
-            }
-        }
-
+        // Hidden Image pool driven by `_prefetchSystemCovers`. Each Image
+        // renders the tinted SVG logo off-screen at the same sourceSize as
+        // the visible Tile so they share one QPixmapCache entry. When every
+        // Image signals Ready or Error, `_systemCoverPrefetchPending` reaches
+        // zero and `_completePrefetchSystemCovers` fires the transition
+        // callback. `_systemCoverPrefetchUrls` is reset to [] when the gate
+        // resolves, which destroys the delegates immediately. No background
+        // fill is added — this Item is already a transparent overlay.
         Repeater {
-            model: systemsCoverPrefetcher.active ? Browse.SystemsModel : null
+            model: root._systemCoverPrefetchUrls
             delegate: Image {
-                required property string coverKey
-                source: coverKey === "" ? "" : Resources.coverUrl(coverKey)
+                required property url modelData
+                source: modelData
                 sourceSize.width: 256
                 asynchronous: true
-                cache: true
-
-                // Each delegate contributes exactly once.
-                // Component.onCompleted catches a synchronous Ready
-                // (cache hit during construction); onStatusChanged
-                // catches the normal async path. `_counted` dedupes
-                // so a delegate whose status flips Null → Ready
-                // inside construction (and again as the binding
-                // settles) tallies once.
-                property bool _counted: false
-                function _markDone(): void {
-                    if (_counted)
-                        return;
-                    _counted = true;
-                    systemsCoverPrefetcher._markDone();
-                }
-
-                Component.onCompleted: {
-                    if (status === Image.Ready || status === Image.Error || coverKey === "")
-                        _markDone();
-                }
+                visible: false
+                width: 0
+                height: 0
                 onStatusChanged: {
-                    if (status === Image.Ready || status === Image.Error)
-                        _markDone();
+                    if (status !== Image.Ready && status !== Image.Error)
+                        return;
+                    root._systemCoverPrefetchPending = Math.max(0, root._systemCoverPrefetchPending - 1);
+                    if (root._systemCoverPrefetchPending <= 0)
+                        root._completePrefetchSystemCovers();
                 }
             }
         }
     }
 
+    // System-cover prefetch gate. Holds the "Loading systems…" transition
+    // overlay until the first visible page of tinted SVG logos has decoded
+    // (or the cap timer fires), then calls cb(). This ensures the Systems
+    // grid reveals fully painted instead of showing name-text placeholders
+    // that pop into logos one-by-one. Fast/re-entry navigations complete
+    // within the 300ms DelayedLoadingIndicator threshold so no cue appears.
+    // The hidden prefetch Repeater lives in the transition-cue Item above;
+    // it watches `_systemCoverPrefetchUrls` and reports back via
+    // `_systemCoverPrefetchPending`.
     function _prefetchSystemCovers(cb): void {
-        systemsCoverPrefetcher.total = Browse.SystemsModel.count;
-        systemsCoverPrefetcher.done = 0;
-        if (systemsCoverPrefetcher.total === 0) {
+        const pageSize = Sizing.visibleCovers * 4;
+        const count = Math.min(Browse.SystemsModel.count, pageSize);
+        if (count === 0) {
             cb();
             return;
         }
-        systemsCoverPrefetcher.doneCallback = cb;
-        systemsCoverPrefetcher.active = true;
-        systemsCoverPrefetchTimeout.restart();
+        const urls = [];
+        for (let i = 0; i < count; ++i) {
+            const sysId = Browse.SystemsModel.system_id_at(i);
+            urls.push(Resources.coverUrl("systems/" + sysId, Theme.logoPrimary, Theme.logoSecondary, Theme.logoShadow));
+        }
+        root._systemCoverPrefetchCallback = cb;
+        root._systemCoverPrefetchPending = urls.length;
+        root._systemCoverPrefetchUrls = urls;
+        systemCoverPrefetchTimer.restart();
     }
 
-    Timer {
-        id: systemsCoverPrefetchTimeout
-        interval: 1500
-        repeat: false
-        onTriggered: {
-            systemsCoverPrefetcher.active = false;
-            const cb = systemsCoverPrefetcher.doneCallback;
-            systemsCoverPrefetcher.doneCallback = null;
-            if (cb !== null)
-                cb();
-        }
+    function _completePrefetchSystemCovers(): void {
+        systemCoverPrefetchTimer.stop();
+        root._systemCoverPrefetchUrls = [];
+        root._systemCoverPrefetchPending = 0;
+        const cb = root._systemCoverPrefetchCallback;
+        root._systemCoverPrefetchCallback = null;
+        if (cb !== null)
+            cb();
     }
 
     Timer {
@@ -2739,6 +2713,19 @@ MainLayout {
         interval: root.loadingIndicatorDelayMs + 50
         repeat: false
         onTriggered: root._completeFolderBackTransition()
+    }
+
+    // Safety cap for the system-cover prefetch gate. If some logos haven't
+    // decoded by this deadline they paint in after the screen reveals,
+    // identical to the Games cover-gate timeout behavior. Cap = 300ms
+    // (loadingIndicatorDelayMs) — logos that land faster than the
+    // DelayedLoadingIndicator threshold complete the transition silently;
+    // logos that are slower get a brief "Loading systems…" cue then pop in.
+    Timer {
+        id: systemCoverPrefetchTimer
+        interval: root.loadingIndicatorDelayMs
+        repeat: false
+        onTriggered: root._completePrefetchSystemCovers()
     }
 
     // Deferred set_category trigger. When the existing model has rows,
