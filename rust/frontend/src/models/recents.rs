@@ -73,7 +73,6 @@ const COVER_PREFETCH_CURSOR_NEXT: i32 = 4;
 const COVER_PREFETCH_CURSOR_PREV: i32 = 2;
 const RESUME_FALLBACK_COVER_KEY: &str = "icons/PlayOutline";
 
-#[derive(Default)]
 #[allow(
     clippy::struct_excessive_bools,
     reason = "the bools are independent qproperties surfaced to QML; collapsing them \
@@ -147,6 +146,47 @@ pub struct RecentsModelRust {
     // thread between sleep-completion and abort.
     cover_gate_seq: Arc<AtomicU64>,
     nav_timing: Option<NavTiming>,
+}
+
+impl Default for RecentsModelRust {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            count: 0,
+            loading: false,
+            loading_more: false,
+            error_message: QString::default(),
+            has_next_page: false,
+            next_cursor: None,
+            resume_available: false,
+            resume_loading: false,
+            resume_name: QString::default(),
+            resume_cover_key: QString::default(),
+            resume_entry: None,
+            resume_requested: false,
+            resume_seq: Arc::new(AtomicU64::new(0)),
+            history_requested: false,
+            history_fetching: false,
+            history_subscription: None,
+            current_detail_loading: false,
+            current_detail_tags: QString::default(),
+            current_detail_image_key: QString::default(),
+            detail_prefetch_key_next: QString::default(),
+            detail_prefetch_key_prev: QString::default(),
+            detail_prefetch_row: None,
+            cover_requests_paused: true,
+            show_original_filenames: false,
+            current_detail_media_key: None,
+            current_detail_media_id: None,
+            detail_seq: Arc::new(AtomicU64::new(0)),
+            seq: Arc::new(AtomicU64::new(0)),
+            cover_subscription: None,
+            pending_first_paint_keys: HashSet::new(),
+            cover_gate_timer: None,
+            cover_gate_seq: Arc::new(AtomicU64::new(0)),
+            nav_timing: None,
+        }
+    }
 }
 
 #[cxx_qt::bridge]

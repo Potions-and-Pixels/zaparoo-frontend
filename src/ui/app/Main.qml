@@ -89,17 +89,17 @@ MainLayout {
     // all flip together regardless of which screen is mounted. Each model's
     // setter re-emits dataChanged so already-built delegates refresh in place.
     Binding {
-        target: Browse.GamesModel
+        target: (root.gamesScreenRequested || root.activeScreen === root.screenGames) ? Browse.GamesModel : null
         property: "show_original_filenames"
         value: Browse.Settings.current_show_original_filenames
     }
     Binding {
-        target: Browse.FavoritesModel
+        target: (root.favoritesScreenRequested || root.activeScreen === root.screenFavorites) ? Browse.FavoritesModel : null
         property: "show_original_filenames"
         value: Browse.Settings.current_show_original_filenames
     }
     Binding {
-        target: Browse.RecentsModel
+        target: (root._firstFrameSeen || root.recentsScreenRequested || root.activeScreen === root.screenRecents) ? Browse.RecentsModel : null
         property: "show_original_filenames"
         value: Browse.Settings.current_show_original_filenames
     }
@@ -116,7 +116,10 @@ MainLayout {
     readonly property int _gamesGridColumns: root._gamesGridShape.columns
     readonly property int _gamesGridRows: root._gamesGridShape.rows
     readonly property int _gamesPageSize: Browse.Settings.current_browse_layout === "list" ? root._gamesListFetchSize : root._gamesGridColumns * root._gamesGridRows
-    on_GamesPageSizeChanged: Browse.GamesModel.page_size = root._gamesPageSize
+    on_GamesPageSizeChanged: {
+        if (root.gamesScreenRequested || root.activeScreen === root.screenGames)
+            root._syncGamesModelLayout();
+    }
     // Maximum cover dimension requested from Core. Computed from the tile
     // pixel size with 2x headroom so the resized image looks sharp even
     // when the grid zooms slightly. Core fits the image within a
@@ -127,7 +130,10 @@ MainLayout {
         const tileH = Math.ceil(Sizing.screenHeight / Math.max(1, root._gamesGridRows));
         return Math.max(tileW, tileH) * 2;
     }
-    on_GamesCoverMaxSizeChanged: Browse.GamesModel.set_cover_max_size(root._gamesCoverMaxSize)
+    on_GamesCoverMaxSizeChanged: {
+        if (root.gamesScreenRequested || root.activeScreen === root.screenGames)
+            root._syncGamesModelLayout();
+    }
 
     // Bind Sizing to the scene's logical dimensions, not the
     // ApplicationWindow's. Outside CRT preview the scene fills the
@@ -149,9 +155,10 @@ MainLayout {
     function _requestScreen(screen: string): void {
         if (screen === root.screenSystems)
             root.systemsScreenRequested = true;
-        else if (screen === root.screenGames)
+        else if (screen === root.screenGames) {
             root.gamesScreenRequested = true;
-        else if (screen === root.screenFavorites)
+            root._syncGamesModelLayout();
+        } else if (screen === root.screenFavorites)
             root.favoritesScreenRequested = true;
         else if (screen === root.screenRecents)
             root.recentsScreenRequested = true;
@@ -161,17 +168,9 @@ MainLayout {
             root.aboutScreenRequested = true;
     }
 
-    function _primeStartupRestoreScreen(screen: string): void {
-        if (screen === root.screenSystems) {
-            root._requestScreen(root.screenSystems);
-            return;
-        }
-        if (screen === root.screenGames) {
-            root._requestScreen(root.screenSystems);
-            root._requestScreen(root.screenGames);
-            return;
-        }
-        root._requestScreen(screen);
+    function _syncGamesModelLayout(): void {
+        Browse.GamesModel.page_size = root._gamesPageSize;
+        Browse.GamesModel.set_cover_max_size(root._gamesCoverMaxSize);
     }
 
     function _screenItem(screen: string): var {
@@ -250,31 +249,26 @@ MainLayout {
         if (!root.fullScreen && root._crtPreviewActive) {
             root.applyCrtPreviewScale(root._crtPreviewInitialScale);
         }
-        Browse.GamesModel.page_size = root._gamesPageSize;
         const savedScreen = root._validStartupScreen(Browse.AppState.active_screen);
-        root.startupRestoreCurtainVisible = savedScreen !== "" && savedScreen !== root.screenHub;
-        if (root.startupRestoreCurtainVisible) {
+        root.activeScreen = root.screenHub;
+        if (savedScreen !== "" && savedScreen !== root.screenHub) {
             root._startupRestorePending = true;
             root._startupRestoreScreen = savedScreen;
-            root._primeStartupRestoreScreen(savedScreen);
-            root.activeScreen = savedScreen;
-            startupRestoreKickTimer.restart();
-        } else {
-            root.activeScreen = root.screenHub;
+            // Raise the curtain before first paint so the ghost Hub never
+            // shows during a warm resume of a non-Hub screen. The screen
+            // stack hides (MainLayout `visible: !startupRestoreCurtainVisible`)
+            // and only the "Loading xxx…" cue paints until
+            // `_finishStartupRestore()` lifts the curtain onto the target.
+            // Cold boots that land on Hub leave the curtain down, so the
+            // ghost Hub still paints there as before.
+            root.startupRestoreCurtainVisible = true;
         }
         root._startupTrace("startup/qml Component.onCompleted", "savedScreen=" + savedScreen, "initialActiveScreen=" + root.activeScreen, "startupRestorePending=" + root._startupRestorePending, "connectionState=" + Browse.AppStatus.connection_state);
-        Browse.FavoritesModel.cover_requests_paused = root.activeScreen !== root.screenFavorites;
-        Browse.RecentsModel.cover_requests_paused = root.activeScreen !== root.screenRecents;
-        // Fire the restore here so focus is seated and marked ready before
-        // first paint. When the catalog is already ready the cascade
-        // (set_category → SystemsModel reset → seed currentIndex →
-        // set_system → GamesModel reset) also lands now. On a cold boot the
-        // catalog is empty (it is in-memory only, never persisted), so the
-        // call only marks focus ready — without it the Hub paints with no
-        // focus ring until Core connects and the onModelReset Connection
-        // below first runs the restore. The cascade is deferred to that
-        // same onModelReset, which re-runs this once the catalog lands.
-        root.hubScreen.restoreFromCategoriesReset();
+        // Fire the focus restore here so Hub focus is seated and marked ready
+        // before first paint. Do not cascade into SystemsModel yet: first
+        // paint stays Hub-only, and the post-frame handler below runs the
+        // cascade needed by saved-screen restore and later drill-downs.
+        root.hubScreen.restoreFromCategoriesReset(false);
         root._maybeArmHubResumeFocus();
         // Open the commercial-use notice on first paint of an unacked
         // install. Sits in front of the media-DB first-run modal in the
@@ -288,6 +282,27 @@ MainLayout {
         root._maybeCompleteBoot();
         root._maybeOpenFirstRunIndex();
         root._maybeStartStartupRestore();
+    }
+
+    on_FirstFrameSeenChanged: {
+        if (root._firstFrameSeen) {
+            Browse.ImageOverrides.load_hub_overrides();
+            if (Browse.CategoriesModel.count > 0)
+                root.hubScreen.restoreFromCategoriesReset(true);
+            root._maybeStartStartupRestore();
+        }
+    }
+
+    Connections {
+        target: Browse.ImageOverrides
+        function onHub_loadedChanged(): void {
+            if (Browse.ImageOverrides.hub_loaded)
+                Browse.ImageOverrides.load_system_overrides();
+        }
+        function onSystems_loadedChanged(): void {
+            if (Browse.ImageOverrides.systems_loaded && Browse.CategoriesModel.count > 0)
+                Browse.SystemsModel.reproject();
+        }
     }
 
     function _validStartupScreen(screen: string): string {
@@ -310,7 +325,7 @@ MainLayout {
     Connections {
         target: Browse.CategoriesModel
         function onModelReset(): void {
-            root.hubScreen.restoreFromCategoriesReset();
+            root.hubScreen.restoreFromCategoriesReset(root._firstFrameSeen);
             root._maybeStartStartupRestore();
             root._maybeContinueOptimisticTransitions();
         }
@@ -322,7 +337,7 @@ MainLayout {
         }
     }
     Connections {
-        target: Browse.SystemsModel
+        target: root._systemsModelConnectionsEnabled ? Browse.SystemsModel : null
         // On a games-screen restore, GamesState.system_id is authoritative;
         // fall back to SystemsState.system_id only if it's empty (edge case:
         // user pressed Enter on an empty systems grid and we flipped the
@@ -341,7 +356,7 @@ MainLayout {
         }
     }
     Connections {
-        target: Browse.GamesModel
+        target: root._gamesModelConnectionsEnabled ? Browse.GamesModel : null
         function onModelReset(): void {
             if (root.gamesScreen === null) {
                 root._whenScreenReady(root.screenGames, function () {
@@ -494,6 +509,10 @@ MainLayout {
     // issued.
     property bool _deferredCategoryPending: false
     property bool _deferredSystemPending: false
+    readonly property bool _systemsModelConnectionsEnabled: root.systemsScreenRequested || (root._firstFrameSeen && root._startupRestorePending) || root._categoryReadyCallback !== null || root._deferredCategoryPending || root._catalogWaitCategory !== ""
+    readonly property bool _gamesModelConnectionsEnabled: root.gamesScreenRequested || root._systemReadyCallback !== null || root._deferredSystemPending
+    readonly property bool _favoritesModelConnectionsEnabled: root.favoritesScreenRequested || root._favoritesReadyCallback !== null
+    readonly property bool _recentsModelConnectionsEnabled: root.recentsScreenRequested || root._recentsReadyCallback !== null || root._pendingResumeLaunch
     // Saved games-screen entry path that wasn't on the freshly seeded
     // page 1 of MediaBrowse. The GamesModel.onCountChanged watcher
     // below paginates forward via fetch_more until the path is found
@@ -591,7 +610,7 @@ MainLayout {
     // is consumed at most once per transition; a stray fire when no
     // transition is pending is a no-op.
     Connections {
-        target: Browse.SystemsModel
+        target: root._systemsModelConnectionsEnabled ? Browse.SystemsModel : null
         function onLoadingChanged(): void {
             if (Browse.SystemsModel.loading)
                 return;
@@ -618,7 +637,7 @@ MainLayout {
         }
     }
     Connections {
-        target: Browse.GamesModel
+        target: root._gamesModelConnectionsEnabled ? Browse.GamesModel : null
         function onLoadingChanged(): void {
             if (Browse.GamesModel.loading)
                 return;
@@ -636,7 +655,7 @@ MainLayout {
         }
     }
     Connections {
-        target: Browse.RecentsModel
+        target: root._recentsModelConnectionsEnabled ? Browse.RecentsModel : null
         function onLoadingChanged(): void {
             if (Browse.RecentsModel.loading)
                 return;
@@ -656,7 +675,7 @@ MainLayout {
         }
     }
     Connections {
-        target: Browse.FavoritesModel
+        target: root._favoritesModelConnectionsEnabled ? Browse.FavoritesModel : null
         function onLoadingChanged(): void {
             if (Browse.FavoritesModel.loading)
                 return;
@@ -771,6 +790,18 @@ MainLayout {
             root._goto(root.screenHub);
     }
 
+    // Fire the actual resume launch and arm the desktop safety-clear. The
+    // "Loading game…" cue (pendingTransition === "resume") stays up through
+    // the launch: on MiSTer the process is replaced by the game before the
+    // timer fires, so the cue covers the core swap; on desktop nothing
+    // replaces us, so resumeLaunchCueTimer clears the cue and restores input.
+    // Started only here, at dispatch — never while still waiting on the
+    // connection — so a slow coalesce keeps the cue for as long as it needs.
+    function _dispatchResumeLaunch(): void {
+        Browse.RecentsModel.launch_resume();
+        resumeLaunchCueTimer.restart();
+    }
+
     function _maybeCompletePendingResumeLaunch(): void {
         if (!root._pendingResumeLaunch || root.pendingTransition !== "resume")
             return;
@@ -778,7 +809,7 @@ MainLayout {
             return;
         if (Browse.RecentsModel.resume_available) {
             root._pendingResumeLaunch = false;
-            Browse.RecentsModel.launch_resume();
+            root._dispatchResumeLaunch();
             return;
         }
         if (Browse.AppStatus.connection_state === 2 || Browse.AppStatus.connection_state === 3)
@@ -793,12 +824,16 @@ MainLayout {
     }
 
     function _navigateResumeFromHub(): void {
+        // Optimistic loader, same contract as the other Hub actions: paint
+        // the "Loading game…" cue (and hide the ghost-Hub tiles / gate input)
+        // immediately, before we know whether the launch can proceed.
+        // _cancelResumeLaunch clears it on the no-resumable-game branch.
+        root.pendingTransition = "resume";
         if (!Browse.RecentsModel.resume_loading && Browse.RecentsModel.resume_available) {
-            Browse.RecentsModel.launch_resume();
+            root._dispatchResumeLaunch();
             return;
         }
         if (Browse.RecentsModel.resume_loading || Browse.AppStatus.connection_state !== 2) {
-            root.pendingTransition = "resume";
             resumeLaunchTimer.restart();
             return;
         }
@@ -1087,6 +1122,8 @@ MainLayout {
     function _maybeStartStartupRestore(): void {
         if (!root._startupRestorePending || root._startupRestoreStarted)
             return;
+        if (!root._firstFrameSeen)
+            return;
         if (startupRestoreKickTimer.running)
             return;
         const targetScreen = root._startupRestoreScreen;
@@ -1107,6 +1144,7 @@ MainLayout {
         }
         if (targetScreen === root.screenFavorites) {
             root._whenScreenReady(root.screenFavorites, function () {
+                root._resumeFavoritesCovers();
                 if (Browse.FavoritesModel.loading) {
                     root._favoritesReadyCallback = function () {
                         root.favoritesScreen.restoreSelection();
@@ -1123,6 +1161,8 @@ MainLayout {
         }
         if (targetScreen === root.screenRecents) {
             root._whenScreenReady(root.screenRecents, function () {
+                Browse.RecentsModel.ensure_loaded();
+                root._resumeRecentsCovers();
                 if (Browse.RecentsModel.loading) {
                     root._recentsReadyCallback = function () {
                         root.recentsScreen.restoreSelection();
@@ -1150,7 +1190,7 @@ MainLayout {
             return;
         }
         if (targetScreen === root.screenHub) {
-            root.hubScreen.restoreFromCategoriesReset();
+            root.hubScreen.restoreFromCategoriesReset(true);
             root._finishStartupRestore();
             root._goto(root.screenHub);
             return;
@@ -2222,7 +2262,7 @@ MainLayout {
     // its facet to the loading state on `load_letter_index`, then fills it; this
     // re-parses into the live grid entries each time either changes.
     Connections {
-        target: Browse.GamesModel
+        target: root.letterJumpModalRequested ? Browse.GamesModel : null
         enabled: root.letterJumpModalRequested
         function onLetter_index_jsonChanged(): void {
             if (root.letterJumpModalVisible)
@@ -2354,7 +2394,10 @@ MainLayout {
         // press goes through the normal routing below.
         if (root._maybeDismissScreensaver())
             return;
-        if (root._startupRestorePending && root.startupRestoreCurtainVisible && root.activeScreen === root._startupRestoreScreen && !ScreenManager.hasModal)
+        // Swallow input while the warm-resume curtain is up. The target
+        // screen restores behind a hidden Hub (activeScreen stays Hub), so
+        // any press here would drive the ghost Hub the user can't see.
+        if (root._startupRestorePending && root.startupRestoreCurtainVisible && !ScreenManager.hasModal)
             return;
         root._resetIdle();
         // Input gate. While a forward transition is in flight, swallow
@@ -2922,6 +2965,20 @@ MainLayout {
         interval: 50
         repeat: false
         onTriggered: root._startResumeLaunch()
+    }
+
+    // Desktop safety-clear for the resume "Loading game…" cue. On MiSTer the
+    // launch replaces this process before this fires, so it never triggers and
+    // the cue covers the core swap. On desktop nothing replaces us, so clear
+    // the cue (and ungate input) once the launch has had time to take.
+    Timer {
+        id: resumeLaunchCueTimer
+        interval: 8000
+        repeat: false
+        onTriggered: {
+            if (root.pendingTransition === "resume")
+                root.pendingTransition = "";
+        }
     }
 
     Timer {

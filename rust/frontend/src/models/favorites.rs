@@ -76,7 +76,6 @@ const PAGE_SIZE: u32 = 25;
 const COVER_PREFETCH_CURSOR_NEXT: i32 = 4;
 const COVER_PREFETCH_CURSOR_PREV: i32 = 2;
 
-#[derive(Default)]
 #[allow(
     clippy::struct_excessive_bools,
     reason = "the bools are independent qproperties surfaced to QML; collapsing them \
@@ -146,6 +145,41 @@ pub struct FavoritesModelRust {
     // thread between sleep-completion and abort.
     cover_gate_seq: Arc<AtomicU64>,
     nav_timing: Option<NavTiming>,
+}
+
+impl Default for FavoritesModelRust {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            disambig_displays: Vec::new(),
+            count: 0,
+            loading: false,
+            loading_more: false,
+            error_message: QString::default(),
+            has_next_page: false,
+            next_cursor: None,
+            card_write_pending: false,
+            card_write_error: QString::default(),
+            current_detail_loading: false,
+            current_detail_tags: QString::default(),
+            current_detail_image_key: QString::default(),
+            detail_prefetch_key_next: QString::default(),
+            detail_prefetch_key_prev: QString::default(),
+            detail_prefetch_row: None,
+            cover_requests_paused: true,
+            show_original_filenames: false,
+            current_detail_media_key: None,
+            current_detail_media_id: None,
+            card_write_seq: Arc::new(AtomicU64::new(0)),
+            detail_seq: Arc::new(AtomicU64::new(0)),
+            seq: Arc::new(AtomicU64::new(0)),
+            cover_subscription: None,
+            pending_first_paint_keys: HashSet::new(),
+            cover_gate_timer: None,
+            cover_gate_seq: Arc::new(AtomicU64::new(0)),
+            nav_timing: None,
+        }
+    }
 }
 
 #[cxx_qt::bridge]

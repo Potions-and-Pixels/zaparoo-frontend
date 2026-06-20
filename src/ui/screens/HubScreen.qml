@@ -61,8 +61,12 @@ Item {
     }
 
     // Resolve the cover key for a Hub item: a user override from the `hub/`
-    // namespace if present, else the bundled key.
+    // namespace if present, else the bundled key. Before the deferred scan
+    // completes, return empty so first paint does no icon image work and avoids
+    // a bundled-to-custom flash.
     function _hubCoverKey(id: string, fallbackKey: string): string {
+        if (!Browse.ImageOverrides.hub_loaded)
+            return "";
         return hub._preferOverride(Browse.ImageOverrides.override_cover_key("hub", id), fallbackKey);
     }
 
@@ -86,6 +90,11 @@ Item {
             id: CategoryIds.handheldId,
             name: qsTr("Handhelds"),
             coverKey: hub._hubCoverKey(CategoryIds.handheldId, CategoryIds.coverKey(CategoryIds.handheldId))
+        },
+        {
+            id: CategoryIds.otherId,
+            name: qsTr("Other"),
+            coverKey: hub._hubCoverKey(CategoryIds.otherId, CategoryIds.coverKey(CategoryIds.otherId))
         }
     ]
     readonly property var visibleCategoryEntries: {
@@ -108,6 +117,10 @@ Item {
     property int currentRow: 1
     // Index within the active row. Resume is first while optimistic/history is unknown.
     property int currentIndex: 0
+    // False on the first-paint path so Hub can draw a static Resume tile
+    // without touching RecentsModel. MainLayout flips this after the
+    // first frame, then Resume can hide/update from Core history.
+    property bool resumeModelEnabled: false
     // Incremented on each Accept so the focused tile plays its push-in
     // animation. Forwarded to every TileLoader; only the focused+selected
     // Tile fires its animation.
@@ -153,7 +166,7 @@ Item {
     readonly property int _blockHeight: 2 * (categoriesRow.cellHeight + 2 * categoriesRow.verticalPadding) + (categoriesRow.spacing - categoriesRow.verticalPadding - actionsRow.verticalPadding) + Sizing.pctH(3) + Sizing.pctH(7)
     readonly property int _blockY: Math.round((Sizing.headerBottom + hub.height - Sizing.pctH(6) - hub._blockHeight) / 2)
 
-    readonly property bool resumeKnownUnavailable: !Browse.RecentsModel.resume_loading && !Browse.RecentsModel.resume_available && Browse.AppStatus.connection_state === 2
+    readonly property bool resumeKnownUnavailable: hub.resumeModelEnabled && !Browse.RecentsModel.resume_loading && !Browse.RecentsModel.resume_available && Browse.AppStatus.connection_state === 2
     readonly property bool resumeActionVisible: !hub.resumeKnownUnavailable
 
     // Action-row data. Resume is visible by default while Core history
@@ -163,7 +176,7 @@ Item {
     readonly property var actionEntries: {
         const entries = [];
         if (hub.resumeActionVisible) {
-            const resumeName = Browse.RecentsModel.resume_name;
+            const resumeName = hub.resumeModelEnabled ? Browse.RecentsModel.resume_name : "";
             entries.push({
                 id: "resume",
                 coverKey: hub._hubCoverKey("resume", "icons/PlayOutline"),
@@ -226,7 +239,15 @@ Item {
     }
 
     onActionEntriesChanged: {
-        if (hub.currentRow === 1 && Browse.HubState.selected_action === "resume" && !hub.resumeActionVisible) {
+        // Only treat a vanishing Resume tile as a real removal once the user
+        // is driving focus (_focusArmed). During the cold-boot settle the
+        // resume fetch can briefly read unavailable before it resolves to the
+        // just-played game; reacting then would jump focus to Arcade and
+        // persist it, stranding the user off the (about-to-reappear) Resume
+        // tile. While !_focusArmed, fall through to _remapActionFocus, which
+        // keeps the actions row aligned to the saved "resume" intent without
+        // overwriting persisted state.
+        if (hub._focusArmed && hub.currentRow === 1 && Browse.HubState.selected_action === "resume" && !hub.resumeActionVisible) {
             hub._focusFallbackAfterResumeRemoved();
             return;
         }
@@ -242,11 +263,10 @@ Item {
         hub._crossSavedIndex = -1;
     }
 
-    // Restore the hub from the persisted `Browse.HubState`. Always
-    // cascades into `SystemsModel.set_category` because the cascade
-    // drives the next onModelReset handler that a games-screen restore
-    // depends on; the call is idempotent when the model already holds
-    // the right category.
+    // Restore the hub from the persisted `Browse.HubState`. The router
+    // decides whether this pass should cascade into
+    // `SystemsModel.set_category`; first Hub paint restores focus only,
+    // then post-frame restore/transition paths can pay for Systems.
     //
     // Called from two sites in Main.qml — the Component.onCompleted
     // early-arrival path (catalog already seeded synchronously) and the
@@ -255,7 +275,7 @@ Item {
     // re-seeded even when SystemsModel is already on the chosen
     // category — otherwise the visible focus drifts off whichever
     // screen the user is on.
-    function restoreFromCategoriesReset(): void {
+    function restoreFromCategoriesReset(cascadeSystems: bool): void {
         // Focus is now being finalized from persisted state; let the tiles
         // render focus from here on (snapped, since `_focusArmed` is still
         // false until the first user input).
@@ -295,6 +315,8 @@ Item {
         // point past the new category list).
         hub._crossSavedIndex = -1;
 
+        if (!cascadeSystems)
+            return;
         // Cold boot before Core delivers the catalog: focus was seated above
         // (and `_restoreDone` set, so the focus ring paints immediately
         // instead of waiting for the connection), but the set_category
