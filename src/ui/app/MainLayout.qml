@@ -1095,7 +1095,12 @@ ApplicationWindow {
                         // help bar must reflect that the actions row is
                         // navigable, otherwise the user reads "Quit only"
                         // and misses the Settings tile entirely.
-                        return [
+                        // `hide_exit` kiosk flag: drop the ButtonB/Quit
+                        // entry so the help bar doesn't advertise a
+                        // no-op button. HubScreen.qml gates the actual
+                        // cancel handler on the same flag — keep the
+                        // two in sync.
+                        const hubEntries = [
                             {
                                 button: "Dpad",
                                 label: qsTr("Move")
@@ -1103,12 +1108,14 @@ ApplicationWindow {
                             {
                                 button: "ButtonA",
                                 label: qsTr("Open")
-                            },
-                            {
-                                button: "ButtonB",
-                                label: qsTr("Quit")
                             }
                         ];
+                        if (!Browse.Settings.current_hide_exit)
+                            hubEntries.push({
+                                button: "ButtonB",
+                                label: qsTr("Quit")
+                            });
+                        return hubEntries;
                     }
                     if (root.activeScreen === root.screenSystems) {
                         if (root.systemsScreenState === "loading")

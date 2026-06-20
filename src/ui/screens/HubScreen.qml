@@ -457,7 +457,13 @@ Item {
         } else if (action === "accept") {
             hub._activateCurrent();
         } else if (action === "cancel") {
-            hub.requestQuit();
+            // Kiosk lockdown — `hide_exit = true` in frontend.toml turns
+            // the B-button into a no-op so operators can't quit back to
+            // the MiSTer main menu. The matching help-bar entry in
+            // MainLayout.qml is also conditional on the same flag so
+            // the UI doesn't advertise an unresponsive button.
+            if (!Browse.Settings.current_hide_exit)
+                hub.requestQuit();
         }
     }
 
