@@ -97,6 +97,7 @@ const DEFAULT_PAGE_SIZE: i32 = 15;
 // longer floods the cover queue.
 const FETCH_MORE_CHUNK_SIZE: i32 = 100;
 const FETCH_MORE_RAPID_CHUNK_SIZE: i32 = 300;
+const COLLAPSED_DIRECTORY_BROWSE_PAGE_SIZE: u32 = 1000;
 const COVER_PREFETCH_NEXT_PAGES: i32 = 2;
 const COVER_PREFETCH_PREVIOUS_PAGES: i32 = 1;
 
@@ -463,7 +464,7 @@ impl ffi::GamesModel {
         }
         let entry = &self.entries[index.row() as usize];
         match role {
-            NAME_ROLE => QVariant::from(&QString::from(entry.name.as_str())),
+            NAME_ROLE => QVariant::from(&QString::from(display_title_for_entry(entry).as_ref())),
             PATH_ROLE => QVariant::from(&QString::from(entry.path.as_str())),
             ZAP_SCRIPT_ROLE => QVariant::from(&QString::from(entry.zap_script.as_str())),
             SYSTEM_ID_ROLE => QVariant::from(&QString::from(entry_system_id(entry).as_str())),
@@ -640,31 +641,35 @@ impl ffi::GamesModel {
         if index < 0 || index >= self.count {
             return;
         }
-        let entry = &self.entries[index as usize];
-        let fallback_text = run_text_for_entry(entry);
-        if fallback_text.is_empty() {
+        let entry = self.entries[index as usize].clone();
+        let params = singleton_directory_needs_launch_resolution(&entry)
+            .then(|| meta_params_for_entry(&entry))
+            .flatten();
+        let browse_params = media_capable_directory_browse_params(&entry);
+        let fallback_text = run_text_for_entry(&entry);
+        if params.is_none() && browse_params.is_none() && fallback_text.is_none() {
             return;
         }
-        let params = singleton_directory_needs_launch_resolution(entry)
-            .then(|| meta_params_for_entry(entry))
-            .flatten();
         let name = entry.name.clone();
+        let needs_resolution = params.is_some() || browse_params.is_some();
         let store = global_store();
         global_handle().spawn(async move {
-            let text = if let Some(params) = params {
-                match store.client().media_meta(params).await {
-                    Ok(result) if !result.media.path.trim().is_empty() => result.media.path,
-                    Ok(_) => fallback_text.clone(),
-                    Err(e) => {
-                        warn!(
-                            "singleton launch path resolve failed for {name}: {}",
-                            e.message
-                        );
-                        fallback_text.clone()
-                    }
-                }
+            let text = if needs_resolution {
+                let client = store.client();
+                resolve_media_capable_directory_run_text(
+                    client.as_ref(),
+                    &entry,
+                    params,
+                    browse_params,
+                    fallback_text,
+                )
+                .await
             } else {
-                fallback_text.clone()
+                fallback_text
+            };
+            let Some(text) = text else {
+                warn!("media-capable directory launch fallback unavailable for {name}; not launching container path");
+                return;
             };
             if let Err(e) = store.run_mutation::<RunMutation>(RunParams { text }).await {
                 warn!("run failed for {name}: {}", e.message);
@@ -786,7 +791,7 @@ impl ffi::GamesModel {
         if index < 0 || index >= self.count {
             return QString::default();
         }
-        QString::from(self.entries[index as usize].name.as_str())
+        QString::from(display_title_for_entry(&self.entries[index as usize]).as_ref())
     }
 
     fn description_at(&self, index: i32) -> QString {
@@ -1106,11 +1111,134 @@ fn is_media_capable_entry(entry: &BrowseEntry) -> bool {
             && (entry.media_id.is_some() || !entry.zap_script.is_empty()))
 }
 
-fn run_text_for_entry(entry: &BrowseEntry) -> String {
-    if !entry.path.trim().is_empty() {
-        return entry.path.clone();
+fn run_text_for_entry(entry: &BrowseEntry) -> Option<String> {
+    if media_capable_directory_needs_child_resolution(entry) {
+        return non_empty_text(&entry.zap_script);
     }
-    entry.zap_script.clone()
+    path_then_zap_script_for_entry(entry)
+}
+
+fn path_then_zap_script_for_entry(entry: &BrowseEntry) -> Option<String> {
+    non_empty_text(&entry.path).or_else(|| non_empty_text(&entry.zap_script))
+}
+
+fn non_empty_text(text: &str) -> Option<String> {
+    (!text.trim().is_empty()).then(|| text.to_string())
+}
+
+async fn resolve_media_capable_directory_run_text(
+    client: &zaparoo_core::client::Client,
+    entry: &BrowseEntry,
+    meta_params: Option<MediaMetaParams>,
+    browse_params: Option<MediaBrowseParams>,
+    fallback_text: Option<String>,
+) -> Option<String> {
+    if let Some(params) = meta_params {
+        match client.media_meta(params).await {
+            Ok(result) if !result.media.path.trim().is_empty() => return Some(result.media.path),
+            Ok(_) => warn!(
+                "singleton launch path resolve returned empty path for {}; trying folder browse",
+                entry.name
+            ),
+            Err(e) => warn!(
+                "singleton launch path resolve failed for {}: {}",
+                entry.name, e.message
+            ),
+        }
+    }
+
+    if let Some(params) = browse_params {
+        match client.media_browse(params).await {
+            Ok(result) => {
+                if let Some(text) = child_launch_text_from_browse_result(entry, &result) {
+                    return Some(text);
+                }
+                warn!(
+                    "media-capable directory browse found no launchable child for {}",
+                    entry.name
+                );
+            }
+            Err(e) => warn!(
+                "media-capable directory browse failed for {}: {}",
+                entry.name, e.message
+            ),
+        }
+    }
+
+    fallback_text
+}
+
+fn child_launch_text_from_browse_result(
+    parent: &BrowseEntry,
+    result: &MediaBrowseResult,
+) -> Option<String> {
+    let children = result
+        .entries
+        .iter()
+        .filter(|entry| !entry.is_folder())
+        .collect::<Vec<_>>();
+    if let Some(media_id) = parent.media_id {
+        let matching_media_id = children
+            .iter()
+            .copied()
+            .filter(|entry| entry.media_id == Some(media_id))
+            .collect::<Vec<_>>();
+        if let Some(text) = best_launch_text_for_entries(&matching_media_id) {
+            return Some(text);
+        }
+    }
+    best_launch_text_for_entries(&children)
+}
+
+fn best_launch_text_for_entries(entries: &[&BrowseEntry]) -> Option<String> {
+    entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            non_empty_text(&entry.path).map(|path| (launch_path_priority(&path), index, path))
+        })
+        .min_by_key(|(priority, index, _)| (*priority, *index))
+        .map(|(_, _, path)| path)
+        .or_else(|| {
+            entries
+                .iter()
+                .find_map(|entry| non_empty_text(&entry.zap_script))
+        })
+}
+
+fn launch_path_priority(path: &str) -> u8 {
+    let Some((_, extension)) = path.rsplit_once('.') else {
+        return 100;
+    };
+    if extension.eq_ignore_ascii_case("m3u") {
+        0
+    } else if extension.eq_ignore_ascii_case("cue") {
+        1
+    } else if extension.eq_ignore_ascii_case("gdi") {
+        2
+    } else if extension.eq_ignore_ascii_case("chd") {
+        3
+    } else {
+        100
+    }
+}
+
+fn media_capable_directory_browse_params(entry: &BrowseEntry) -> Option<MediaBrowseParams> {
+    if !media_capable_directory_needs_child_resolution(entry) || entry.path.trim().is_empty() {
+        return None;
+    }
+    let system_id = entry_system_id(entry);
+    let systems = if system_id.trim().is_empty() {
+        Vec::new()
+    } else {
+        vec![system_id]
+    };
+    Some(MediaBrowseParams {
+        path: entry.path.clone(),
+        systems,
+        max_results: Some(COLLAPSED_DIRECTORY_BROWSE_PAGE_SIZE),
+        ..MediaBrowseParams::default()
+    })
 }
 
 fn meta_params_for_entry(entry: &BrowseEntry) -> Option<MediaMetaParams> {
@@ -1126,6 +1254,11 @@ fn meta_params_for_entry(entry: &BrowseEntry) -> Option<MediaMetaParams> {
 
 fn singleton_directory_needs_launch_resolution(entry: &BrowseEntry) -> bool {
     entry.entry_type == "directory" && entry.media_id.is_some()
+}
+
+fn media_capable_directory_needs_child_resolution(entry: &BrowseEntry) -> bool {
+    entry.entry_type == "directory"
+        && (entry.media_id.is_some() || !entry.zap_script.trim().is_empty())
 }
 
 fn description_from_meta(meta: &MediaMeta) -> String {
@@ -1238,6 +1371,14 @@ fn detail_value_for_aliases(source: &[TagInfo], aliases: &[&str]) -> String {
         .map(tag_display_value)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn display_title_for_entry(entry: &BrowseEntry) -> std::borrow::Cow<'_, str> {
+    if entry.name.is_empty() {
+        std::borrow::Cow::Owned(file_stem_or_name(&entry.path, &entry.name))
+    } else {
+        std::borrow::Cow::Borrowed(entry.name.as_str())
+    }
 }
 
 fn file_stem_or_name(path: &str, name: &str) -> String {
@@ -1355,7 +1496,13 @@ fn cover_key_for(entry: &BrowseEntry, page_size: u32, requests_enabled: bool) ->
     let soft_no_image = media_key
         .as_ref()
         .is_some_and(|k| cache.is_soft_no_image(k));
-    if requests_enabled && !cached && !negative && !soft_no_image {
+    // Browse-provided signal: Core confirmed no image property for this entry.
+    // Treat as negative — show the cover placeholder and skip the
+    // media.image request. This eliminates the per-entry lookup flood on
+    // systems like Arcade that have very few scraped covers.
+    let no_cover = !entry.has_cover;
+    let effective_cached = cached && !no_cover;
+    if requests_enabled && !effective_cached && !negative && !soft_no_image && !no_cover {
         // Miss-driven re-enqueue: when QML asks for the cover URL of
         // a media entry whose bytes aren't in the cache, kick a fetch
         // right here. This is the only implicit path covers reach the
@@ -1372,8 +1519,8 @@ fn cover_key_for(entry: &BrowseEntry, page_size: u32, requests_enabled: bool) ->
     cover_key_for_with(
         entry,
         media_key.as_ref(),
-        cached,
-        negative || soft_no_image || !requests_enabled,
+        effective_cached,
+        negative || soft_no_image || no_cover || !requests_enabled,
     )
 }
 
@@ -1447,6 +1594,11 @@ fn prefetch_around_plan(
                 continue;
             }
             let entry = &entries[idx];
+            // Skip entries Core has confirmed have no cover; they would
+            // occupy fetch queue slots but always return "no image".
+            if !entry.has_cover {
+                continue;
+            }
             if let Some(key) = media_key_for(entry) {
                 plan.push((key.with_current_cover_preference(), entry.media_id));
             }
@@ -1591,7 +1743,15 @@ fn notify_cover_update(mut model: Pin<&mut ffi::GamesModel>, key: &MediaKey) {
         .rust_mut()
         .pending_first_paint_keys
         .remove(key);
-    if was_pending && model.pending_first_paint_keys.is_empty() && model.loading {
+    // Hold the overlay while the initial look-ahead is still in flight so
+    // the Loading screen covers both cover resolution AND the background
+    // chunk's materialization. `release_initial_lookahead_gate` below will
+    // trigger the release once both conditions are satisfied.
+    if was_pending
+        && model.pending_first_paint_keys.is_empty()
+        && !model.pending_initial_lookahead
+        && model.loading
+    {
         if let Some(handle) = model.as_mut().rust_mut().cover_gate_timer.take() {
             handle.abort();
         }
@@ -1655,6 +1815,10 @@ where
 {
     entries
         .iter()
+        // Browse-provided signal: Core confirmed no image for this entry.
+        // Exclude from the gate set — these entries will never resolve to
+        // cached bytes, so waiting on them would always ride the timeout.
+        .filter(|entry| entry.has_cover)
         .filter_map(|entry| media_key_for(entry).map(MediaKey::with_current_cover_preference))
         .filter(|k| !is_cached(k) && !is_negative(k))
         .collect()
@@ -1680,28 +1844,47 @@ fn reset_cover_gate(mut model: Pin<&mut ffi::GamesModel>) {
 /// - If every media entry is already cached or negatively-memoised
 ///   (folder-only page, or revisit), set loading=false right now —
 ///   there's nothing to wait on, the screen-flip overlay clears.
-/// - Otherwise, store the unresolved set on the model, arm a 3 s safety
-///   timer, and leave loading=true. `notify_cover_update` will drain
-///   the set as covers land; whichever happens first (set empties or
-///   timer fires) releases the gate.
+/// - Otherwise, store the unresolved set on the model, arm a 1.5 s
+///   safety timer, and leave loading=true. `notify_cover_update` will
+///   drain the set as covers land; whichever happens first (set empties
+///   or timer fires) releases the gate.
 ///
-/// The 3 s timeout is the fall-through: if the bulk RPC stalls, the
-/// user sees `Loading…` for at most 3 s before the existing
-/// "list with placeholders → covers pop in" behaviour resumes.
+/// The 1.5 s timeout is the fall-through: if the bulk RPC or initial
+/// look-ahead stalls, the user sees `Loading…` for at most 1.5 s before
+/// the existing "list with placeholders → covers pop in" behavior resumes.
 fn arm_cover_gate(mut model: Pin<&mut ffi::GamesModel>) {
     if let Some(handle) = model.as_mut().rust_mut().cover_gate_timer.take() {
         handle.abort();
     }
     let cache = global_media_image_cache();
+    // Scope the waiting set to the visible page only, not all loaded
+    // entries. The prefetcher queues only ~3 pages' worth; computing
+    // over all entries means the set can never drain on a large folder
+    // (e.g. 411 PSX dirs) and the gate always rides the full timeout.
+    // Using the visible page (page_size rows starting at visible_first_row)
+    // lets the set drain as soon as the on-screen covers land.
+    let page_size = model.page_size.max(1) as usize;
+    let first = model.rust().visible_first_row.max(0) as usize;
+    let window_end = (first + page_size).min(model.entries.len());
+    let visible_entries = &model.entries[first..window_end];
     let unresolved = compute_unresolved_keys(
-        &model.entries,
+        visible_entries,
         |k| cache.is_cached(k),
         |k| cache.is_negative(k),
     );
     if unresolved.is_empty() {
         model.as_mut().rust_mut().pending_first_paint_keys.clear();
+        // If the initial look-ahead is still in flight, keep loading=true
+        // so the overlay covers the materialization of the first background
+        // chunk. `release_initial_lookahead_gate` will release it once
+        // the sub-batches have finished splicing onto the Qt thread.
         if model.loading {
-            model.as_mut().set_loading(false);
+            if model.pending_initial_lookahead {
+                info!("games: arm cover gate (holding loading until look-ahead lands)");
+                arm_cover_gate_timeout(model);
+            } else {
+                model.as_mut().set_loading(false);
+            }
         }
         return;
     }
@@ -1710,26 +1893,46 @@ fn arm_cover_gate(mut model: Pin<&mut ffi::GamesModel>) {
         "games: arm cover gate (holding loading until covers cached)"
     );
     model.as_mut().rust_mut().pending_first_paint_keys = unresolved;
+    arm_cover_gate_timeout(model);
+}
+
+fn arm_cover_gate_timeout(mut model: Pin<&mut ffi::GamesModel>) {
     let seq = model.rust().cover_gate_seq.clone();
     let ticket = seq.fetch_add(1, Ordering::SeqCst) + 1;
     let qt_thread = model.qt_thread();
     let handle = global_handle().spawn(async move {
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        let _ = qt_thread.queue(move |model| {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let _ = qt_thread.queue(move |mut model: Pin<&mut ffi::GamesModel>| {
             if seq.load(Ordering::SeqCst) != ticket {
                 return;
             }
-            release_cover_gate_after_timeout(model);
+            if model.loading
+                && (model.pending_initial_lookahead || !model.pending_first_paint_keys.is_empty())
+            {
+                release_cover_gate_after_timeout(model);
+            } else {
+                model.as_mut().rust_mut().cover_gate_timer = None;
+            }
         });
     });
     model.as_mut().rust_mut().cover_gate_timer = Some(handle);
 }
 
-/// Clear `pending_initial_lookahead` after the background prefetch
-/// lands. Look-ahead no longer participates in full-screen loading:
-/// visible page readiness and cover first-paint own that gate.
+/// Clear `pending_initial_lookahead` after the background prefetch lands.
+/// If the cover gate already drained before look-ahead finished (e.g. a
+/// system with no covers whose pending keys resolved to empty immediately),
+/// release the loading overlay now that both conditions are met.
 fn release_initial_lookahead_gate(mut model: Pin<&mut ffi::GamesModel>) {
     model.as_mut().rust_mut().pending_initial_lookahead = false;
+    if model.pending_first_paint_keys.is_empty() {
+        if let Some(handle) = model.as_mut().rust_mut().cover_gate_timer.take() {
+            handle.abort();
+            model.rust().cover_gate_seq.fetch_add(1, Ordering::SeqCst);
+        }
+        if model.loading {
+            model.as_mut().set_loading(false);
+        }
+    }
 }
 
 /// Force-release the cover gate from the safety timer. Called only via
@@ -2317,12 +2520,13 @@ mod tests {
     )]
 
     use super::{
-        chunk_for_subbatching, compute_unresolved_keys, cover_key_for_with, cover_placeholder_for,
-        decide_initial, dedup_roots_drop_ancestors, detail_tags_from_tags, display_name,
-        entry_system_id, is_media_capable_entry, is_strict_ancestor_path, leading_dir_count,
-        media_key_for, meta_params_for_entry, position_of_game_path, prefetch_around_plan,
-        project_status, run_text_for_entry, singleton_directory_needs_launch_resolution,
-        transform_entries, InitialAction, Projection,
+        child_launch_text_from_browse_result, chunk_for_subbatching, compute_unresolved_keys,
+        cover_key_for_with, cover_placeholder_for, decide_initial, dedup_roots_drop_ancestors,
+        detail_tags_from_tags, display_name, display_title_for_entry, entry_system_id,
+        is_media_capable_entry, is_strict_ancestor_path, leading_dir_count,
+        media_capable_directory_browse_params, media_key_for, meta_params_for_entry,
+        position_of_game_path, prefetch_around_plan, project_status, run_text_for_entry,
+        singleton_directory_needs_launch_resolution, transform_entries, InitialAction, Projection,
     };
     use crate::media_image_cache::{MediaImageCache, MediaKey};
     use std::collections::HashSet;
@@ -2577,6 +2781,27 @@ mod tests {
             decide_initial(&result, true, None, ""),
             InitialAction::Apply
         );
+    }
+
+    #[test]
+    fn display_title_prefers_core_name_with_disc_marker() {
+        let entry = media("D (Disc 1)", "/roms/PSX/D.cue", "PSX");
+        assert_eq!(display_title_for_entry(&entry).as_ref(), "D (Disc 1)");
+    }
+
+    #[test]
+    fn display_title_prefers_singleton_directory_alias() {
+        let mut entry = folder("Friendly Alias", "/roms/PSX/InternalContainer");
+        entry.media_id = Some(42);
+        entry.system_id = "PSX".into();
+        entry.zap_script = "@PSX/Friendly Alias".into();
+        assert_eq!(display_title_for_entry(&entry).as_ref(), "Friendly Alias");
+    }
+
+    #[test]
+    fn display_title_falls_back_to_file_stem_when_name_empty() {
+        let entry = media("", "/roms/PSX/D (Disc 2).cue", "PSX");
+        assert_eq!(display_title_for_entry(&entry).as_ref(), "D (Disc 2)");
     }
 
     #[test]
@@ -2863,14 +3088,14 @@ mod tests {
     }
 
     #[test]
-    fn singleton_directory_uses_media_id_for_meta_but_container_as_fallback_run_text() {
+    fn singleton_directory_uses_media_id_for_meta_and_skips_container_run_text() {
         let entry = BrowseEntry {
             media_id: Some(42),
-            name: "Archive".into(),
-            path: "/roms/NES/archive.zip".into(),
+            name: "Game".into(),
+            path: "/roms/PSX/Game".into(),
             entry_type: "directory".into(),
-            system_id: "NES".into(),
-            zap_script: "@NES/Super Mario Bros.".into(),
+            system_id: "PSX".into(),
+            zap_script: "@PSX/Game".into(),
             ..BrowseEntry::default()
         };
         assert!(singleton_directory_needs_launch_resolution(&entry));
@@ -2878,7 +3103,88 @@ mod tests {
         assert_eq!(params.media_id, Some(42));
         assert!(params.system.is_empty());
         assert!(params.path.is_empty());
-        assert_eq!(run_text_for_entry(&entry), "/roms/NES/archive.zip");
+        let browse_params = media_capable_directory_browse_params(&entry).expect("browse params");
+        assert_eq!(browse_params.path, "/roms/PSX/Game");
+        assert_eq!(browse_params.systems, vec!["PSX".to_string()]);
+        assert_eq!(browse_params.max_results, Some(1000));
+        assert_eq!(run_text_for_entry(&entry).as_deref(), Some("@PSX/Game"));
+        assert_ne!(
+            run_text_for_entry(&entry).as_deref(),
+            Some("/roms/PSX/Game")
+        );
+    }
+
+    #[test]
+    fn singleton_directory_child_resolution_prefers_cue_path_over_zapscript() {
+        let parent = BrowseEntry {
+            media_id: Some(42),
+            name: "Game".into(),
+            path: "/roms/PSX/Game".into(),
+            entry_type: "directory".into(),
+            system_id: "PSX".into(),
+            zap_script: "@PSX/Game".into(),
+            ..BrowseEntry::default()
+        };
+        let result = MediaBrowseResult {
+            path: parent.path.clone(),
+            entries: vec![
+                BrowseEntry {
+                    media_id: Some(42),
+                    name: "Game Track 1".into(),
+                    path: "/roms/PSX/Game/track01.bin".into(),
+                    entry_type: "media".into(),
+                    system_id: "PSX".into(),
+                    zap_script: "@PSX/Game Track 1".into(),
+                    ..BrowseEntry::default()
+                },
+                BrowseEntry {
+                    media_id: Some(42),
+                    name: "Game".into(),
+                    path: "/roms/PSX/Game/Game.cue".into(),
+                    entry_type: "media".into(),
+                    system_id: "PSX".into(),
+                    zap_script: "@PSX/Game".into(),
+                    ..BrowseEntry::default()
+                },
+            ],
+            total_files: 2,
+            pagination: None,
+        };
+        assert_eq!(
+            child_launch_text_from_browse_result(&parent, &result).as_deref(),
+            Some("/roms/PSX/Game/Game.cue")
+        );
+    }
+
+    #[test]
+    fn singleton_directory_without_zapscript_can_still_resolve_child_path() {
+        let parent = BrowseEntry {
+            media_id: Some(42),
+            name: "Game".into(),
+            path: "/roms/PSX/Game".into(),
+            entry_type: "directory".into(),
+            system_id: "PSX".into(),
+            ..BrowseEntry::default()
+        };
+        let result = MediaBrowseResult {
+            path: parent.path.clone(),
+            entries: vec![BrowseEntry {
+                media_id: Some(42),
+                name: "Game".into(),
+                path: "/roms/PSX/Game/Game.cue".into(),
+                entry_type: "media".into(),
+                system_id: "PSX".into(),
+                ..BrowseEntry::default()
+            }],
+            total_files: 1,
+            pagination: None,
+        };
+        assert!(singleton_directory_needs_launch_resolution(&parent));
+        assert_eq!(run_text_for_entry(&parent), None);
+        assert_eq!(
+            child_launch_text_from_browse_result(&parent, &result).as_deref(),
+            Some("/roms/PSX/Game/Game.cue")
+        );
     }
 
     #[test]
@@ -2888,7 +3194,10 @@ mod tests {
             ..media("smb", "/roms/NES/smb.nes", "NES")
         };
         assert!(!singleton_directory_needs_launch_resolution(&entry));
-        assert_eq!(run_text_for_entry(&entry), "/roms/NES/smb.nes");
+        assert_eq!(
+            run_text_for_entry(&entry).as_deref(),
+            Some("/roms/NES/smb.nes")
+        );
     }
 
     #[test]
@@ -3009,6 +3318,36 @@ mod tests {
                 ..BrowseEntry::default()
             },
         ];
+        let unresolved = compute_unresolved_keys(&entries, |_| false, |_| false);
+        assert!(unresolved.is_empty());
+    }
+
+    #[test]
+    fn compute_unresolved_keys_excludes_no_cover_entries() {
+        // Core sends has_cover=false for entries with no image property row.
+        // These entries will never resolve to cached bytes, so they must
+        // not be included in the gate set — otherwise the gate would always
+        // ride the safety timer on systems like Arcade.
+        let mut no_cover = media("nocovergame", "/p/nocovergame", "Arcade");
+        no_cover.has_cover = false;
+        let entries = vec![no_cover, media("coveredgame", "/p/coveredgame", "NES")];
+        let unresolved = compute_unresolved_keys(&entries, |_| false, |_| false);
+        let expected: HashSet<MediaKey> = [MediaKey::new("NES", "/p/coveredgame")]
+            .into_iter()
+            .collect();
+        assert_eq!(unresolved, expected);
+    }
+
+    #[test]
+    fn compute_unresolved_keys_all_no_cover_returns_empty() {
+        // A page where Core confirmed no entry has a cover (e.g. Arcade
+        // with no scraped artwork) must result in an empty unresolved set
+        // so the gate releases immediately rather than timing out.
+        let mut a = media("a", "/p/a", "Arcade");
+        a.has_cover = false;
+        let mut b = media("b", "/p/b", "Arcade");
+        b.has_cover = false;
+        let entries = vec![a, b];
         let unresolved = compute_unresolved_keys(&entries, |_| false, |_| false);
         assert!(unresolved.is_empty());
     }

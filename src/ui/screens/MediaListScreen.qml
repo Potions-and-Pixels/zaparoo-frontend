@@ -26,7 +26,6 @@ Item {
     property string detailPlaceholderKey: "icons/File"
     property int totalItemsOverride: -1
     property int targetVisibleRowCount: 0
-    property bool showFileStem: false
     property bool detailShowDescription: true
     property bool detailShowTitle: true
     property string detailLoadingText: qsTr("Loading…")
@@ -211,7 +210,7 @@ Item {
     function _resumeCoverRequests(): void {
         if (root.mediaModel === null)
             return;
-        if (root._listLayout && root.pauseCoverRequestsDuringRapid)
+        if (root.pauseCoverRequestsDuringRapid)
             root.mediaModel.cover_requests_paused = false;
         if (typeof root.mediaModel.refresh_cover_keys === "function")
             root.mediaModel.refresh_cover_keys(root._coverRefreshFirstRow(), root._coverRefreshRowCount());
@@ -220,7 +219,7 @@ Item {
     }
 
     function _pauseCoverRequests(): void {
-        if (root.mediaModel === null || !root._listLayout || !root.pauseCoverRequestsDuringRapid)
+        if (root.mediaModel === null || !root.pauseCoverRequestsDuringRapid)
             return;
         root.mediaModel.cover_requests_paused = true;
         if (typeof root.mediaModel.clear_pending_cover_requests === "function")
@@ -368,7 +367,6 @@ Item {
         model: root.mediaModel
         totalItemsOverride: root.totalItemsOverride
         targetVisibleRowCount: root.targetVisibleRowCount
-        showFileStem: root.showFileStem
         currentIndex: mediaGrid.currentIndex
         detailTitle: listCard.currentName
         detailCoverKey: root.detailRapidScrollActive ? root.detailPlaceholderKey : (root._detailImageKey() !== "" ? root._detailImageKey() : listCard.currentCoverKey)
