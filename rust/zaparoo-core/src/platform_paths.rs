@@ -63,6 +63,68 @@ pub fn state_file_path() -> PathBuf {
     }
 }
 
+/// Directory containing per-sponsor folders (see `credits` module).
+/// On `MiSTer` this is the install-bundled (or agent-synced) location
+/// alongside `frontend.toml`. On dev hosts it lands next to the
+/// dev config directory so contributors can manually drop a credits
+/// dir there to test the Credits screen without a real cabinet.
+pub fn credits_dir_path() -> PathBuf {
+    if runtime::current().is_mister() {
+        PathBuf::from("/media/fat/zaparoo/credits")
+    } else {
+        dirs_next::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("zaparoo")
+            .join("credits")
+    }
+}
+
+/// Directory containing per-artist folders. Mirrors `credits_dir_path`
+/// — same on-disk schema (`<dir>/<slug>/metadata.toml` + `logo.png`),
+/// reuses the same `credits::load_credits` loader. Sibling of the
+/// credits dir rather than a nested subdir so the existing
+/// sponsor-sync logic stays untouched.
+pub fn artists_dir_path() -> PathBuf {
+    if runtime::current().is_mister() {
+        PathBuf::from("/media/fat/zaparoo/artists")
+    } else {
+        dirs_next::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("zaparoo")
+            .join("artists")
+    }
+}
+
+/// Directory containing per-person Dev Team folders. Same schema as
+/// `credits_dir_path` / `artists_dir_path` — reuses the same loader.
+/// Surfaced via `Browse.DevTeam` to the Credits → Dev Team screen.
+pub fn dev_team_dir_path() -> PathBuf {
+    if runtime::current().is_mister() {
+        PathBuf::from("/media/fat/zaparoo/devteam")
+    } else {
+        dirs_next::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("zaparoo")
+            .join("devteam")
+    }
+}
+
+/// Directory containing per-section About / Potions & Pixels cards.
+/// Each folder is one card on the Credits → Potions & Pixels
+/// scrollable view (section title + body + optional image). Same
+/// schema as `credits_dir_path` — reuses the same loader. Surfaced
+/// via `Browse.About`.
+pub fn about_dir_path() -> PathBuf {
+    if runtime::current().is_mister() {
+        PathBuf::from("/media/fat/zaparoo/about")
+    } else {
+        dirs_next::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("zaparoo")
+            .join("about")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(

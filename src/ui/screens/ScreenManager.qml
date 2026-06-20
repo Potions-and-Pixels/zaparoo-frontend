@@ -21,6 +21,23 @@ QtObject {
     readonly property string screenRecents: "recents"
     readonly property string screenSettings: "settings"
     readonly property string screenAbout: "about"
+    // ArtCade-fork: Credits & Acknowledgements screen reachable directly
+    // from the Hub (so the Zaparoo About / License entry stays accessible
+    // even on kiosk installs that hide the Settings tile).
+    readonly property string screenCredits: "credits"
+    // ArtCade-fork: dedicated Sponsors scrollable screen reached from
+    // Credits → "Sponsors". Cancel returns to the Credits menu, not
+    // the Hub directly.
+    readonly property string screenSponsors: "sponsors"
+    // ArtCade-fork: three more leaf screens reached from the Credits
+    // menu. Same scrollable-card layout as SponsorsScreen.
+    //   * Dev Team — static prose, ArtCade engineering acknowledgments
+    //   * Artists — dynamic, file-based per-artist folders (mirrors
+    //     the sponsors loader, different on-disk dir)
+    //   * Potions & Pixels — static prose, client nonprofit mission
+    readonly property string screenDevTeam: "devTeam"
+    readonly property string screenArtists: "artists"
+    readonly property string screenPotionsPixels: "potionsPixels"
 
     // Currently-focused root screen. Persistence lives in
     // Browse.AppState — write there via Main.qml's orchestration, not

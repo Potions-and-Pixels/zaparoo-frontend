@@ -67,6 +67,14 @@ pub struct SettingsConfig {
     /// Kiosk lockdown — hide the Resume Game tile on the Hub action row
     /// (it normally appears only when Core has a resumable session).
     pub hide_resume: Option<bool>,
+    /// Kiosk lockdown — disable the Hub's "Quit" / Exit action (B-button
+    /// cancel + the corresponding help-bar entry in `MainLayout.qml`).
+    /// When `true` the cancel handler is a no-op and the operator
+    /// cannot leave the Zaparoo frontend back to the MiSTer main menu.
+    /// Same opt-in posture as the other `hide_*` flags — default
+    /// `None`/`false` keeps the existing behavior; the installer
+    /// flips it on as part of the kiosk-lockdown `frontend.toml`.
+    pub hide_exit: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,6 +170,7 @@ struct RawSettings {
     hide_favorites: Option<bool>,
     hide_recents: Option<bool>,
     hide_resume: Option<bool>,
+    hide_exit: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -253,6 +262,7 @@ pub fn load_config(path: &Path) -> Config {
         hide_favorites: raw.settings.hide_favorites,
         hide_recents: raw.settings.hide_recents,
         hide_resume: raw.settings.hide_resume,
+        hide_exit: raw.settings.hide_exit,
     };
     cfg.notice = NoticeConfig {
         commercial_ack: raw.notice.commercial_ack.unwrap_or(false),
