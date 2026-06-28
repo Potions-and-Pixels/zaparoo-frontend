@@ -38,7 +38,7 @@ import Zaparoo.Theme
 // `confirmed` (confirm Yes).
 //
 // Software-rendering safe — only Item, Rectangle, Text, Column, Row,
-// MouseArea. No transforms, no shaders, no animations.
+// MouseArea, and scale transforms (buttons push in on activation).
 Item {
     id: modal
 
@@ -60,6 +60,13 @@ Item {
     // into the next prompt.
     property bool _focusYes: false
 
+    // Push-in scale for button activation, mirroring the tile push-in.
+    // _pressTarget identifies which button is currently scaled; the others
+    // stay at 1.0 so only the pressed button cues the user's intention.
+    property real _pressScale: 1.0
+    property string _pressTarget: ""
+    property string _pendingSignal: ""
+
     // Shell-mode content slot. Children declared inside a Modal are
     // routed here; only rendered when kind === "shell" so a stray child
     // on a prebaked-kind modal can't leak into the panel.
@@ -74,13 +81,31 @@ Item {
     z: 300
 
     onOpenChanged: {
-        if (modal.open && modal.kind === "confirm")
+        if (!modal.open) {
+            // Disarm a pending deferred signal so a press-then-close inside the
+            // deferred window cannot emit confirmed/accepted after dismissal.
+            actionCommit.stop();
+            return;
+        }
+        if (modal.kind === "confirm")
             modal._focusYes = false;
+        modal._pressScale = 1.0;
+        modal._pressTarget = "";
+        modal._pendingSignal = "";
+        pressAnim.stop();
     }
 
-    // confirm-only input dispatch. Main.qml routes key/controller
-    // actions here while this modal is on top of the stack.
+    // Input dispatch. Main.qml routes key/controller actions here while
+    // this modal is on top of the stack.
     function handleAction(action: string): void {
+        // action_error has a single OK button — accept plays the push cue
+        // then emits `accepted`, matching the mouse path so key/controller
+        // dismissal animates identically.
+        if (modal.kind === "action_error") {
+            if (action === "accept")
+                modal._commit("ok", "accepted");
+            return;
+        }
         if (modal.kind !== "confirm")
             return;
         if (action === "left") {
@@ -89,11 +114,44 @@ Item {
             modal._focusYes = true;
         } else if (action === "accept") {
             if (modal._focusYes)
-                modal.confirmed();
+                modal._commit("yes", "confirmed");
             else
-                modal.cancelRequested();
+                modal._commit("no", "cancelRequested");
         } else if (action === "cancel") {
+            // Back-key dismissal — not an on-screen button, no push-in.
             modal.cancelRequested();
+        }
+    }
+
+    // Play the push-in cue on the named button, then emit the pending
+    // signal deferred so the animation completes before the caller acts.
+    function _commit(target: string, sig: string): void {
+        modal._pressTarget = target;
+        modal._pendingSignal = sig;
+        pressAnim.restart();
+        actionCommit.arm();
+    }
+
+    NumberAnimation {
+        id: pressAnim
+        target: modal
+        property: "_pressScale"
+        to: Motion.pressScale
+        duration: Motion.dur(Motion.pressMs)
+        easing.type: Easing.OutQuad
+    }
+
+    DeferredAction {
+        id: actionCommit
+        onDeferred: {
+            const sig = modal._pendingSignal;
+            modal._pendingSignal = "";
+            if (sig === "accepted")
+                modal.accepted();
+            else if (sig === "confirmed")
+                modal.confirmed();
+            else if (sig === "cancelRequested")
+                modal.cancelRequested();
         }
     }
 
@@ -191,6 +249,8 @@ Item {
                         border.width: Sizing.stroke(2)
                         border.color: Theme.accent
                         radius: Sizing.cornerRadius
+                        transformOrigin: Item.Center
+                        scale: modal._pressTarget === "cancel" ? modal._pressScale : 1.0
 
                         Text {
                             x: Sizing.center(parent.width, width)
@@ -205,7 +265,7 @@ Item {
                         MouseArea {
                             anchors.fill: parent
                             cursorShape: Qt.PointingHandCursor
-                            onClicked: modal.cancelRequested()
+                            onClicked: modal._commit("cancel", "cancelRequested")
                         }
                     }
                 }
@@ -229,6 +289,8 @@ Item {
                         border.width: Sizing.stroke(2)
                         border.color: Theme.accent
                         radius: Sizing.cornerRadius
+                        transformOrigin: Item.Center
+                        scale: modal._pressTarget === "ok" ? modal._pressScale : 1.0
 
                         Text {
                             x: Sizing.center(parent.width, width)
@@ -243,7 +305,7 @@ Item {
                         MouseArea {
                             anchors.fill: parent
                             cursorShape: Qt.PointingHandCursor
-                            onClicked: modal.accepted()
+                            onClicked: modal._commit("ok", "accepted")
                         }
                     }
                 }
@@ -278,6 +340,8 @@ Item {
                             border.width: modal._focusYes ? Sizing.stroke(1) : Sizing.stroke(2)
                             border.color: modal._focusYes ? Theme.borderMid : Theme.accent
                             radius: Sizing.cornerRadius
+                            transformOrigin: Item.Center
+                            scale: modal._pressTarget === "no" ? modal._pressScale : 1.0
 
                             Text {
                                 x: Sizing.center(parent.width, width)
@@ -294,7 +358,7 @@ Item {
                                 cursorShape: Qt.PointingHandCursor
                                 onClicked: {
                                     modal._focusYes = false;
-                                    modal.cancelRequested();
+                                    modal._commit("no", "cancelRequested");
                                 }
                             }
                         }
@@ -306,6 +370,8 @@ Item {
                             border.width: modal._focusYes ? Sizing.stroke(2) : Sizing.stroke(1)
                             border.color: modal._focusYes ? Theme.accent : Theme.borderMid
                             radius: Sizing.cornerRadius
+                            transformOrigin: Item.Center
+                            scale: modal._pressTarget === "yes" ? modal._pressScale : 1.0
 
                             Text {
                                 x: Sizing.center(parent.width, width)
@@ -322,7 +388,7 @@ Item {
                                 cursorShape: Qt.PointingHandCursor
                                 onClicked: {
                                     modal._focusYes = true;
-                                    modal.confirmed();
+                                    modal._commit("yes", "confirmed");
                                 }
                             }
                         }

@@ -12,12 +12,20 @@ default:
     @just --list
 
 # --- build ---
+# Configure runs only when the build dir has no build.ninja (the guard
+# is build.ninja, not CMakeCache.txt, because a failed configure leaves
+# the cache behind but only a successful generate writes build.ninja).
+# Ninja re-runs cmake itself when CMakeLists/*.cmake change, so the
+# explicit configure is pure overhead on every other invocation. The one
+# case ninja cannot see is an edited cacheVariable in CMakePresets.json —
+# after changing presets, run `cmake --preset <name>` once by hand (or
+# `just clean`).
 build:
-    cmake --preset desktop-debug
+    test -f build/build.ninja || cmake --preset desktop-debug
     cmake --build --preset desktop-debug
 
 build-release:
-    cmake --preset desktop-release
+    test -f build-release/build.ninja || cmake --preset desktop-release
     cmake --build --preset desktop-release
 
 # Release build with provenance markers baked in. Sets
@@ -36,11 +44,11 @@ release-zip *args:
     ./scripts/package-mister-release.sh {{args}}
 
 build-dev:
-    cmake --preset desktop-dev
+    test -f build-dev/build.ninja || cmake --preset desktop-dev
     cmake --build --preset desktop-dev
 
 build-san:
-    cmake --preset desktop-sanitized
+    test -f build-san/build.ninja || cmake --preset desktop-sanitized
     cmake --build --preset desktop-sanitized
 
 arm32:
@@ -56,7 +64,8 @@ run-dev *args: build-dev
 # Run a local mock Zaparoo Core (ws://127.0.0.1:27497/api/v0.1).
 # Deliberately offset from the real Core's 7497 so dev never collides
 # with a running Core. `just run-dev` automatically points the frontend
-# here via ZAPAROO_CORE_ENDPOINT. See docs/quickstart.md.
+# here via ZAPAROO_CORE_ENDPOINT.
+# See docs/quickstart.md.
 mock-core:
     cd rust && cargo run --bin mock-core
 
@@ -93,10 +102,21 @@ _LINT_IMAGE := "ghcr.io/zaparooproject/zaparoo-lint:" + trim(`cat scripts/lint/V
 # opt in with `DOCKER_PLATFORM=linux/arm64 just …`.
 _LINT_PLATFORM := env_var_or_default("DOCKER_PLATFORM", "linux/amd64")
 
+# Host-side caches survive the ephemeral container: the cargo registry
+# (index + crate sources), cargo-deny's advisory DB clone, and ccache's
+# object cache otherwise re-download / recompile on every run. They live
+# under gitignored .docker-cache/ as plain host dirs (not named volumes)
+# so the `-u $(id -u)` user can write to them. Deliberately NOT mounted:
+# /usr/local/rustup — shadowing it would hide the image's baked
+# toolchains and break the cmake-driven _build-in-image path.
 _lint *cmd:
+    mkdir -p .docker-cache/cargo-registry .docker-cache/advisory-dbs .docker-cache/ccache
     docker run --rm \
         --platform {{_LINT_PLATFORM}} \
         -v "$PWD":/workdir \
+        -v "$PWD/.docker-cache/cargo-registry":/usr/local/cargo/registry \
+        -v "$PWD/.docker-cache/advisory-dbs":/usr/local/cargo/advisory-dbs \
+        -e CCACHE_DIR=/workdir/.docker-cache/ccache \
         -u "$(id -u):$(id -g)" \
         {{_LINT_IMAGE}} \
         {{cmd}}
@@ -106,7 +126,7 @@ _lint *cmd:
 # host's build/ directory. Underscore-prefixed recipes are private
 # (hidden from `just --list`).
 _build-in-image:
-    cmake --preset desktop-docker-debug
+    test -f build-docker/build.ninja || cmake --preset desktop-docker-debug
     cmake --build --preset desktop-docker-debug
 
 # Container-internal: cmake `lint` target (clang-format dry-run +
@@ -118,13 +138,20 @@ _lint-cpp-target: _build-in-image
 _lint-qml-target: _build-in-image
     cmake --build build-docker --target all_qmllint
 
+# Container-internal: refresh Qt Linguist catalogs and fail if checked-in
+# translations are stale. `lupdate` updates source locations as well as strings,
+# so this catches missing line-number/catalog churn from QML/C++ edits.
+_lint-translations-internal:
+    test -f build-docker/build.ninja || cmake --preset desktop-docker-debug
+    bash scripts/check-translations-updated.sh build-docker
+
 # Container-internal: the rust lint surface (fmt --check + clippy + deny).
 _lint-rust-internal:
     cd rust && cargo fmt --all --check
     cd rust && cargo clippy --workspace --all-targets -- -D warnings
     cd rust && cargo deny check
 
-_lint-all-internal: _lint-rust-internal _lint-cpp-target
+_lint-all-internal: _lint-rust-internal _lint-cpp-target _lint-translations-internal
 
 # Container-internal: format-and-autofix surface. xargs -r skips the
 # invocation when the file list is empty.
@@ -156,6 +183,9 @@ lint-cpp:
 lint-qml:
     just _lint just _lint-qml-target
 
+lint-translations:
+    just _lint just _lint-translations-internal
+
 fmt:
     just _lint just _fmt-internal
 
@@ -171,10 +201,10 @@ install-tools:
     cargo install --locked cargo-nextest
 
 # --- deploy ---
-deploy-mister:
-    ./scripts/deploy-mister.sh
+deploy-mister *args:
+    ./scripts/deploy-mister.sh {{args}}
 
 # --- clean ---
 clean:
-    rm -rf build build-release build-dev build-san build-docker output
+    rm -rf build build-release build-dev build-dev-no-update build-san build-docker output
     cd rust && cargo clean

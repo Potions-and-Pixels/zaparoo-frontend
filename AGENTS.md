@@ -35,7 +35,7 @@ raw cargo as the default path; the justfile carries the expected environment.
 - Qt 6.7+ with Qt Quick, QuickControls2, QML, QuickTest, and LinguistTools.
 - C++17 executable at `src/app/main.cpp`; Rust static library linked through
   Corrosion and cxx-qt.
-- Rust workspace is under `rust/`, edition 2021, MSRV 1.90, cxx-qt 0.8.
+- Rust workspace is under `rust/`, edition 2021, MSRV 1.96, cxx-qt 0.8.
 - Desktop builds link Qt dynamically for LGPL compliance.
 - MiSTer ARM32 builds use the Docker toolchain and static Qt.
 
@@ -121,6 +121,32 @@ raw cargo as the default path; the justfile carries the expected environment.
   a cold start. Any in-memory cache must enforce a strict bytes cap with LRU
   eviction — MiSTer has under 512 MB of shared system RAM and the frontend
   competes with Core, the FPGA wrapper, and the active core for it.
+- Do not add `.git/` rerun-if triggers or `ZAPAROO_BUILD_*` provenance baking
+  to `rust/frontend/build.rs`. Provenance lives in the `rust/build-info` leaf
+  crate precisely so commits don't re-run the cxx-qt codegen. See
+  `docs/building.md` → "Build caching".
+
+## Build caching couplings
+
+Full inventory and rationale: `docs/building.md` → "Build caching". The
+update rules, in short:
+
+- Bumping the Rust toolchain pin touches three files together:
+  `rust-toolchain.toml` (repo root — it must stay there so Corrosion's
+  cargo invocations from `build*/` resolve it), `Dockerfile.lint`'s
+  `RUST_TOOLCHAIN` ARG (+ `scripts/lint/VERSION` bump), and
+  `Dockerfile.toolchain`'s pre-warm (+ `scripts/toolchain/VERSION` bump).
+  A missed image still builds, but re-downloads the toolchain inside the
+  container on every run.
+- `just build` recipes skip cmake configure when `build.ninja` exists.
+  After editing `cacheVariables` in `CMakePresets.json`, run
+  `cmake --preset <name>` once by hand (ninja can't see preset edits).
+- `just lint` persists the cargo registry, advisory DB, and ccache dir in
+  gitignored `.docker-cache/`. Delete it to reset. Never mount over the
+  lint container's `/usr/local/rustup`.
+- `Dockerfile.arm32` builds inside BuildKit cache mounts; cache mounts are
+  not image layers, so anything the export stage needs must be `cp`'d out
+  within the same RUN. `docker builder prune` resets a corrupted cache.
 
 ## Project Map
 
@@ -208,6 +234,24 @@ and clears `/tmp/zaparoo/frontend.log`.
 `/media/fat/MiSTer_Zaparoo` is the integration binary shipped with MiSTer. It
 starts our `frontend`; do not replace that flow with a new wrapper script.
 
+## Release
+
+A MiSTer release bundles three independently versioned components: the
+**frontend** (this repo), the **`MiSTer_Zaparoo`** host wrapper (`Main_MiSTer`),
+and the **`menu_zaparoo.rbf`** menu core (`Menu_MiSTer`). The analog video path
+depends on all three matching. Full checklist: `docs/building.md` → "Cutting a
+release". Key points:
+
+- The version lives in two places: `project(... VERSION ...)` in `CMakeLists.txt`
+  and `version` in `rust/Cargo.toml`. Bump both and regenerate `rust/Cargo.lock`
+  (`cargo update --workspace`). The About page derives its version from the CMake
+  version (`ZAPAROO_VERSION`); do not hardcode it in `main.cpp` or QML.
+- The release workflow auto-resolves the latest `Main_MiSTer` and `Menu_MiSTer`
+  releases; override with the `menu_tag` workflow input or
+  `MENU_MISTER_TAG` / `MAIN_MISTER_TAG` when running the packaging script.
+- After publishing, update the downloader DB in `Zaparoo_MiSTer` (`db.json` and
+  its distributed zip(s)).
+
 ## Further Reading
 
 - `docs/architecture.md` — module graph, data flow, runtime/platform split
@@ -215,6 +259,7 @@ starts our `frontend`; do not replace that flow with a new wrapper script.
 - `docs/qml-gotchas.md` — QML issues qmllint often catches late
 - `docs/style.md` — corner-radius token, tile aspect, pill vs. sharp shapes
 - `docs/cxx-qt-bridge.md` — cxx-qt 0.8 bridge constraints
+- `docs/customization.md` — user overrides: `custom/` image folder, `[custom.system_names]`
 - `docs/translations.md` — `qsTr()`/`tr()` pipeline and locale catalogs
 - `design/README.md` — Qt Design Studio workflow and designer boundaries
 - `src/LICENSES/` — Qt LGPL notices

@@ -37,6 +37,11 @@ corrosion_import_crate(
     MANIFEST_PATH "${CMAKE_SOURCE_DIR}/rust/Cargo.toml" CRATES zaparoo-frontend-rs
 )
 
+corrosion_set_features(zaparoo_frontend_rs NO_DEFAULT_FEATURES)
+if(ZAPAROO_WITH_UPDATE)
+    corrosion_set_features(zaparoo_frontend_rs FEATURES update)
+endif()
+
 # ── Environment variables for cxx_qt_build's build.rs ─────────────────────── QMAKE: cxx_qt_build
 # (via qt-build-utils) uses qmake to locate Qt headers and libraries. For ARM32 cross-builds the
 # system qmake points to x86_64 Qt; override with the cross-compiled qmake.
@@ -63,6 +68,10 @@ qt_add_executable(
     "${CMAKE_SOURCE_DIR}/src/app/main.cpp"
     "${CMAKE_SOURCE_DIR}/src/app/media_image_provider.h"
     "${CMAKE_SOURCE_DIR}/src/app/media_image_provider.cpp"
+    "${CMAKE_SOURCE_DIR}/src/app/tinted_svg_image_provider.h"
+    "${CMAKE_SOURCE_DIR}/src/app/tinted_svg_image_provider.cpp"
+    "${CMAKE_SOURCE_DIR}/src/app/custom_image_provider.h"
+    "${CMAKE_SOURCE_DIR}/src/app/custom_image_provider.cpp"
     "${CMAKE_SOURCE_DIR}/src/app/native_video_writer.h"
     "${CMAKE_SOURCE_DIR}/src/app/native_video_writer.cpp"
 )
@@ -106,8 +115,18 @@ endif()
 
 target_link_libraries(
     frontend
-    PRIVATE zaparoo_frontend_rs zaparoo_ui_appplugin Qt6::Quick Qt6::QuickControls2
+    PRIVATE zaparoo_frontend_rs zaparoo_ui_appplugin Qt6::Quick Qt6::QuickControls2 Qt6::Svg
 )
+if(ZAPAROO_WITH_UPDATE)
+    target_link_libraries(frontend PRIVATE zaparoo_update_qmlplugin)
+    zaparoo_update_runtime_qml_import_path(_rs_update_runtime_qml_import_path)
+    if(_rs_update_runtime_qml_import_path)
+        target_compile_definitions(
+            frontend
+            PRIVATE ZAPAROO_UPDATE_RUNTIME_QML_IMPORT_PATH=\"${_rs_update_runtime_qml_import_path}\"
+        )
+    endif()
+endif()
 
 # Dummy CMake target satisfying qmlimportscanner's lookup for the cxx-qt plugin.
 # build/qml/Zaparoo/Browse/qmldir declares `optional plugin Zaparoo_Browse`, and

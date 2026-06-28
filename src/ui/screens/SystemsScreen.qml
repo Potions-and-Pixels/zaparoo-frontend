@@ -1,6 +1,7 @@
 // Zaparoo Frontend
 // Copyright (c) 2026 Wizzo Pty Ltd and the Zaparoo Project contributors.
 // SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0
+pragma ComponentBehavior: Bound
 
 import QtQuick
 import Zaparoo.Theme
@@ -29,6 +30,10 @@ Item {
     property alias systemsGrid: systemsGrid
     property alias listCard: listCard
     property bool transitioning: false
+    // Set false by MainLayout when this screen is not the active screen.
+    // Forwarded to systemsGrid.screenSettling so tile delegates reset
+    // their push-in scale off-screen.
+    property bool active: true
     // Router-driven flag: `MainLayout` writes this to
     // `!ScreenManager.hasModal` so the focused tile's accent ring
     // hides while a modal (the context menu) is on top of the stack.
@@ -38,6 +43,17 @@ Item {
     // times. The ring restores automatically when the modal pops.
     property bool gridFocused: true
     property bool optimisticLoading: false
+    // False until the user takes control of focus (first input). Combined
+    // with `_restoreDone` into `_focusReady`, which gates whether the grid
+    // tiles render focus at all.
+    property bool _focusArmed: false
+    // Set true once the load-time system restore has run (see Main.qml's
+    // `_restoreSystemsScreenSelection`). Combined with `_focusArmed` into
+    // `_focusReady`, which gates whether the grid tiles render focus at all —
+    // so the grid's default tile 0 never paints a ring during the window
+    // before restore points `currentIndex` at the saved system on a cold start.
+    property bool _restoreDone: false
+    readonly property bool _focusReady: systems._focusArmed || systems._restoreDone
     readonly property bool _listLayout: Browse.Settings.current_browse_layout === "list"
     readonly property bool _crtGridLayout: Theme.crtNativePath && !systems._listLayout
     readonly property bool _crtListStrip: Theme.crtNativePath && systems._listLayout
@@ -51,6 +67,9 @@ Item {
     readonly property var _listProfile: systems._viewProfile && systems._viewProfile.list ? systems._viewProfile.list : null
     readonly property int _listOverlayBottomMargin: systems._listProfile ? systems._listProfile.overlayBottomMargin : Sizing.pctH(15)
     readonly property var _gridShape: Sizing.systemsGridShape(Sizing.screenWidth, Sizing.screenHeight)
+    readonly property bool _loading: Browse.SystemsModel.loading || systems.optimisticLoading
+    readonly property bool _overlayLoadingVisible: stateOverlay.loadingVisible
+    readonly property bool _gateHide: systems.transitioning || systems._loading || systems._overlayLoadingVisible
 
     signal requestAccept(systemId: string)
     signal requestHubScreen
@@ -103,6 +122,7 @@ Item {
     function _focusIndex(index: int): void {
         if (index < 0 || index >= systems.systemsGrid.itemCount)
             return;
+        systems._focusArmed = true;
         systems.systemsGrid.currentIndex = index;
         Browse.SystemsState.system_id = Browse.SystemsModel.system_id_at(systems.systemsGrid.currentIndex);
     }
@@ -110,7 +130,7 @@ Item {
     // Mirrors ScreenStateOverlay's `state` ternary so accept routing and
     // the in-screen overlay agree on which state we're in.
     function _state(): string {
-        if (Browse.SystemsModel.loading || systems.optimisticLoading)
+        if (systems._loading || systems._overlayLoadingVisible)
             return "loading";
         if ((Browse.SystemsModel.error_message ?? "") !== "")
             return "error";
@@ -120,6 +140,12 @@ Item {
     }
 
     function handleAction(action: string): void {
+        if ((action === "left" || action === "right" || action === "up" || action === "down" || action === "page_prev" || action === "page_next") && systems._overlayLoadingVisible)
+            return;
+        if (action === "context_menu" && systems._gateHide)
+            return;
+        systems._focusArmed = true;
+
         if (action === "left") {
             systems._performMove(-1, 0);
         } else if (action === "right") {
@@ -155,19 +181,41 @@ Item {
                 return;
             }
             const chosen = Browse.SystemsModel.system_id_at(systems.systemsGrid.currentIndex);
-            systems.requestAccept(chosen);
-        } else if (action === "write_card") {
+            // Route the push-in cue to the visible layout. In list mode the
+            // grid is hidden and the BrowseList is shown, so pulsing the grid
+            // would animate nothing; mirror the layout-aware routing
+            // MediaListScreen.pulseActivate() uses.
+            if (systems._listLayout)
+                listCard.activatePulse++;
+            else
+                systems.systemsGrid.pulseActivate();
+            pressCommit._systemId = chosen;
+            pressCommit.arm();
+        } else if (action === "context_menu") {
             if (systems.systemsGrid.itemCount > 0) {
                 const idx = systems.systemsGrid.currentIndex;
                 Browse.SystemsState.system_id = Browse.SystemsModel.system_id_at(idx);
                 systems.requestContextMenu(idx, systems._listLayout ? listCard.currentCellRectIn(systems) : systems.systemsGrid.currentCellRectIn(systems));
             }
         } else if (action === "cancel") {
+            // Disarm a pending accept so a press-then-back inside the deferred
+            // window cannot drill into a system after the user has backed out.
+            pressCommit.stop();
             systems.requestHubScreen();
         }
     }
 
     // ── Visual tree ───────────────────────────────────────────────────────────
+
+    DeferredAction {
+        id: pressCommit
+        property string _systemId: ""
+        onDeferred: {
+            const id = _systemId;
+            _systemId = "";
+            systems.requestAccept(id);
+        }
+    }
 
     // Top status strip — page counter (left), category title (center),
     // total-systems badge (right). Replaces the standalone top label
@@ -196,13 +244,13 @@ Item {
         totalPages: systems._footerProfile && systems._footerProfile.bottomStatusVisible ? 1 : Math.max(1, Math.ceil(Browse.SystemsModel.count / systemsGrid.pageSize))
         totalText: Theme.crtNativePath ? "" : (Browse.SystemsModel.count > 0 ? qsTr("%1 systems").arg(Browse.SystemsModel.count) : "")
         rightTextOverride: !systems._listLayout || systemsGrid.itemCount <= 0 ? "" : qsTr("%1 / %2").arg(systemsGrid.currentIndex + 1).arg(Math.max(1, Browse.SystemsModel.count))
-        visible: !systems.transitioning && (!systems._statusProfile || systems._statusProfile.topStripVisible)
+        visible: !systems._gateHide && (!systems._statusProfile || systems._statusProfile.topStripVisible)
     }
 
     BrowseListDetailView {
         id: listCard
 
-        visible: !systems.transitioning && systems._listLayout
+        visible: !systems._gateHide && systems._listLayout
         anchors.left: parent.left
         anchors.leftMargin: systems._listProfile ? systems._listProfile.cardSideMargin : Sizing.pctW(5)
         anchors.right: parent.right
@@ -213,6 +261,8 @@ Item {
         anchors.bottomMargin: systems._listProfile ? systems._listProfile.cardBottomMargin : Sizing.pctH(8)
         model: Browse.SystemsModel
         currentIndex: systemsGrid.currentIndex
+        focusReady: systems._focusReady
+        screenSettling: !systems.active
         layoutProfile: systems._viewProfile
         detailTitle: listCard.currentName
         detailCoverKey: listCard.currentCoverKey
@@ -224,7 +274,7 @@ Item {
         }
         onItemRightClicked: index => {
             systems._focusIndex(index);
-            systems.handleAction("write_card");
+            systems.handleAction("context_menu");
         }
         onEmptyRightClicked: systems.handleAction("cancel")
         onPageWheelRequested: delta => systems.handleAction(delta > 0 ? "page_next" : "page_prev")
@@ -242,6 +292,8 @@ Item {
         anchors.bottom: parent.bottom
         anchors.bottomMargin: systems._footerProfile ? systems._footerProfile.gridBottomMargin : (Sizing.pctH(8) + Sizing.pctH(7))
         focused: systems.gridFocused
+        screenSettling: !systems.active
+        focusReady: systems._focusReady
         model: Browse.SystemsModel
         layoutProfile: systems._viewProfile
         columnsOverride: systems._gridShape.columns
@@ -256,15 +308,15 @@ Item {
         }
         onItemRightClicked: index => {
             systems._focusIndex(index);
-            systems.handleAction("write_card");
+            systems.handleAction("context_menu");
         }
         onEmptyRightClicked: systems.handleAction("cancel")
         onPageWheelRequested: delta => systems.handleAction(delta > 0 ? "page_next" : "page_prev")
 
-        // Hide the tiles while the router holds us here on a forward
-        // transition (Systems → Games) so the centred "Loading…" cue
-        // (painted from Main.qml) reads alone over the cleared grid.
-        visible: !systems.transitioning && !systems._listLayout
+        // Hide tiles as soon as the model enters Loading, while the
+        // centered cue below can still use its anti-flicker delay.
+        // Otherwise the cleared/reseeded model can flash loading tiles.
+        visible: !systems._gateHide && !systems._listLayout
     }
 
     // Active system caption — single big line just under the grid.
@@ -279,11 +331,11 @@ Item {
         anchors.bottomMargin: systems._footerProfile ? systems._footerProfile.activeLabelBottomMargin : Sizing.pctH(8)
         height: systems._footerProfile ? systems._footerProfile.activeLabelHeight : Sizing.pctH(7)
         text: systemsGrid.itemCount > 0 ? Browse.SystemsModel.system_name_at(systemsGrid.currentIndex) : ""
-        visible: !systems.transitioning && !systems._listLayout
+        visible: !systems._gateHide && !systems._listLayout
     }
 
     Text {
-        visible: systems._footerProfile && systems._footerProfile.bottomStatusVisible && !systems.transitioning && !systems._listLayout && Browse.SystemsModel.count > 0
+        visible: systems._footerProfile && systems._footerProfile.bottomStatusVisible && !systems._gateHide && !systems._listLayout && Browse.SystemsModel.count > 0
         anchors.left: parent.left
         anchors.leftMargin: systems._footerProfile ? systems._footerProfile.bottomStatusLeftMargin : 0
         anchors.verticalCenter: activeLabel.verticalCenter
@@ -300,7 +352,7 @@ Item {
     }
 
     Text {
-        visible: systems._footerProfile && systems._footerProfile.bottomStatusVisible && !systems.transitioning && !systems._listLayout && Math.ceil(Browse.SystemsModel.count / systemsGrid.pageSize) > 1
+        visible: systems._footerProfile && systems._footerProfile.bottomStatusVisible && !systems._gateHide && !systems._listLayout && Math.ceil(Browse.SystemsModel.count / systemsGrid.pageSize) > 1
         anchors.right: parent.right
         anchors.rightMargin: systems._footerProfile ? systems._footerProfile.bottomStatusRightMargin : 0
         anchors.verticalCenter: activeLabel.verticalCenter
@@ -317,12 +369,14 @@ Item {
     }
 
     ScreenStateOverlay {
+        id: stateOverlay
+
         x: systems._listLayout ? 0 : systemsGrid.x
         y: systems._listLayout ? listCard.y : systemsGrid.y
         width: systems._listLayout ? systems.width : systemsGrid.width
         height: systems._listLayout ? Math.max(0, systems.height - listCard.y - systems._listOverlayBottomMargin) : systemsGrid.height
         enabled: true
-        loading: Browse.SystemsModel.loading || systems.optimisticLoading
+        loading: systems._loading
         errorMessage: Browse.SystemsModel.error_message ?? ""
         count: Browse.SystemsModel.count
         emptyText: qsTr("No systems in this category")

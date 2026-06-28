@@ -4,9 +4,15 @@
 
 #[macro_use]
 mod bind;
+pub mod image_overrides;
 mod media_image_cache;
+mod media_meta_cache;
 mod mister_runtime;
 mod models;
+pub mod system_logos;
+pub mod system_name_overrides;
+pub mod system_names;
+pub mod system_region;
 
 /// Called from the Qt message handler in main.cpp. `level` is `QtMsgType`
 /// cast to u8. `msg_ptr`/`msg_len` are a UTF-8 slice owned by the caller.
@@ -45,7 +51,7 @@ use zaparoo_core::{
     config::load_config,
     logger::{debug_logging_enabled, install},
     persist, platform,
-    platform_paths::{config_file_path, log_file_path, stderr_log_path},
+    platform_paths::{config_file_path, custom_dir, log_file_path, stderr_log_path},
     store::Store,
 };
 
@@ -110,6 +116,8 @@ static LANGUAGE_CODE: OnceLock<CString> = OnceLock::new();
 static CRT_NATIVE_PATH_ENABLED: OnceLock<bool> = OnceLock::new();
 static VIDEO_WIDTH: OnceLock<u32> = OnceLock::new();
 static VIDEO_HEIGHT: OnceLock<u32> = OnceLock::new();
+static CRT_H_OFFSET: OnceLock<i32> = OnceLock::new();
+static CRT_V_OFFSET: OnceLock<i32> = OnceLock::new();
 static DEBUG_LOGGING_ENABLED: OnceLock<bool> = OnceLock::new();
 static STARTUP_TRACE_ORIGIN: OnceLock<Instant> = OnceLock::new();
 
@@ -158,6 +166,23 @@ pub extern "C" fn zaparoo_rust_video_width() -> u32 {
 #[no_mangle]
 pub extern "C" fn zaparoo_rust_video_height() -> u32 {
     VIDEO_HEIGHT.get().copied().unwrap_or(0)
+}
+
+/// Persisted native CRT horizontal centering trim (pixels, + = right),
+/// already clamped to the core's honored range. Pulled by
+/// `native_video_writer.cpp` at init so word1 carries the saved
+/// calibration from the first published frame. Reads before
+/// [`zaparoo_rust_init`] return `0`.
+#[no_mangle]
+pub extern "C" fn zaparoo_rust_crt_h_offset() -> i32 {
+    CRT_H_OFFSET.get().copied().unwrap_or(0)
+}
+
+/// Persisted native CRT vertical centering trim (lines, + = down). See
+/// [`zaparoo_rust_crt_h_offset`].
+#[no_mangle]
+pub extern "C" fn zaparoo_rust_crt_v_offset() -> i32 {
+    CRT_V_OFFSET.get().copied().unwrap_or(0)
 }
 
 #[no_mangle]
@@ -349,13 +374,27 @@ pub extern "C" fn zaparoo_rust_init(crt_native_path_forced: bool) -> c_int {
     let _ = DEBUG_LOGGING_ENABLED.set(debug_logging);
     startup_trace("rust:init config loaded");
 
-    // CRT path always renders to the native writer's fixed 320x240 RGB8888
-    // linuxfb surface. User-configured [video] dimensions still apply to the
-    // normal MiSTer path, but `--crt` overrides them so startup `vmode`, the
-    // desktop preview canvas, and the writer's fb0 validation all agree.
+    // CRT path always renders to one of the native writer's mode
+    // geometries (352x240 NTSC, 352x288 PAL, 720x480 480i), selected by
+    // the persisted video standard. User-configured [video] dimensions
+    // still apply to the normal MiSTer path, but `--crt` overrides them
+    // so startup `vmode`, the desktop preview canvas, and the writer's
+    // fb0 validation all agree. frontend.toml is the durable source for
+    // the standard and offsets (state.toml lives on tmpfs on MiSTer and
+    // mirrors it).
     if crt_native_path_forced {
-        config.video_width = 320;
-        config.video_height = 240;
+        let standard = zaparoo_core::config::normalize_crt_video_standard(
+            config.settings.crt_video_standard.as_deref().unwrap_or(""),
+        );
+        let (width, height) = zaparoo_core::config::crt_video_dimensions(standard);
+        config.video_width = width;
+        config.video_height = height;
+        let (h_offset, v_offset) = zaparoo_core::config::clamp_crt_offsets(
+            config.settings.crt_h_offset.unwrap_or(0),
+            config.settings.crt_v_offset.unwrap_or(0),
+        );
+        let _ = CRT_H_OFFSET.set(h_offset);
+        let _ = CRT_V_OFFSET.set(v_offset);
     }
 
     // Cache the language override so `zaparoo_rust_language_code` (called
@@ -421,6 +460,26 @@ pub extern "C" fn zaparoo_rust_init(crt_native_path_forced: bool) -> c_int {
     let persist_state = Arc::new(Mutex::new(persist::load()));
     startup_trace("rust:persist loaded");
 
+    // Hidden browse filters are durable preferences, not volatile
+    // navigation state. Source them only from frontend.toml so they
+    // survive MiSTer's /tmp lifecycle without polluting state.toml.
+    let hidden_browse_prefs = Arc::new(Mutex::new(models::HiddenBrowsePrefs {
+        hidden_categories: config.settings.hidden_categories.clone(),
+        hidden_system_ids: config.settings.hidden_system_ids.clone(),
+    }));
+    startup_trace("rust:hidden browse prefs loaded");
+
+    // Register the customization root without scanning it. Hub and system
+    // image scans run asynchronously after first paint; system display-name
+    // overrides are already in the parsed config and need no filesystem work.
+    let custom_root = config
+        .custom_dir
+        .clone()
+        .map_or_else(custom_dir, std::path::PathBuf::from);
+    image_overrides::configure(&custom_root);
+    system_name_overrides::set(config.system_names.clone());
+    startup_trace("rust:image override root and name overrides configured");
+
     // init_globals takes the owning `Runtime` — the static holder is
     // what `zaparoo_rust_shutdown` later drains via `shutdown_timeout`.
     // Other subsystems reach the runtime through `global_handle()`.
@@ -429,6 +488,7 @@ pub extern "C" fn zaparoo_rust_init(crt_native_path_forced: bool) -> c_int {
         runtime,
         store,
         persist_state,
+        hidden_browse_prefs,
         config.key_to_action.clone(),
         core_is_local,
     );

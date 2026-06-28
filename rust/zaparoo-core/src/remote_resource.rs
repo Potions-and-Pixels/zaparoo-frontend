@@ -81,6 +81,10 @@ impl<T: Clone + Send + Sync + 'static> RemoteResource<T> {
         self.status.subscribe()
     }
 
+    pub fn is_ready(&self) -> bool {
+        matches!(&*self.status.borrow(), ResourceStatus::Ready(_))
+    }
+
     /// Trigger a refetch outside the natural connection-change cadence.
     /// While connected, this cancels any in-flight fetch and starts a
     /// new one; otherwise the notification queues and fires on the
@@ -499,7 +503,7 @@ mod tests {
             // Long-running fetch keeps the spawned task in Loading; it
             // never publishes Ready while we're checking the seed.
             let res = RemoteResource::<i32>::spawn_with(conn_rx, runtime.handle(), || async {
-                tokio::time::sleep(Duration::from_secs(60)).await;
+                tokio::time::sleep(Duration::from_mins(1)).await;
                 Ok(0)
             });
             let sub = res.subscribe();

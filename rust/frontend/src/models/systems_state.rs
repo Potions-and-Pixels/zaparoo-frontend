@@ -7,7 +7,10 @@
 // Schema version is checked independently from other screens on load
 // (see `zaparoo_core::persist`).
 
-use crate::models::{with_persist_mut, with_persist_read};
+use crate::models::{
+    with_hidden_browse_prefs_mut, with_hidden_browse_prefs_read, with_persist_mut,
+    with_persist_read,
+};
 use cxx_qt::{CxxQtType, Initialize};
 use cxx_qt_lib::QString;
 use std::pin::Pin;
@@ -35,6 +38,18 @@ pub mod ffi {
 
         #[qinvokable]
         fn set_system_id(self: Pin<&mut SystemsState>, value: QString);
+
+        /// Add `id` to the persisted hidden-system set. No-op if already there.
+        #[qinvokable]
+        fn hide_system(self: Pin<&mut SystemsState>, id: &QString);
+
+        /// Remove `id` from the persisted hidden-system set.
+        #[qinvokable]
+        fn unhide_system(self: Pin<&mut SystemsState>, id: &QString);
+
+        /// Returns true when `id` is in the persisted hidden-system set.
+        #[qinvokable]
+        fn is_system_hidden(self: &SystemsState, id: &QString) -> bool;
     }
 
     impl cxx_qt::Initialize for SystemsState {}
@@ -62,6 +77,28 @@ impl ffi::SystemsState {
         self.as_mut().rust_mut().system_id = value;
         self.as_mut().system_id_changed();
         persist_systems(|s| s.system_id = value_str);
+    }
+
+    fn hide_system(self: Pin<&mut Self>, id: &QString) {
+        let id_str = id.to_string();
+        if id_str.is_empty() {
+            return;
+        }
+        with_hidden_browse_prefs_mut(|p| {
+            if !p.hidden_system_ids.contains(&id_str) {
+                p.hidden_system_ids.push(id_str);
+            }
+        });
+    }
+
+    fn unhide_system(self: Pin<&mut Self>, id: &QString) {
+        let id_str = id.to_string();
+        with_hidden_browse_prefs_mut(|p| p.hidden_system_ids.retain(|x| x != &id_str));
+    }
+
+    fn is_system_hidden(&self, id: &QString) -> bool {
+        let id_str = id.to_string();
+        with_hidden_browse_prefs_read(|p| p.hidden_system_ids.contains(&id_str))
     }
 }
 

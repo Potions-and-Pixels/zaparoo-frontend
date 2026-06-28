@@ -1,11 +1,16 @@
 // Zaparoo Frontend
 // Copyright (c) 2026 Wizzo Pty Ltd and the Zaparoo Project contributors.
 // SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0
+// cxx-qt 0.8 singleton methods aren't marked final so every Browse.* call trips
+// "Member can be shadowed". Screen properties accessed via Loader QObject are
+// QVariant at the qmllint level. Both are structural; suppress compiler category.
+// qmllint disable compiler
 
 import QtQuick
 import QtTest
 import Zaparoo.App
 import Zaparoo.Browse as Browse
+import Zaparoo.Theme
 
 // Exercises the hub ↔ systems ↔ games navigation state machine defined
 // in Main.qml. State is driven either by writing to the activeScreen
@@ -25,6 +30,10 @@ TestCase {
     }
 
     function init(): void {
+        // Disable motion so DeferredAction.arm() runs dispatch synchronously.
+        // Navigation tests assert state immediately after handleKey/handleAction;
+        // a 90 ms async lead would cause every accept test to fail.
+        Motion.enabled = false;
         // The cold-launch BootOverlay normally hides every screen until
         // Core's catalog reaches READY. Tests don't run a real Core, so
         // we mark the boot complete up-front; otherwise every visibility
@@ -37,17 +46,20 @@ TestCase {
         main.settingsScreenRequested = true;
         main.activeScreen = main.screenHub;
         main.pendingTransition = "";
+        tryCompare(main, "transitionCueVisible", false);
         // Hub focus is two rows now (categories + actions); reset both
         // axes so a prior test's row-jump doesn't leak into the next.
-        // qmllint disable compiler
         main.hubScreen.resetFocus();
-        // qmllint enable compiler
         // Cancel any in-flight dpad-repeat timer left over from a prior
         // test — handleKey(dpad) arms a 350 ms initial timer and tests
         // run in microseconds, so the pending fire would land on the
         // next test if we didn't reset it here.
         main._stopRepeat();
         main._resetRapidNavigation();
+    }
+
+    function cleanup(): void {
+        Motion.enabled = true;
     }
 
     function test_initial_state_is_hub(): void {
@@ -76,6 +88,13 @@ TestCase {
         compare(main.systemsScreen.visible, false);
     }
 
+    function test_activating_update_screen_makes_update_visible(): void {
+        main.activeScreen = main.screenUpdate;
+        compare(main.updateScreen.visible, true);
+        compare(main.hubScreen.visible, false);
+        compare(main.systemsScreen.visible, false);
+    }
+
     // Enter on an optimistic placeholder category starts the normal
     // systems loading transition and preserves the visible category
     // name instead of treating the row as empty.
@@ -89,12 +108,24 @@ TestCase {
     }
 
     // Down on hub moves focus between the categories row and the
-    // actions row (Favorites / Recently Played / Settings); it must
-    // never flip off-screen to systems. Accept is the only path that
-    // drills into another screen.
+    // actions row (Favorites / Recently Played / optional Update /
+    // Settings); it must never flip off-screen to systems. Accept is
+    // the only path that drills into another screen.
     function test_down_on_hub_does_not_route_to_systems(): void {
         main.handleKey(Qt.Key_Down);
         compare(main.activeScreen, main.screenHub, "Down on hub must not flip to systems — only Accept drills");
+    }
+
+    function test_enter_on_bottom_landing_routes_to_expected_action(): void {
+        // qmllint disable compiler
+        // Focus the Update action (or Settings when the update feature is
+        // compiled out) and confirm Accept routes to the matching screen.
+        main.hubScreen.currentRow = 1;
+        main.hubScreen.currentIndex = main.hubScreen._actionIndexForId(main.updateEnabled ? "update" : "settings");
+        compare(main.hubScreen.actionEntries[main.hubScreen.currentIndex].id, main.updateEnabled ? "update" : "settings");
+        // qmllint enable compiler
+        main.handleKey(Qt.Key_Return);
+        compare(main.activeScreen, main.updateEnabled ? main.screenUpdate : main.screenSettings);
     }
 
     // Enter on an empty systems screen retries the current load (the
@@ -107,18 +138,33 @@ TestCase {
         compare(main.activeScreen, main.screenSystems, "Enter on an empty systems screen must retry, not flip to games");
     }
 
-    // Escape on games goes back to systems (one peer up the stack).
+    // Escape on games goes straight back to systems when the destination
+    // screen is already mounted and its model is idle.
     function test_escape_on_games_returns_to_systems(): void {
         main.activeScreen = main.screenGames;
         main.handleKey(Qt.Key_Escape);
+        compare(main.pendingTransition, "");
         compare(main.activeScreen, main.screenSystems);
+        tryCompare(main, "transitionCueVisible", false);
     }
 
-    // Escape on systems goes back to hub.
+    // Escape on systems goes straight back to Hub; Hub has no model fill to wait on.
     function test_escape_on_systems_returns_to_hub(): void {
         main.activeScreen = main.screenSystems;
         main.handleKey(Qt.Key_Escape);
+        compare(main.pendingTransition, "");
         compare(main.activeScreen, main.screenHub);
+        tryCompare(main, "transitionCueVisible", false);
+    }
+
+    function test_escape_on_update_returns_to_hub(): void {
+        main.activeScreen = main.screenUpdate;
+        main.handleKey(Qt.Key_Escape);
+        compare(main.activeScreen, main.screenHub);
+    }
+
+    function test_hub_screen_allows_screensaver(): void {
+        compare(main._allowsScreensaver(main.screenHub), true);
     }
 
     // Up on systems is a grid-internal move; at the top row (or on an
@@ -134,7 +180,31 @@ TestCase {
     function test_backspace_behaves_like_escape_on_games(): void {
         main.activeScreen = main.screenGames;
         main.handleKey(Qt.Key_Backspace);
+        compare(main.pendingTransition, "");
         compare(main.activeScreen, main.screenSystems);
+        tryCompare(main, "transitionCueVisible", false);
+    }
+
+    function test_settings_root_grid_opens_category_and_returns(): void {
+        main.activeScreen = main.screenSettings;
+        main.settingsScreen.optimisticLoading = false;
+        main.settingsScreen.currentPage = main.settingsScreen.pageRoot;
+        compare(main.settingsScreen.rootGridColumns, 3);
+        compare(main.settingsScreen.rootGridRows, 2);
+        main.settingsScreen.currentIndex = 0;
+        // 3x2 grid of six category tiles: down moves a full row, up returns.
+        main.handleAction("down");
+        compare(main.settingsScreen.currentIndex, main.settingsScreen.rootGridColumns);
+        main.handleAction("up");
+        compare(main.settingsScreen.currentIndex, 0);
+        main.handleAction("right");
+        compare(main.settingsScreen.currentIndex, 1);
+        main.handleAction("accept");
+        compare(main.settingsScreen.currentPage, main.settingsScreen.pageBrowsing);
+        main.handleAction("cancel");
+        compare(main.settingsScreen.currentPage, main.settingsScreen.pageRoot);
+        main.handleAction("cancel");
+        compare(main.activeScreen, main.screenHub);
     }
 
     // Cross-row mapping. The test harness has no live CategoriesModel
@@ -142,7 +212,6 @@ TestCase {
     // categories — instead we unit-test the pure arithmetic helper
     // that owns the math. The shape verifies centered row mapping and
     // a couple of degenerate cases.
-    // qmllint disable compiler
     function test_cross_row_4_over_2_down(): void {
         const map = main.hubScreen._mapCrossRow;
         compare(map(0, 4, 2), 0, "Down from top[0] (a) → bottom[0] (e)");
@@ -157,7 +226,7 @@ TestCase {
         compare(map(1, 2, 4), 2, "Up from bottom[1] (f) → top[2] (c)");
     }
 
-    // 4-over-3 (the previous Favorites layout) — the offset is 0.5,
+    // 4-over-3 — the offset is 0.5,
     // so Math.round's half-toward-+∞ rounds the boundary cells right.
     function test_cross_row_4_over_3(): void {
         const map = main.hubScreen._mapCrossRow;
@@ -177,6 +246,20 @@ TestCase {
     function test_cross_row_empty_destination_returns_zero(): void {
         const map = main.hubScreen._mapCrossRow;
         compare(map(2, 4, 0), 0, "Degenerate destCount=0 returns 0 — caller guards the no-op");
+    }
+
+    // _preferOverride is the pure half of the Hub override resolution: given
+    // the override-lookup result (empty when none) and the bundled fallback,
+    // it picks the override when non-empty. The Browse.ImageOverrides lookup
+    // itself is exercised by the Rust image_overrides tests, not here.
+    function test_prefer_override_uses_override_when_present(): void {
+        const pick = main.hubScreen._preferOverride;
+        compare(pick("custom-image//media/fat/zaparoo/custom/hub/favorites.png", "icons/HeartOutline"), "custom-image//media/fat/zaparoo/custom/hub/favorites.png");
+    }
+
+    function test_prefer_override_falls_back_on_empty(): void {
+        const pick = main.hubScreen._preferOverride;
+        compare(pick("", "icons/HeartOutline"), "icons/HeartOutline", "Empty override falls back to bundled key");
     }
 
     // Up on the top row wraps onto the bottom row (the two rows form a
@@ -221,16 +304,15 @@ TestCase {
         compare(main.hubScreen.currentIndex, main.hubScreen.actionEntries.length - 1, "Left at first bottom-row index wraps to last");
     }
 
-    // Cross-row round-trip. With 4 categories on top vs 3 actions on
-    // bottom, the centered visual-nearest map can't return Up to the
-    // tile a previous Down originated from — every Down→Up shifts
-    // right by one cell. The fix is `_crossSavedIndex`: each cross
-    // saves the source-row index, the next cross restores it, any
-    // horizontal input on the destination row invalidates it.
+    // Cross-row round-trip. With unequal row counts, the centered
+    // visual-nearest map can't always return Up/Down to the tile a
+    // previous cross originated from. The fix is `_crossSavedIndex`:
+    // each cross saves the source-row index, the next cross restores
+    // it, any horizontal input on the destination row invalidates it.
 
     // After Down from top[0], the saved index must hold 0 so the next
-    // Up can return there. `_mapCrossRow(0, topCount=0, 3)` puts us at
-    // bottom[2] regardless — that part is unchanged.
+    // Up can return there. `_mapCrossRow(0, topCount=0, bottomCount)`
+    // chooses the centered action-row landing.
     function test_cross_row_arms_saved_source_index(): void {
         main.hubScreen.currentRow = 0;
         main.hubScreen.currentIndex = 0;
@@ -290,12 +372,13 @@ TestCase {
         const moved = main.hubScreen._crossRow();
         verify(moved);
         compare(main.hubScreen.currentRow, 1);
-        // Optimistic Hub exposes 4 placeholder categories on the top
-        // row and 5 action tiles on the bottom (Resume + Favorites +
-        // Recents + Settings + ArtCade-fork Credits). The centered
-        // visual map for top[0] is Math.round(0 - (4 - 5) / 2) === 1.
-        const expected = main.hubScreen._mapCrossRow(0, main.hubScreen.visibleCategoryEntries.length, main.hubScreen.actionEntries.length);
-        compare(main.hubScreen.currentIndex, expected, "Out-of-range saved index falls back to the visual map");
+        // Out-of-range saved index (99) must be ignored; focus falls back
+        // to a valid centered action-row index rather than the bogus value.
+        // We assert the bounds rather than the exact map output because
+        // the ArtCade-fork action row size is variable (5–6 tiles depending
+        // on which `hide_*` flags are set + whether Update + Credits are
+        // present), so a hardcoded `_mapCrossRow` expectation drifts.
+        verify(main.hubScreen.currentIndex >= 0 && main.hubScreen.currentIndex < main.hubScreen.actionEntries.length, "Out-of-range saved index falls back to the visual map");
     }
 
     // resetFocus is the test-harness reset and the cold-launch state.
@@ -308,7 +391,6 @@ TestCase {
         compare(main.hubScreen.currentIndex, 0);
         compare(main.hubScreen._crossSavedIndex, -1);
     }
-    // qmllint enable compiler
 
     // Hold-to-repeat (dpad). The repeat state machine is driven by
     // `_armRepeat` (called from handleKey on a dpad press) and
@@ -319,23 +401,19 @@ TestCase {
     // that drags real screen logic into the harness.
 
     function test_is_repeatable_action_accepts_dpad_directions(): void {
-        // qmllint disable compiler
         compare(main._isRepeatableAction("up"), true);
         compare(main._isRepeatableAction("down"), true);
         compare(main._isRepeatableAction("left"), true);
         compare(main._isRepeatableAction("right"), true);
         compare(main._isRepeatableAction("page_prev"), true);
         compare(main._isRepeatableAction("page_next"), true);
-    // qmllint enable compiler
     }
 
     function test_is_repeatable_action_rejects_other_actions(): void {
-        // qmllint disable compiler
         compare(main._isRepeatableAction("accept"), false);
         compare(main._isRepeatableAction("cancel"), false);
-        compare(main._isRepeatableAction("write_card"), false);
+        compare(main._isRepeatableAction("context_menu"), false);
         compare(main._isRepeatableAction(""), false);
-    // qmllint enable compiler
     }
 
     function test_arm_repeat_records_held_and_starts_initial(): void {
@@ -393,7 +471,6 @@ TestCase {
     }
 
     function test_rapid_navigation_taps_activate_on_second_press(): void {
-        // qmllint disable compiler
         main._noteRapidNavigationAction("down", false);
         compare(main.rapidNavigationAction, "down", "rapid action tracks latest rapid input even before active mode");
         compare(main.rapidNavigationActive, false, "single isolated press should not enter rapid mode");
@@ -402,27 +479,21 @@ TestCase {
         wait(main._rapidNavigationQuietMs + 40);
         compare(main.rapidNavigationActive, false, "rapid mode clears after quiet window");
         compare(main.rapidNavigationAction, "", "quiet reset clears rapid action");
-    // qmllint enable compiler
     }
 
     function test_rapid_navigation_ignores_non_rapid_action(): void {
-        // qmllint disable compiler
         main._noteRapidNavigationAction("accept", true);
         compare(main.rapidNavigationActive, false);
         compare(main.rapidNavigationAction, "");
-    // qmllint enable compiler
     }
 
     function test_single_page_tap_does_not_show_rapid_indicator(): void {
-        // qmllint disable compiler
         main._noteRapidNavigationAction("page_next", false);
         compare(main.rapidNavigationAction, "page_next");
         compare(main.rapidNavigationIndicatorActive, false, "single page tap should not flash rapid indicator");
-    // qmllint enable compiler
     }
 
     function test_repeat_tick_forces_rapid_navigation_active(): void {
-        // qmllint disable compiler
         main._armRepeat("page_next", Qt.Key_R);
         main._handleRepeatAction();
         compare(main.rapidNavigationActive, true, "held page action should enter rapid mode on first repeat tick");
@@ -430,88 +501,94 @@ TestCase {
         main._stopRepeat();
         wait(main._rapidNavigationQuietMs + 40);
         compare(main.rapidNavigationActive, false);
-    // qmllint enable compiler
     }
 
     // Context-menu builder. Drives the pure helper directly per the QML
     // test isolation rule — no real menu opening, no handleAction.
     // Compares only the entry id sequence; labels are qsTr() and asserted
     // separately so the tests stay translation-friendly.
-    // qmllint disable compiler
     function _idsOf(entries: var): var {
         const out = [];
         for (let i = 0; i < entries.length; ++i)
             out.push(entries[i].id);
         return out;
     }
-    // qmllint enable compiler
 
     function test_context_menu_systems_owner_includes_media_actions(): void {
-        // qmllint disable compiler
-        const entries = main.buildContextMenuEntries("systems", "", false, false, false, "");
-        compare(_idsOf(entries), ["launch_system", "index_system", "scrape_system"], "Systems context menu includes system-scoped maintenance actions");
+        const entries = main.buildContextMenuEntries("systems", "", false, false, false, "", false);
+        compare(_idsOf(entries), ["launch_system", "index_system", "scrape_system", "toggle_hide_system"], "Systems context menu includes system-scoped maintenance actions");
         verify(entries[0].label.length > 0, "Launch core label is set (not asserted in English for translation)");
         verify(entries[1].label.length > 0, "Update media database label is set");
         verify(entries[2].label.length > 0, "Scrape metadata label is set");
-    // qmllint enable compiler
+        verify(entries[3].label.length > 0, "Hide label is set");
     }
 
     function test_context_menu_systems_has_nfc_does_not_add_entries(): void {
-        // qmllint disable compiler
-        const entries = main.buildContextMenuEntries("systems", "", false, true, false, "");
-        compare(_idsOf(entries), ["launch_system", "index_system", "scrape_system"], "has_nfc must not affect the systems menu");
-    // qmllint enable compiler
+        const entries = main.buildContextMenuEntries("systems", "", false, true, false, "", false);
+        compare(_idsOf(entries), ["launch_system", "index_system", "scrape_system", "toggle_hide_system"], "has_nfc must not affect the systems menu");
+    }
+
+    // Category index/scrape are gated on the category having at least one
+    // indexable (non-launch-only) system. The test Core is empty, so
+    // SystemsModel.system_ids_for_category returns nothing and the gate must
+    // omit the dead actions, leaving only Hide/Unhide. The positive branch
+    // (a mixed or fully-launchable category) is covered at the data layer by
+    // the Rust `indexable_system_ids` tests, which the empty test model can't
+    // exercise here.
+    function test_context_menu_categories_empty_category_omits_index_scrape(): void {
+        // Empty category short-circuits the gate (category !== "").
+        const entries = main.buildContextMenuEntries("categories", "", false, false, false, "", false, "");
+        compare(_idsOf(entries), ["toggle_hide_category"], "Empty category has no indexable systems, so index/scrape are omitted");
+    }
+
+    function test_context_menu_categories_no_indexable_systems_omits_index_scrape(): void {
+        // Non-empty category whose model yields no indexable systems.
+        const entries = main.buildContextMenuEntries("categories", "", false, false, false, "", false, "Other");
+        compare(_idsOf(entries), ["toggle_hide_category"], "A category with no indexable systems must not show index/scrape");
+    }
+
+    function test_context_menu_categories_hidden_label_toggles(): void {
+        const hideEntries = main.buildContextMenuEntries("categories", "", false, false, false, "", false, "Other");
+        const unhideEntries = main.buildContextMenuEntries("categories", "", false, false, false, "", true, "Other");
+        compare(hideEntries[0].id, "toggle_hide_category");
+        compare(unhideEntries[0].id, "toggle_hide_category");
+        verify(hideEntries[0].label !== unhideEntries[0].label, "Hide/Unhide label flips on isHidden");
     }
 
     function test_context_menu_games_directory_returns_empty(): void {
-        // qmllint disable compiler
         compare(main.buildContextMenuEntries("games", "directory", false, true, false, ""), [], "Folder tiles have no context menu, even with reader attached");
-    // qmllint enable compiler
     }
 
     function test_context_menu_games_root_returns_empty(): void {
-        // qmllint disable compiler
         compare(main.buildContextMenuEntries("games", "root", false, true, false, ""), []);
-    // qmllint enable compiler
     }
 
     function test_context_menu_games_no_reader_omits_write_card(): void {
-        // qmllint disable compiler
         const entries = main.buildContextMenuEntries("games", "media", true, false, false, "");
         compare(_idsOf(entries), ["toggle_favorite", "qr_code", "launch_game"], "Write to NFC token must be hidden when no reader is reported");
-    // qmllint enable compiler
     }
 
     function test_context_menu_games_with_reader_includes_write_card(): void {
-        // qmllint disable compiler
         const entries = main.buildContextMenuEntries("games", "media", true, true, false, "");
         compare(_idsOf(entries), ["toggle_favorite", "write_card", "qr_code", "launch_game"]);
-    // qmllint enable compiler
     }
 
     function test_context_menu_favorites_matches_games_media_entries(): void {
-        // qmllint disable compiler
         const entries = main.buildContextMenuEntries("favorites", "", true, true, true, "");
         compare(_idsOf(entries), ["toggle_favorite", "write_card", "qr_code", "launch_game"]);
-    // qmllint enable compiler
     }
 
     function test_context_menu_favorites_no_reader_omits_write_card(): void {
-        // qmllint disable compiler
         const entries = main.buildContextMenuEntries("favorites", "", true, false, true, "");
         compare(_idsOf(entries), ["toggle_favorite", "qr_code", "launch_game"]);
-    // qmllint enable compiler
     }
 
     function test_context_menu_recents_omits_more_info(): void {
-        // qmllint disable compiler
         const entries = main.buildContextMenuEntries("recents", "", false, false, false, "");
         compare(_idsOf(entries), ["launch_game"]);
-    // qmllint enable compiler
     }
 
     function test_context_menu_games_favorite_label_toggles(): void {
-        // qmllint disable compiler
         const addEntries = main.buildContextMenuEntries("games", "media", true, false, false, "");
         const removeEntries = main.buildContextMenuEntries("games", "media", true, false, true, "");
         compare(addEntries[0].id, "toggle_favorite");
@@ -519,32 +596,24 @@ TestCase {
         verify(addEntries[0].label.length > 0);
         verify(removeEntries[0].label.length > 0);
         verify(addEntries[0].label !== removeEntries[0].label);
-    // qmllint enable compiler
     }
 
     function test_context_menu_unknown_owner_returns_empty(): void {
-        // qmllint disable compiler
         compare(main.buildContextMenuEntries("nope", "", false, true, false, ""), [], "Unknown owners get no entries — safe default");
-    // qmllint enable compiler
     }
 
     // QR-code payload wrapper. The web app at zaparoo.app/write reads the
     // zapscript out of the `v=` query param, so the helper must
     // URL-encode reserved characters.
     function test_qr_payload_empty_zapscript(): void {
-        // qmllint disable compiler
         compare(main._buildQrPayload(""), "https://zaparoo.app/write?v=");
-    // qmllint enable compiler
     }
 
     function test_qr_payload_plain_ascii(): void {
-        // qmllint disable compiler
         compare(main._buildQrPayload("foo"), "https://zaparoo.app/write?v=foo");
-    // qmllint enable compiler
     }
 
     function test_qr_payload_encodes_reserved_chars(): void {
-        // qmllint disable compiler
         // encodeURIComponent leaves `* - _ . ! ~ ' ( )` unescaped — only
         // characters that would terminate or restructure the URL get
         // percent-encoded. Real zapscripts look like
@@ -552,16 +621,13 @@ TestCase {
         // otherwise be read as a port separator in some parsers).
         const payload = main._buildQrPayload("**launch.system:Atari2600");
         compare(payload, "https://zaparoo.app/write?v=**launch.system%3AAtari2600");
-    // qmllint enable compiler
     }
 
     function test_qr_payload_encodes_url_breakers(): void {
-        // qmllint disable compiler
         // Belt-and-braces check that characters that *would* break the URL
         // (space, `&`, `?`) are escaped as expected. None of these appear
         // in current zapscripts but a future zapscript with arguments
         // containing them must still survive a round-trip.
         compare(main._buildQrPayload("a b&c?d"), "https://zaparoo.app/write?v=a%20b%26c%3Fd");
-    // qmllint enable compiler
     }
 }

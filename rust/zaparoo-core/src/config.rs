@@ -40,17 +40,39 @@ pub struct Config {
     /// state is wiped on reboot — using state would re-show the notice
     /// every cold boot.
     pub notice: NoticeConfig,
+    /// Optional override for the user customization root. When absent the
+    /// frontend uses `platform_paths::custom_dir()` (zero-config default).
+    /// The root holds `systems/` and `hub/` subfolders of override images
+    /// named by id, served as-is — no tint pipeline — via the `custom-image`
+    /// image provider. Configured via `[custom] dir` in `frontend.toml`.
+    pub custom_dir: Option<String>,
+    /// User-supplied system display-name overrides, keyed by system id.
+    /// Parsed from the `[custom.system_names]` table in `frontend.toml`. Takes
+    /// priority over the bundled `Names_MiSTer` localized data and the Core
+    /// catalog name. Empty when the table is absent.
+    pub system_names: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SettingsConfig {
     pub orientation: Option<String>,
+    pub clock_format: Option<String>,
     pub browse_layout: Option<String>,
+    pub system_logo_style: Option<String>,
     pub button_layout: Option<String>,
     pub mouse_enabled: Option<bool>,
+    pub reduce_motion: Option<bool>,
     pub discover_arcade_alternate_versions: Option<bool>,
     pub screensaver_timeout: Option<String>,
     pub media_image_type: Option<String>,
+    pub show_hidden: Option<bool>,
+    pub show_original_filenames: Option<bool>,
+    pub hidden_categories: Vec<String>,
+    pub hidden_system_ids: Vec<String>,
+    pub region: Option<String>,
+    pub crt_video_standard: Option<String>,
+    pub crt_h_offset: Option<i32>,
+    pub crt_v_offset: Option<i32>,
     /// Kiosk lockdown — hide the Settings tile on the Hub action row.
     /// `None`/`Some(false)` leave it visible (default). `Some(true)`
     /// removes it; the screen stays accessible programmatically but
@@ -77,18 +99,31 @@ pub struct SettingsConfig {
     pub hide_exit: Option<bool>,
 }
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "flat settings mirror; each bool is an independent user-visible toggle"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SettingsMirror<'a> {
     pub resolution: &'a str,
     pub language: &'a str,
     pub orientation: &'a str,
+    pub clock_format: &'a str,
     pub browse_layout: &'a str,
+    pub system_logo_style: &'a str,
     pub button_layout: &'a str,
     pub mouse_enabled: bool,
+    pub reduce_motion: bool,
     pub discover_arcade_alternate_versions: bool,
     pub debug_logging: bool,
     pub screensaver_timeout: &'a str,
     pub media_image_type: &'a str,
+    pub show_hidden: bool,
+    pub show_original_filenames: bool,
+    pub region: &'a str,
+    pub crt_video_standard: &'a str,
+    pub crt_h_offset: i32,
+    pub crt_v_offset: i32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -108,6 +143,8 @@ impl Default for Config {
             key_to_action: input_actions::invert(&input_actions::default_bindings()),
             settings: SettingsConfig::default(),
             notice: NoticeConfig::default(),
+            custom_dir: None,
+            system_names: HashMap::new(),
         }
     }
 }
@@ -128,6 +165,8 @@ struct RawConfig {
     settings: RawSettings,
     #[serde(default)]
     notice: RawNotice,
+    #[serde(default)]
+    custom: RawCustom,
 }
 
 #[derive(Deserialize, Default)]
@@ -160,12 +199,25 @@ struct RawInput {
 #[derive(Deserialize, Default)]
 struct RawSettings {
     orientation: Option<String>,
+    clock_format: Option<String>,
     browse_layout: Option<String>,
+    system_logo_style: Option<String>,
     button_layout: Option<String>,
     mouse_enabled: Option<bool>,
+    reduce_motion: Option<bool>,
     discover_arcade_alternate_versions: Option<bool>,
     screensaver_timeout: Option<String>,
     media_image_type: Option<String>,
+    show_hidden: Option<bool>,
+    show_original_filenames: Option<bool>,
+    #[serde(default)]
+    hidden_categories: Vec<String>,
+    #[serde(default)]
+    hidden_system_ids: Vec<String>,
+    region: Option<String>,
+    crt_video_standard: Option<String>,
+    crt_h_offset: Option<i32>,
+    crt_v_offset: Option<i32>,
     hide_settings: Option<bool>,
     hide_favorites: Option<bool>,
     hide_recents: Option<bool>,
@@ -176,6 +228,13 @@ struct RawSettings {
 #[derive(Deserialize, Default)]
 struct RawNotice {
     commercial_ack: Option<bool>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawCustom {
+    dir: Option<String>,
+    #[serde(default)]
+    system_names: HashMap<String, String>,
 }
 
 pub fn load_config(path: &Path) -> Config {
@@ -235,39 +294,91 @@ pub fn load_config(path: &Path) -> Config {
         }
         cfg.key_to_action = input_actions::invert(&merged);
     }
-    cfg.settings = SettingsConfig {
-        orientation: raw
-            .settings
-            .orientation
-            .map(|value| value.trim().to_string()),
-        browse_layout: raw
-            .settings
-            .browse_layout
-            .map(|value| value.trim().to_string()),
-        button_layout: raw
-            .settings
-            .button_layout
-            .map(|value| value.trim().to_string()),
-        mouse_enabled: raw.settings.mouse_enabled,
-        discover_arcade_alternate_versions: raw.settings.discover_arcade_alternate_versions,
-        screensaver_timeout: raw
-            .settings
-            .screensaver_timeout
-            .map(|value| value.trim().to_string()),
-        media_image_type: raw
-            .settings
-            .media_image_type
-            .map(|value| value.trim().to_string()),
-        hide_settings: raw.settings.hide_settings,
-        hide_favorites: raw.settings.hide_favorites,
-        hide_recents: raw.settings.hide_recents,
-        hide_resume: raw.settings.hide_resume,
-        hide_exit: raw.settings.hide_exit,
-    };
+    cfg.settings = settings_config_from_raw(raw.settings);
     cfg.notice = NoticeConfig {
         commercial_ack: raw.notice.commercial_ack.unwrap_or(false),
     };
+    cfg.custom_dir = raw
+        .custom
+        .dir
+        .map(|value| value.trim().to_string())
+        .filter(|s| !s.is_empty());
+    // Trim keys and values; drop entries that are empty on either side so a
+    // stray `"" = "x"` line can't shadow a real system or render blank.
+    cfg.system_names = raw
+        .custom
+        .system_names
+        .into_iter()
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .filter(|(k, v)| !k.is_empty() && !v.is_empty())
+        .collect();
     cfg
+}
+
+fn trim_opt(value: Option<String>) -> Option<String> {
+    value.map(|s| s.trim().to_string())
+}
+
+fn normalize_string_list(values: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(values.len());
+    for value in values {
+        let trimmed = value.trim().to_string();
+        if !trimmed.is_empty() && !out.contains(&trimmed) {
+            out.push(trimmed);
+        }
+    }
+    out
+}
+
+fn toml_array_from_strings(values: &[String]) -> toml::Value {
+    toml::Value::Array(
+        values
+            .iter()
+            .map(|value| toml::Value::String(value.trim().to_string()))
+            .filter(|value| value.as_str().is_some_and(|s| !s.is_empty()))
+            .collect(),
+    )
+}
+
+fn settings_config_from_raw(raw: RawSettings) -> SettingsConfig {
+    SettingsConfig {
+        orientation: trim_opt(raw.orientation),
+        clock_format: trim_opt(raw.clock_format),
+        browse_layout: trim_opt(raw.browse_layout),
+        system_logo_style: trim_opt(raw.system_logo_style),
+        button_layout: trim_opt(raw.button_layout),
+        mouse_enabled: raw.mouse_enabled,
+        reduce_motion: raw.reduce_motion,
+        discover_arcade_alternate_versions: raw.discover_arcade_alternate_versions,
+        screensaver_timeout: trim_opt(raw.screensaver_timeout),
+        media_image_type: trim_opt(raw.media_image_type),
+        show_hidden: raw.show_hidden,
+        show_original_filenames: raw.show_original_filenames,
+        hidden_categories: normalize_string_list(raw.hidden_categories),
+        hidden_system_ids: normalize_string_list(raw.hidden_system_ids),
+        region: trim_opt(raw.region),
+        crt_video_standard: trim_opt(raw.crt_video_standard),
+        crt_h_offset: raw.crt_h_offset,
+        crt_v_offset: raw.crt_v_offset,
+        hide_settings: raw.hide_settings,
+        hide_favorites: raw.hide_favorites,
+        hide_recents: raw.hide_recents,
+        hide_resume: raw.hide_resume,
+        hide_exit: raw.hide_exit,
+    }
+}
+
+/// Get a mutable reference to a TOML section table, creating it if absent.
+fn section_mut<'a>(
+    table: &'a mut toml::Table,
+    key: &'static str,
+    path: &Path,
+) -> Result<&'a mut toml::Table, String> {
+    let v = table
+        .entry(key)
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    v.as_table_mut()
+        .ok_or_else(|| format!("config key [{key}] in {} is not a table", path.display()))
 }
 
 pub fn save_settings_mirror(path: &Path, mirror: SettingsMirror<'_>) -> Result<(), String> {
@@ -280,29 +391,13 @@ pub fn save_settings_mirror(path: &Path, mirror: SettingsMirror<'_>) -> Result<(
         toml::Table::new()
     };
 
-    let general_value = table
-        .entry("general")
-        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-    let Some(general) = general_value.as_table_mut() else {
-        return Err(format!(
-            "config key [general] in {} is not a table",
-            path.display()
-        ));
-    };
+    let general = section_mut(&mut table, "general", path)?;
     general.insert(
         "language".into(),
         toml::Value::String(normalize_language_override(mirror.language)),
     );
 
-    let video_value = table
-        .entry("video")
-        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-    let Some(video) = video_value.as_table_mut() else {
-        return Err(format!(
-            "config key [video] in {} is not a table",
-            path.display()
-        ));
-    };
+    let video = section_mut(&mut table, "video", path)?;
     video.remove("backend");
     if let Some((width, height)) = parse_resolution_override(mirror.resolution) {
         video.insert("width".into(), toml::Value::Integer(i64::from(width)));
@@ -312,22 +407,22 @@ pub fn save_settings_mirror(path: &Path, mirror: SettingsMirror<'_>) -> Result<(
         video.remove("height");
     }
 
-    let settings_value = table
-        .entry("settings")
-        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-    let Some(settings) = settings_value.as_table_mut() else {
-        return Err(format!(
-            "config key [settings] in {} is not a table",
-            path.display()
-        ));
-    };
+    let settings = section_mut(&mut table, "settings", path)?;
     settings.insert(
         "orientation".into(),
         toml::Value::String(mirror.orientation.trim().to_string()),
     );
     settings.insert(
+        "clock_format".into(),
+        toml::Value::String(mirror.clock_format.trim().to_string()),
+    );
+    settings.insert(
         "browse_layout".into(),
         toml::Value::String(mirror.browse_layout.trim().to_string()),
+    );
+    settings.insert(
+        "system_logo_style".into(),
+        toml::Value::String(mirror.system_logo_style.trim().to_string()),
     );
     settings.insert(
         "button_layout".into(),
@@ -336,6 +431,10 @@ pub fn save_settings_mirror(path: &Path, mirror: SettingsMirror<'_>) -> Result<(
     settings.insert(
         "mouse_enabled".into(),
         toml::Value::Boolean(mirror.mouse_enabled),
+    );
+    settings.insert(
+        "reduce_motion".into(),
+        toml::Value::Boolean(mirror.reduce_motion),
     );
     settings.insert(
         "discover_arcade_alternate_versions".into(),
@@ -349,17 +448,68 @@ pub fn save_settings_mirror(path: &Path, mirror: SettingsMirror<'_>) -> Result<(
         "media_image_type".into(),
         toml::Value::String(mirror.media_image_type.trim().to_string()),
     );
+    settings.insert(
+        "show_hidden".into(),
+        toml::Value::Boolean(mirror.show_hidden),
+    );
+    settings.insert(
+        "show_original_filenames".into(),
+        toml::Value::Boolean(mirror.show_original_filenames),
+    );
+    settings.insert(
+        "region".into(),
+        toml::Value::String(mirror.region.trim().to_string()),
+    );
+    settings.insert(
+        "crt_video_standard".into(),
+        toml::Value::String(normalize_crt_video_standard(mirror.crt_video_standard).to_string()),
+    );
+    let (crt_h, crt_v) = clamp_crt_offsets(mirror.crt_h_offset, mirror.crt_v_offset);
+    settings.insert(
+        "crt_h_offset".into(),
+        toml::Value::Integer(i64::from(crt_h)),
+    );
+    settings.insert(
+        "crt_v_offset".into(),
+        toml::Value::Integer(i64::from(crt_v)),
+    );
 
-    let logging_value = table
-        .entry("logging")
-        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-    let Some(logging) = logging_value.as_table_mut() else {
-        return Err(format!(
-            "config key [logging] in {} is not a table",
-            path.display()
-        ));
-    };
+    let logging = section_mut(&mut table, "logging", path)?;
     logging.insert("debug".into(), toml::Value::Boolean(mirror.debug_logging));
+
+    let serialized =
+        toml::to_string(&table).map_err(|e| format!("config serialisation failed: {e}"))?;
+    write_atomic(path, serialized.as_bytes())
+        .map_err(|e| format!("could not write {}: {e}", path.display()))
+}
+
+/// Persist hidden browse filters into `frontend.toml`.
+///
+/// Hidden categories/systems are durable user preferences, not volatile
+/// navigation state, so `MiSTer`'s `/tmp` state file must not carry them.
+pub fn save_hidden_browse_prefs(
+    path: &Path,
+    hidden_categories: &[String],
+    hidden_system_ids: &[String],
+) -> Result<(), String> {
+    let mut table = if path.exists() {
+        let src = std::fs::read_to_string(path)
+            .map_err(|e| format!("could not read {}: {e}", path.display()))?;
+        toml::from_str::<toml::Table>(&src)
+            .map_err(|e| format!("config parse error in {}: {e}", path.display()))?
+    } else {
+        toml::Table::new()
+    };
+
+    let settings = section_mut(&mut table, "settings", path)?;
+    settings.insert(
+        "hidden_categories".into(),
+        toml_array_from_strings(hidden_categories),
+    );
+    settings.insert(
+        "hidden_system_ids".into(),
+        toml_array_from_strings(hidden_system_ids),
+    );
 
     let serialized =
         toml::to_string(&table).map_err(|e| format!("config serialisation failed: {e}"))?;
@@ -399,6 +549,65 @@ pub fn save_notice_ack(path: &Path, commercial_ack: bool) -> Result<(), String> 
         toml::to_string(&table).map_err(|e| format!("config serialisation failed: {e}"))?;
     write_atomic(path, serialized.as_bytes())
         .map_err(|e| format!("could not write {}: {e}", path.display()))
+}
+
+/// Offset ranges the Menu fork core honors before clamping in RTL
+/// (`native_video_reader.sv`). Mirrored by the C++ writer's
+/// `kNativeVideoHOffsetMin`/... constants in `native_video_writer.h`.
+pub const CRT_H_OFFSET_MIN: i32 = -8;
+pub const CRT_H_OFFSET_MAX: i32 = 8;
+pub const CRT_V_OFFSET_MIN: i32 = -8;
+pub const CRT_V_OFFSET_MAX: i32 = 2;
+
+/// Canonical native CRT video standard names. `"480i"` is accepted so
+/// it can be hand-set in `frontend.toml` for hardware smoke tests, but
+/// the settings UI only offers `"ntsc"` and `"pal"` until the 480i
+/// flicker-discipline UI pass lands. Anything unrecognised falls back
+/// to `"ntsc"`.
+pub fn normalize_crt_video_standard(value: &str) -> &'static str {
+    let trimmed = value.trim();
+    if trimmed.eq_ignore_ascii_case("pal") {
+        "pal"
+    } else if trimmed.eq_ignore_ascii_case("480i") {
+        "480i"
+    } else {
+        "ntsc"
+    }
+}
+
+/// Framebuffer geometry for a native CRT video standard. The Menu fork
+/// core derives its mode from these exact shapes (352x240 -> mode 0,
+/// 720x480 -> mode 1, 352x288 -> mode 2), as does the C++ writer's fb0
+/// validation.
+pub fn crt_video_dimensions(standard: &str) -> (u32, u32) {
+    match normalize_crt_video_standard(standard) {
+        "pal" => (352, 288),
+        "480i" => (720, 480),
+        _ => (352, 240),
+    }
+}
+
+/// DDR word1 mode id for a native CRT video standard. Same vocabulary
+/// as the Menu fork core and `native_video_writer.cpp`, and also byte 1
+/// of `zaparoo_launcher_crt.bin` so `Main_MiSTer` programs the matching
+/// framebuffer geometry before spawning the frontend (Main's hardcoded
+/// 352x240 plus its post-spawn re-assert would otherwise stomp a PAL
+/// framebuffer).
+pub fn crt_mode_id(standard: &str) -> u8 {
+    match normalize_crt_video_standard(standard) {
+        "480i" => 1,
+        "pal" => 2,
+        _ => 0,
+    }
+}
+
+/// Clamp centering trims to the ranges the core honors, so persisted
+/// values never depend on the hardware's saturating clamp.
+pub fn clamp_crt_offsets(h_offset: i32, v_offset: i32) -> (i32, i32) {
+    (
+        h_offset.clamp(CRT_H_OFFSET_MIN, CRT_H_OFFSET_MAX),
+        v_offset.clamp(CRT_V_OFFSET_MIN, CRT_V_OFFSET_MAX),
+    )
 }
 
 fn normalize_language_override(value: &str) -> String {
@@ -466,7 +675,10 @@ mod tests {
         reason = "tests should fail-fast on unexpected errors"
     )]
 
-    use super::{load_config, save_notice_ack, save_settings_mirror, Config, SettingsMirror};
+    use super::{
+        load_config, save_hidden_browse_prefs, save_notice_ack, save_settings_mirror, Config,
+        SettingsMirror,
+    };
     use std::io::Write;
 
     fn write_tmp(contents: &str) -> tempfile::NamedTempFile {
@@ -484,13 +696,120 @@ mod tests {
         assert!(!cfg.debug_logging);
         assert_eq!(cfg.language, "");
         assert_eq!(cfg.settings.orientation, None);
+        assert_eq!(cfg.settings.clock_format, None);
         assert_eq!(cfg.settings.browse_layout, None);
         assert_eq!(cfg.settings.button_layout, None);
         assert_eq!(cfg.settings.mouse_enabled, None);
         assert_eq!(cfg.settings.discover_arcade_alternate_versions, None);
+        assert!(cfg.settings.hidden_categories.is_empty());
+        assert!(cfg.settings.hidden_system_ids.is_empty());
+        assert_eq!(cfg.settings.region, None);
+        assert!(cfg.custom_dir.is_none());
+        assert!(cfg.system_names.is_empty());
         assert!(!cfg.notice.commercial_ack);
         // Default keyboard bindings populate the map.
         assert!(!cfg.key_to_action.is_empty());
+    }
+
+    #[test]
+    fn custom_dir_round_trips() {
+        let f = write_tmp("[custom]\ndir = \"/mnt/art\"\n");
+        let cfg = load_config(f.path());
+        assert_eq!(cfg.custom_dir.as_deref(), Some("/mnt/art"));
+    }
+
+    #[test]
+    fn custom_dir_absent_is_none() {
+        let f = write_tmp("[core]\nendpoint = \"ws://example.com/api\"\n");
+        let cfg = load_config(f.path());
+        assert!(cfg.custom_dir.is_none());
+    }
+
+    #[test]
+    fn custom_dir_empty_string_is_none() {
+        let f = write_tmp("[custom]\ndir = \"   \"\n");
+        let cfg = load_config(f.path());
+        assert!(cfg.custom_dir.is_none());
+    }
+
+    #[test]
+    fn system_names_table_round_trips() {
+        let f =
+            write_tmp("[custom.system_names]\nSNES = \"Super Nintendo\"\nPSX = \"PlayStation\"\n");
+        let cfg = load_config(f.path());
+        assert_eq!(
+            cfg.system_names.get("SNES").map(String::as_str),
+            Some("Super Nintendo")
+        );
+        assert_eq!(
+            cfg.system_names.get("PSX").map(String::as_str),
+            Some("PlayStation")
+        );
+    }
+
+    #[test]
+    fn system_names_coexists_with_custom_dir() {
+        // Both keys live under [custom]; setting one must not drop the other.
+        let f = write_tmp(
+            "[custom]\ndir = \"/mnt/art\"\n\n[custom.system_names]\nSNES = \"Super Nintendo\"\n",
+        );
+        let cfg = load_config(f.path());
+        assert_eq!(cfg.custom_dir.as_deref(), Some("/mnt/art"));
+        assert_eq!(
+            cfg.system_names.get("SNES").map(String::as_str),
+            Some("Super Nintendo")
+        );
+    }
+
+    #[test]
+    fn system_names_absent_is_empty() {
+        let f = write_tmp("[core]\nendpoint = \"ws://example.com/api\"\n");
+        let cfg = load_config(f.path());
+        assert!(cfg.system_names.is_empty());
+    }
+
+    #[test]
+    fn system_names_drops_blank_entries() {
+        // A value that trims to empty must not register as an override, else
+        // it would blank out the real display name for that system.
+        let f = write_tmp("[custom.system_names]\nSNES = \"   \"\n");
+        let cfg = load_config(f.path());
+        assert!(cfg.system_names.is_empty());
+    }
+
+    #[test]
+    fn region_setting_round_trips() {
+        let f = write_tmp("[settings]\nregion = \"jp\"\n");
+        let cfg = load_config(f.path());
+        assert_eq!(cfg.settings.region.as_deref(), Some("jp"));
+    }
+
+    #[test]
+    fn hidden_browse_prefs_round_trip_from_settings() {
+        let f = write_tmp(
+            "[settings]\nhidden_categories = [\"Arcade\", \"  Consoles  \", \"Arcade\", \"\"]\nhidden_system_ids = [\"NES\", \"SNES\"]\n",
+        );
+        let cfg = load_config(f.path());
+        assert_eq!(cfg.settings.hidden_categories, vec!["Arcade", "Consoles"]);
+        assert_eq!(cfg.settings.hidden_system_ids, vec!["NES", "SNES"]);
+    }
+
+    #[test]
+    fn save_hidden_browse_prefs_preserves_other_config() {
+        let f = write_tmp(
+            "[core]\nendpoint = \"ws://example.com/api\"\n[settings]\nbutton_layout = \"b\"\n",
+        );
+        save_hidden_browse_prefs(
+            f.path(),
+            &["Arcade".to_string(), "Consoles".to_string()],
+            &["NES".to_string()],
+        )
+        .expect("save");
+        let cfg = load_config(f.path());
+        assert_eq!(cfg.core_endpoint, "ws://example.com/api");
+        assert_eq!(cfg.settings.button_layout.as_deref(), Some("b"));
+        assert_eq!(cfg.settings.hidden_categories, vec!["Arcade", "Consoles"]);
+        assert_eq!(cfg.settings.hidden_system_ids, vec!["NES"]);
     }
 
     #[test]
@@ -545,9 +864,14 @@ mod tests {
     fn keyboard_override_replaces_default_for_that_action() {
         use crate::input_actions::{actions, qt_key_code};
 
+        // `page_menu` defaults to Space, so unbind it here (empty list =
+        // unbind) before reusing Space to demonstrate that an `accept`
+        // override replaces accept's own defaults. Without freeing Space the
+        // deterministic collision policy would hand it to `page_menu`.
         let toml = r#"
             [input.keyboard]
             accept = ["Space"]
+            page_menu = []
         "#;
         let f = write_tmp(toml);
         let cfg = load_config(f.path());
@@ -626,7 +950,9 @@ mod tests {
 
             [settings]
             orientation = "cw"
+            clock_format = "12h"
             browse_layout = "list"
+            system_logo_style = "color"
             button_layout = "c"
             mouse_enabled = false
         "#;
@@ -638,9 +964,57 @@ mod tests {
         assert_eq!(cfg.video_height, 480);
         assert!(cfg.debug_logging);
         assert_eq!(cfg.settings.orientation.as_deref(), Some("cw"));
+        assert_eq!(cfg.settings.clock_format.as_deref(), Some("12h"));
         assert_eq!(cfg.settings.browse_layout.as_deref(), Some("list"));
+        assert_eq!(cfg.settings.system_logo_style.as_deref(), Some("color"));
         assert_eq!(cfg.settings.button_layout.as_deref(), Some("c"));
         assert_eq!(cfg.settings.mouse_enabled, Some(false));
+    }
+
+    #[test]
+    fn parse_resolution_override_accepts_lower_x() {
+        use super::parse_resolution_override;
+        assert_eq!(parse_resolution_override("1920x1080"), Some((1920, 1080)));
+    }
+
+    #[test]
+    fn parse_resolution_override_accepts_upper_x() {
+        use super::parse_resolution_override;
+        assert_eq!(parse_resolution_override("640X480"), Some((640, 480)));
+    }
+
+    #[test]
+    fn parse_resolution_override_trims_whitespace() {
+        use super::parse_resolution_override;
+        assert_eq!(parse_resolution_override("  1280x720 "), Some((1280, 720)));
+    }
+
+    #[test]
+    fn parse_resolution_override_rejects_empty() {
+        use super::parse_resolution_override;
+        assert!(parse_resolution_override("").is_none());
+        assert!(parse_resolution_override("   ").is_none());
+    }
+
+    #[test]
+    fn parse_resolution_override_rejects_missing_separator() {
+        use super::parse_resolution_override;
+        assert!(parse_resolution_override("1920").is_none());
+        assert!(parse_resolution_override("1920-1080").is_none());
+    }
+
+    #[test]
+    fn parse_resolution_override_rejects_non_numeric() {
+        use super::parse_resolution_override;
+        assert!(parse_resolution_override("widexheight").is_none());
+        assert!(parse_resolution_override("1920xfoo").is_none());
+    }
+
+    #[test]
+    fn parse_resolution_override_rejects_zero_components() {
+        use super::parse_resolution_override;
+        assert!(parse_resolution_override("0x1080").is_none());
+        assert!(parse_resolution_override("1920x0").is_none());
     }
 
     #[test]
@@ -660,13 +1034,22 @@ mod tests {
                 resolution: "1280x720",
                 language: "it_IT",
                 orientation: "cw",
+                clock_format: "24h",
                 browse_layout: "list",
+                system_logo_style: "color",
                 button_layout: "b",
                 mouse_enabled: false,
+                reduce_motion: true,
                 discover_arcade_alternate_versions: true,
                 debug_logging: true,
                 screensaver_timeout: "300",
                 media_image_type: "auto",
+                show_hidden: true,
+                show_original_filenames: true,
+                region: "us",
+                crt_video_standard: "pal",
+                crt_h_offset: -3,
+                crt_v_offset: 1,
             },
         )
         .expect("save");
@@ -676,18 +1059,27 @@ mod tests {
         assert_eq!(cfg.video_height, 720);
         assert!(cfg.video_explicit);
         assert_eq!(cfg.settings.orientation.as_deref(), Some("cw"));
+        assert_eq!(cfg.settings.clock_format.as_deref(), Some("24h"));
         assert_eq!(cfg.settings.browse_layout.as_deref(), Some("list"));
+        assert_eq!(cfg.settings.system_logo_style.as_deref(), Some("color"));
         assert_eq!(cfg.settings.button_layout.as_deref(), Some("b"));
         assert_eq!(cfg.settings.mouse_enabled, Some(false));
+        assert_eq!(cfg.settings.reduce_motion, Some(true));
         assert_eq!(cfg.settings.discover_arcade_alternate_versions, Some(true));
         assert_eq!(cfg.settings.screensaver_timeout.as_deref(), Some("300"));
+        assert_eq!(cfg.settings.show_hidden, Some(true));
+        assert_eq!(cfg.settings.show_original_filenames, Some(true));
+        assert_eq!(cfg.settings.region.as_deref(), Some("us"));
+        assert_eq!(cfg.settings.crt_video_standard.as_deref(), Some("pal"));
+        assert_eq!(cfg.settings.crt_h_offset, Some(-3));
+        assert_eq!(cfg.settings.crt_v_offset, Some(1));
         assert!(cfg.debug_logging);
     }
 
     #[test]
     fn save_settings_mirror_preserves_other_sections() {
         let f = write_tmp(
-            "[core]\nendpoint = \"ws://example.com/api\"\n[video]\nbackend = \"native-core-poc\"\nwidth = 1280\nheight = 720\n",
+            "[core]\nendpoint = \"ws://example.com/api\"\n[video]\nbackend = \"native-core-poc\"\nwidth = 1280\nheight = 720\n[settings]\nhidden_categories = [\"Arcade\"]\nhidden_system_ids = [\"NES\"]\n",
         );
         save_settings_mirror(
             f.path(),
@@ -695,13 +1087,22 @@ mod tests {
                 resolution: "1280x720",
                 language: "en",
                 orientation: "horizontal",
+                clock_format: "auto",
                 browse_layout: "grid",
+                system_logo_style: "tinted",
                 button_layout: "a",
                 mouse_enabled: true,
+                reduce_motion: false,
                 discover_arcade_alternate_versions: false,
                 debug_logging: false,
                 screensaver_timeout: "60",
                 media_image_type: "auto",
+                show_hidden: false,
+                show_original_filenames: false,
+                region: "auto",
+                crt_video_standard: "ntsc",
+                crt_h_offset: 0,
+                crt_v_offset: 0,
             },
         )
         .expect("save");
@@ -713,11 +1114,16 @@ mod tests {
         assert_eq!(cfg.video_width, 1280);
         assert_eq!(cfg.video_height, 720);
         assert_eq!(cfg.settings.orientation.as_deref(), Some("horizontal"));
+        assert_eq!(cfg.settings.clock_format.as_deref(), Some("auto"));
         assert_eq!(cfg.settings.browse_layout.as_deref(), Some("grid"));
+        assert_eq!(cfg.settings.system_logo_style.as_deref(), Some("tinted"));
         assert_eq!(cfg.settings.button_layout.as_deref(), Some("a"));
         assert_eq!(cfg.settings.mouse_enabled, Some(true));
+        assert_eq!(cfg.settings.reduce_motion, Some(false));
         assert_eq!(cfg.settings.discover_arcade_alternate_versions, Some(false));
         assert_eq!(cfg.settings.screensaver_timeout.as_deref(), Some("60"));
+        assert_eq!(cfg.settings.hidden_categories, vec!["Arcade"]);
+        assert_eq!(cfg.settings.hidden_system_ids, vec!["NES"]);
         assert!(!cfg.debug_logging);
     }
 
@@ -730,20 +1136,33 @@ mod tests {
                 resolution: "",
                 language: "",
                 orientation: "ccw",
+                clock_format: "12h",
                 browse_layout: "list",
+                system_logo_style: "color",
                 button_layout: "c",
                 mouse_enabled: false,
+                reduce_motion: false,
                 discover_arcade_alternate_versions: true,
                 debug_logging: true,
                 screensaver_timeout: "off",
                 media_image_type: "auto",
+                show_hidden: false,
+                show_original_filenames: false,
+                region: "auto",
+                // Out-of-range offsets and an unknown standard must be
+                // normalised on the way to disk, not written verbatim.
+                crt_video_standard: "secam",
+                crt_h_offset: 99,
+                crt_v_offset: -99,
             },
         )
         .expect("save");
         let written = std::fs::read_to_string(f.path()).expect("read");
         assert!(written.contains("language = \"auto\""));
         assert!(written.contains("orientation = \"ccw\""));
+        assert!(written.contains("clock_format = \"12h\""));
         assert!(written.contains("browse_layout = \"list\""));
+        assert!(written.contains("system_logo_style = \"color\""));
         assert!(written.contains("button_layout = \"c\""));
         assert!(written.contains("mouse_enabled = false"));
         assert!(written.contains("discover_arcade_alternate_versions = true"));
@@ -753,12 +1172,55 @@ mod tests {
         assert_eq!(cfg.language, "");
         assert!(!cfg.video_explicit);
         assert_eq!(cfg.settings.orientation.as_deref(), Some("ccw"));
+        assert_eq!(cfg.settings.clock_format.as_deref(), Some("12h"));
         assert_eq!(cfg.settings.browse_layout.as_deref(), Some("list"));
+        assert_eq!(cfg.settings.system_logo_style.as_deref(), Some("color"));
         assert_eq!(cfg.settings.button_layout.as_deref(), Some("c"));
         assert_eq!(cfg.settings.mouse_enabled, Some(false));
+        assert_eq!(cfg.settings.reduce_motion, Some(false));
         assert_eq!(cfg.settings.discover_arcade_alternate_versions, Some(true));
         assert_eq!(cfg.settings.screensaver_timeout.as_deref(), Some("off"));
+        assert_eq!(cfg.settings.crt_video_standard.as_deref(), Some("ntsc"));
+        assert_eq!(cfg.settings.crt_h_offset, Some(8));
+        assert_eq!(cfg.settings.crt_v_offset, Some(-8));
         assert!(cfg.debug_logging);
+    }
+
+    #[test]
+    fn crt_video_standard_normalisation() {
+        use super::normalize_crt_video_standard;
+        assert_eq!(normalize_crt_video_standard("ntsc"), "ntsc");
+        assert_eq!(normalize_crt_video_standard("PAL"), "pal");
+        assert_eq!(normalize_crt_video_standard(" 480i "), "480i");
+        assert_eq!(normalize_crt_video_standard(""), "ntsc");
+        assert_eq!(normalize_crt_video_standard("secam"), "ntsc");
+    }
+
+    #[test]
+    fn crt_video_dimensions_per_standard() {
+        use super::crt_video_dimensions;
+        assert_eq!(crt_video_dimensions("ntsc"), (352, 240));
+        assert_eq!(crt_video_dimensions("pal"), (352, 288));
+        assert_eq!(crt_video_dimensions("480i"), (720, 480));
+        assert_eq!(crt_video_dimensions("garbage"), (352, 240));
+    }
+
+    #[test]
+    fn crt_mode_ids_match_ddr_contract() {
+        use super::crt_mode_id;
+        assert_eq!(crt_mode_id("ntsc"), 0);
+        assert_eq!(crt_mode_id("480i"), 1);
+        assert_eq!(crt_mode_id("PAL"), 2);
+        assert_eq!(crt_mode_id("garbage"), 0);
+    }
+
+    #[test]
+    fn crt_offsets_clamp_to_core_ranges() {
+        use super::clamp_crt_offsets;
+        assert_eq!(clamp_crt_offsets(0, 0), (0, 0));
+        assert_eq!(clamp_crt_offsets(-8, 2), (-8, 2));
+        assert_eq!(clamp_crt_offsets(9, 3), (8, 2));
+        assert_eq!(clamp_crt_offsets(-9, -9), (-8, -8));
     }
 
     // Single test because std::env is process-global; splitting into

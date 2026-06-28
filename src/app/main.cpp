@@ -6,8 +6,10 @@
 // zaparoo_frontend_rs staticlib; Qt plugin wiring is handled here so that
 // Qt's CMake (qt_import_qml_plugins) can emit the correct link flags.
 
+#include "custom_image_provider.h"
 #include "media_image_provider.h"
 #include "native_video_writer.h"
+#include "tinted_svg_image_provider.h"
 
 #include <QByteArray>
 #include <QChar>
@@ -36,9 +38,9 @@
 #include <unistd.h>
 #include <vector>
 
-// Default QPixmapCache cap is 10 MiB. With ~100 system PNGs decoded at
+// Default QPixmapCache cap is 10 MiB. With ~100 system SVGs rasterized at
 // 256 px sourceSize the working set straddles that limit, so navigating
-// through every category evicts earlier system covers and re-decodes
+// through every category evicts earlier system covers and re-renders
 // them on the next visit. Bumping to 50 MiB keeps the entire system-
 // cover set resident across category swaps for the cost of a one-time
 // allocation — a worthwhile trade on MiSTer's 1 GiB DDR3 since
@@ -56,6 +58,10 @@ extern "C" uint32_t zaparoo_rust_video_width();
 extern "C" uint32_t zaparoo_rust_video_height();
 extern "C" bool zaparoo_rust_debug_logging_enabled();
 extern "C" void zaparoo_rust_trace_startup(const uint8_t* stage, size_t len);
+// Push the effective UI locale into Rust so `system_region::current_region()`
+// can resolve `auto` without calling back into Qt. Called once after
+// `zaparoo_rust_init()` and the QLocale resolution below.
+extern "C" void zaparoo_rust_set_effective_locale(const uint8_t* locale, size_t len);
 
 // Pull Zaparoo QML plugin symbols into the final binary so the linker does
 // not strip their static-initializer registration functions.
@@ -63,7 +69,13 @@ Q_IMPORT_QML_PLUGIN(Zaparoo_AppPlugin)
 Q_IMPORT_QML_PLUGIN(Zaparoo_UiPlugin)
 Q_IMPORT_QML_PLUGIN(Zaparoo_ThemePlugin)
 Q_IMPORT_QML_PLUGIN(Zaparoo_ScreensPlugin)
+#ifdef ZAPAROO_UPDATE_STATIC_QML_PLUGIN
+Q_IMPORT_QML_PLUGIN(Zaparoo_UpdatePlugin)
+#endif
 Q_IMPORT_QML_PLUGIN(Zaparoo_Browse_plugin)
+#ifdef ZAPAROO_UPDATE_STATIC_NATIVE_PLUGIN
+Q_IMPORT_QML_PLUGIN(Zaparoo_Update_Native_plugin)
+#endif
 
 // For static Qt builds (MiSTer ARM32): the QtQuick.Controls plugin chain and
 // platform plugin are embedded in the binary, not found on disk, so they
@@ -93,6 +105,11 @@ struct ParsedArguments
 {
     bool crtNativePathForced = false;
     std::vector<char*> argv;
+    // Unfiltered process arguments (nullptr-terminated). The restart
+    // execvp must use these, not `argv`: `argv` has `--crt` stripped
+    // for Qt, and restarting with the filtered vector would silently
+    // drop the native CRT path on any restart-applied setting change.
+    std::vector<char*> originalArgv;
 };
 
 static ParsedArguments extractCrtArgument(int argc, char* argv[])
@@ -100,6 +117,8 @@ static ParsedArguments extractCrtArgument(int argc, char* argv[])
     ParsedArguments parsed;
     parsed.argv.reserve(static_cast<size_t>(argc));
     std::copy_n(argv, argc, std::back_inserter(parsed.argv));
+    parsed.originalArgv = parsed.argv;
+    parsed.originalArgv.push_back(nullptr);
 
     std::vector<char*> filtered;
     filtered.reserve(parsed.argv.size());
@@ -124,6 +143,12 @@ static ParsedArguments extractCrtArgument(int argc, char* argv[])
     return parsed;
 }
 
+static bool envFlagEnabled(const char* name)
+{
+    const QByteArray value = qgetenv(name).trimmed().toLower();
+    return value == "1" || value == "true" || value == "yes" || value == "on";
+}
+
 constexpr int kRestartExitCode = 1000;
 
 static void startupTrace(const char* stage)
@@ -141,7 +166,10 @@ static void startupTrace(const char* stage)
 int main(int argc, char* argv[]) // NOLINT
 {
     ParsedArguments parsedArgs = extractCrtArgument(argc, argv);
-    const bool crtNativePathForced = parsedArgs.crtNativePathForced;
+    const bool crtPreviewResolutionForced =
+        !qEnvironmentVariableIsEmpty("ZAPAROO_CRT_PREVIEW_RESOLUTION");
+    const bool crtNativePathForced = parsedArgs.crtNativePathForced || crtPreviewResolutionForced;
+    const bool debugCrtSafeAreaOverlay = envFlagEnabled("ZAPAROO_DEBUG");
     int qtArgc = static_cast<int>(parsedArgs.argv.size()) - 1;
 
     char** qtArgv = parsedArgs.argv.data();
@@ -163,7 +191,7 @@ int main(int argc, char* argv[]) // NOLINT
     }
 
     QGuiApplication::setApplicationName("Zaparoo Frontend");
-    QGuiApplication::setApplicationVersion("1.1.0");
+    QGuiApplication::setApplicationVersion(ZAPAROO_VERSION);
     QGuiApplication::setOrganizationName("Zaparoo");
     QGuiApplication::setOrganizationDomain("zaparoo.org");
 
@@ -191,6 +219,19 @@ int main(int argc, char* argv[]) // NOLINT
     const QLocale locale = langCode.isEmpty() ? QLocale::system() : QLocale(langCode);
     const QLocale::Language uiLanguage = locale.language();
     const bool crtNativePathEnabled = zaparoo_rust_crt_native_path_enabled();
+
+    // Push the effective locale into Rust so `system_region::current_region()`
+    // can resolve the `auto` region setting without calling back into Qt.
+    // Called here — after the QLocale is fully resolved — before any QML
+    // model Initialize callback runs. The Rust side stores it in an OnceLock
+    // so later calls are silent no-ops.
+    {
+        const QByteArray localeName = locale.name().toUtf8();
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+        zaparoo_rust_set_effective_locale(reinterpret_cast<const uint8_t*>(localeName.constData()),
+                                          static_cast<size_t>(localeName.size()));
+    }
+    startupTrace("cpp:effective locale pushed to Rust");
 
 #ifdef ZAPAROO_EMBEDDED_BUILD
     if (qEnvironmentVariableIsEmpty("QT_QPA_FONTDIR"))
@@ -350,10 +391,22 @@ int main(int argc, char* argv[]) // NOLINT
     // MainLayout does).
     // NOLINTNEXTLINE(cppcoreguidelines-owning-memory)
     engine.addImageProvider(QStringLiteral("media-image"), new MediaImageProvider());
-    startupTrace("cpp:QQmlApplicationEngine + image provider ready");
+    // NOLINTNEXTLINE(cppcoreguidelines-owning-memory)
+    engine.addImageProvider(QStringLiteral("tinted-svg"), new TintedSvgImageProvider());
+    // User-supplied customization images (system artwork and Hub icons).
+    // Files under the `[custom] dir` root in `frontend.toml` are served as-is
+    // -- no tint pipeline. The provider validates that decoded paths stay
+    // inside the customization root to prevent arbitrary filesystem reads.
+    // NOLINTNEXTLINE(cppcoreguidelines-owning-memory)
+    engine.addImageProvider(QStringLiteral("custom-image"), new CustomImageProvider());
+#ifdef ZAPAROO_UPDATE_RUNTIME_QML_IMPORT_PATH
+    engine.addImportPath(QStringLiteral(ZAPAROO_UPDATE_RUNTIME_QML_IMPORT_PATH));
+#endif
+    startupTrace("cpp:QQmlApplicationEngine + image providers ready");
 
     QVariantMap initialProperties = {
         {"crtNativePath", crtNativePathEnabled},
+        {"debugCrtSafeAreaOverlay", debugCrtSafeAreaOverlay},
     };
 #ifdef ZAPAROO_EMBEDDED_BUILD
     // MainLayout's `fullScreen` defaults true so the binding pass during
@@ -367,13 +420,15 @@ int main(int argc, char* argv[]) // NOLINT
     // FullScreen→Windowed transition during construction isn't visible
     // — the desktop compositor buffers until the first paint.
     initialProperties.insert(QStringLiteral("fullScreen"), false);
-    // Desktop CRT preview: when --crt is passed off-MiSTer, render the
-    // QML scene at the configured logical video size and integer-
-    // upscale via a layered wrapper Item in MainLayout. Scale defaults
-    // to 0 (sentinel for "auto-pick the largest integer that fits the
-    // primary screen with a 5% margin"); ZAPAROO_CRT_PREVIEW_SCALE
-    // overrides for ad-hoc testing without rebuilding (e.g. =2 for
-    // half-size, =8 to inspect a single tile).
+    // Desktop CRT preview: when --crt is passed off-MiSTer, or
+    // ZAPAROO_CRT_PREVIEW_RESOLUTION is set, render the QML scene at
+    // the configured logical video size and integer-upscale via a
+    // layered wrapper Item in MainLayout. Scale defaults to 0
+    // (sentinel for "auto-pick the largest integer that fits the
+    // primary screen with a 5% margin"); ZAPAROO_CRT_PREVIEW_RESOLUTION
+    // also selects the logical CRT canvas on desktop, and
+    // ZAPAROO_CRT_PREVIEW_SCALE overrides the integer window scale for
+    // ad-hoc testing without rebuilding.
     if (crtNativePathEnabled)
     {
         int previewScale = 0;
@@ -495,14 +550,18 @@ int main(int argc, char* argv[]) // NOLINT
     const int exitCode = QGuiApplication::exec();
     if (exitCode != kRestartExitCode)
     {
+        // Any other code propagates to the parent. On MiSTer, exit 42 is
+        // the Main_MiSTer fork's "re-read zaparoo_launcher_crt.bin and
+        // respawn me" protocol; it must reach the parent untouched.
         return exitCode;
     }
 
     // Restart as a fresh process so the Rust globals and cached config are
     // rebuilt from scratch. Re-entering main() in-process panics on the
-    // OnceLock-backed runtime/store singletons.
-    const char* programPath = parsedArgs.argv.front();
-    ::execvp(programPath, qtArgv);
+    // OnceLock-backed runtime/store singletons. Use the unfiltered argv so
+    // `--crt` survives the restart.
+    const char* programPath = parsedArgs.originalArgv.front();
+    ::execvp(programPath, parsedArgs.originalArgv.data());
     std::fprintf(stderr, "Failed to restart frontend via execvp(%s): %s\n", programPath,
                  std::strerror(errno));
     return EXIT_FAILURE;

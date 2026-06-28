@@ -35,6 +35,10 @@ TestCase {
     }
 
     function init(): void {
+        // Disable motion so DeferredAction.arm() runs dispatch synchronously.
+        // Persistence tests assert state immediately after handleKey/handleAction;
+        // a 90 ms async lead would cause every accept test to fail.
+        Motion.enabled = false;
         // The cold-launch BootOverlay normally hides every screen until
         // Core's catalog reaches READY. Tests don't run a real Core, so
         // mark the boot complete up-front; otherwise visibility-driven
@@ -51,6 +55,7 @@ TestCase {
     // later suites — in particular tst_smoke's test_initial_state — see
     // a clean Component.onCompleted path.
     function cleanup(): void {
+        Motion.enabled = true;
         Browse.AppState.active_screen = "";
         Browse.HubState.category = "";
         Browse.HubState.selected_row = 0;
@@ -114,6 +119,13 @@ TestCase {
         main.handleKey(Qt.Key_Return);
         compare(main.pendingTransition, "systems");
         compare(Browse.AppState.active_screen, "", "Pending optimistic transition must not persist a completed screen flip yet");
+    }
+
+    function test_update_screen_does_not_persist_active_screen(): void {
+        Browse.AppState.active_screen = main.screenSystems;
+        main._goto(main.screenUpdate);
+        compare(main.activeScreen, main.screenUpdate);
+        compare(Browse.AppState.active_screen, main.screenSystems, "Update is an operational screen and must not become the next launch target");
     }
 
     // Symmetric to the Hub test above: that one proves the flip *does*

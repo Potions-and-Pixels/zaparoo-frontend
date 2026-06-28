@@ -23,6 +23,8 @@
 // recents launches by `run`-ing the entry's launcher route.
 
 use crate::media_image_cache::{global_media_image_cache, MediaImageCache, MediaKey};
+use crate::media_meta_cache::{global_media_meta_cache, MetaLookup};
+use crate::models::nav_timing::NavTiming;
 use crate::models::tag_utils::tag_display_value;
 use crate::models::{global_handle, global_store};
 use cxx_qt::{CxxQtType, Initialize, Threading};
@@ -33,7 +35,7 @@ use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::task::JoinHandle;
@@ -52,6 +54,10 @@ const COVER_KEY_ROLE: i32 = 256 + 4;
 const LAUNCHER_ID_ROLE: i32 = 256 + 5;
 const FAVORITE_ROLE: i32 = 256 + 6;
 const FILE_STEM_ROLE: i32 = 256 + 7;
+const HIDDEN_ROLE: i32 = 256 + 8;
+// History entries carry no tags; the role exists only so the shared
+// grid/list delegates (which require it for media rows) bind cleanly here.
+const DISAMBIGUATING_TAGS_ROLE: i32 = 256 + 9;
 
 // Page size for the initial load and every cursor follow-up. Core caps
 // `limit` at 100; history rows are tiny (one tile + one caption per row)
@@ -60,9 +66,13 @@ const FILE_STEM_ROLE: i32 = 256 + 7;
 // doesn't change the UI cap.
 const PAGE_SIZE: u32 = 25;
 const RESUME_MAX_AGE_DAYS: i64 = 7;
+// How many rows ahead/behind the settled cursor to warm when the user
+// dwells on a row in list-detail layout. Kept small so the 2-worker byte
+// queue stays shallow and the next cover is fetched first within ~250 ms.
+const COVER_PREFETCH_CURSOR_NEXT: i32 = 4;
+const COVER_PREFETCH_CURSOR_PREV: i32 = 2;
 const RESUME_FALLBACK_COVER_KEY: &str = "icons/PlayOutline";
 
-#[derive(Default)]
 #[allow(
     clippy::struct_excessive_bools,
     reason = "the bools are independent qproperties surfaced to QML; collapsing them \
@@ -91,7 +101,22 @@ pub struct RecentsModelRust {
     current_detail_loading: bool,
     current_detail_tags: QString,
     current_detail_image_key: QString,
+    // Warm cover key for the item immediately after the current selection.
+    // Empty when there is no next item or the next item has no cached bytes.
+    // Exposed as a qproperty so QML can mount a hidden Image that decodes the
+    // cover into Qt's pixmap cache while the user is still on the current row.
+    detail_prefetch_key_next: QString,
+    // Same as `detail_prefetch_key_next` but for the item immediately before.
+    detail_prefetch_key_prev: QString,
+    // Row whose adjacent covers are being preloaded. None when no detail
+    // is active (cleared on reset or out-of-range).
+    detail_prefetch_row: Option<i32>,
     cover_requests_paused: bool,
+    // Mirrors the global `Show original filenames` setting; when true the
+    // `name` role, `name_at()`, and the resume banner show the original
+    // filename (sans extension). Bound from QML; flipping re-emits
+    // `dataChanged(NAME_ROLE)` and re-syncs the resume banner.
+    show_original_filenames: bool,
     current_detail_media_key: Option<MediaKey>,
     current_detail_media_id: Option<i64>,
     detail_seq: Arc<AtomicU64>,
@@ -120,6 +145,48 @@ pub struct RecentsModelRust {
     // JoinHandle doesn't cancel a callback already queued onto the Qt
     // thread between sleep-completion and abort.
     cover_gate_seq: Arc<AtomicU64>,
+    nav_timing: Option<NavTiming>,
+}
+
+impl Default for RecentsModelRust {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            count: 0,
+            loading: false,
+            loading_more: false,
+            error_message: QString::default(),
+            has_next_page: false,
+            next_cursor: None,
+            resume_available: false,
+            resume_loading: false,
+            resume_name: QString::default(),
+            resume_cover_key: QString::default(),
+            resume_entry: None,
+            resume_requested: false,
+            resume_seq: Arc::new(AtomicU64::new(0)),
+            history_requested: false,
+            history_fetching: false,
+            history_subscription: None,
+            current_detail_loading: false,
+            current_detail_tags: QString::default(),
+            current_detail_image_key: QString::default(),
+            detail_prefetch_key_next: QString::default(),
+            detail_prefetch_key_prev: QString::default(),
+            detail_prefetch_row: None,
+            cover_requests_paused: true,
+            show_original_filenames: false,
+            current_detail_media_key: None,
+            current_detail_media_id: None,
+            detail_seq: Arc::new(AtomicU64::new(0)),
+            seq: Arc::new(AtomicU64::new(0)),
+            cover_subscription: None,
+            pending_first_paint_keys: HashSet::new(),
+            cover_gate_timer: None,
+            cover_gate_seq: Arc::new(AtomicU64::new(0)),
+            nav_timing: None,
+        }
+    }
 }
 
 #[cxx_qt::bridge]
@@ -155,7 +222,10 @@ pub mod ffi {
         #[qproperty(bool, current_detail_loading)]
         #[qproperty(QString, current_detail_tags)]
         #[qproperty(QString, current_detail_image_key)]
+        #[qproperty(QString, detail_prefetch_key_next)]
+        #[qproperty(QString, detail_prefetch_key_prev)]
         #[qproperty(bool, cover_requests_paused)]
+        #[qproperty(bool, show_original_filenames, READ, WRITE = set_show_original_filenames, NOTIFY)]
         type RecentsModel = super::RecentsModelRust;
 
         #[qinvokable]
@@ -171,13 +241,25 @@ pub mod ffi {
         fn launch_resume(self: Pin<&mut RecentsModel>);
 
         #[qinvokable]
+        fn set_show_original_filenames(self: Pin<&mut RecentsModel>, value: bool);
+
+        #[qinvokable]
         fn name_at(self: &RecentsModel, index: i32) -> QString;
+
+        // Always empty — media history carries no disambiguating tags. Present
+        // so the shared MediaListScreen active-label tags provider can call it
+        // uniformly across models.
+        #[qinvokable]
+        fn disambiguating_tags_at(self: &RecentsModel, index: i32) -> QString;
 
         #[qinvokable]
         fn path_at(self: &RecentsModel, index: i32) -> QString;
 
         #[qinvokable]
         fn system_id_at(self: &RecentsModel, index: i32) -> QString;
+
+        #[qinvokable]
+        fn peek_detail_at(self: Pin<&mut RecentsModel>, index: i32);
 
         #[qinvokable]
         fn load_detail_at(self: Pin<&mut RecentsModel>, index: i32);
@@ -267,7 +349,11 @@ fn apply_state(
     mut model: Pin<&mut ffi::RecentsModel>,
     (data, err): (Option<PageSnapshot>, String),
 ) {
+    let apply_started = Instant::now();
     if let Some((entries, has_next_page, next_cursor)) = data {
+        if let Some(timing) = model.as_mut().rust_mut().nav_timing.as_mut() {
+            timing.mark_request_done();
+        }
         model.as_mut().rust_mut().history_requested = true;
         model.as_mut().rust_mut().history_fetching = false;
         model.as_mut().rust_mut().history_subscription = None;
@@ -275,7 +361,14 @@ fn apply_state(
         // any in-flight `fetch_more` sees a stale ticket and bails.
         model.as_mut().rust_mut().seq.fetch_add(1, Ordering::SeqCst);
         model.as_mut().ensure_cover_subscription();
+        let raw_len = entries.len();
         let entries = dedupe_latest_by_path(entries);
+        info!(
+            raw_len,
+            deduped_len = entries.len(),
+            has_next_page,
+            "recents-diag: apply_state Ready branch"
+        );
         if !model.cover_requests_paused {
             enqueue_recents_covers(&entries);
         }
@@ -288,6 +381,13 @@ fn apply_state(
         model.as_mut().end_reset_model();
         model.as_mut().count_changed();
         sync_resume_state(model.as_mut());
+        if let Some(timing) = model.as_mut().rust_mut().nav_timing.as_mut() {
+            timing.mark_apply_done();
+        }
+        debug!(
+            apply_ms = apply_started.elapsed().as_millis(),
+            "recents: apply_state timing",
+        );
         if model.has_next_page != has_next_page {
             model.as_mut().set_has_next_page(has_next_page);
         }
@@ -299,6 +399,7 @@ fn apply_state(
             if model.loading {
                 model.as_mut().set_loading(false);
             }
+            finish_nav_timing(model.as_mut(), "covers-paused", 0);
         } else {
             // Decide whether to release `loading` immediately or hold it until
             // covers are cached. `arm_cover_gate` flips loading off itself when
@@ -316,6 +417,10 @@ fn apply_state(
             model.as_mut().fetch_more();
         }
     } else if err.is_empty() {
+        info!(
+            count = model.count,
+            "recents-diag: apply_state Pending branch (loading, entries untouched)"
+        );
         // Pending (Idle/Loading): show the spinner; don't touch entries.
         // Disarm pagination so a grid scroll during a refetch doesn't
         // fire `fetch_more` against a stale cursor — `has_next_page`
@@ -329,6 +434,9 @@ fn apply_state(
         model.as_mut().rust_mut().seq.fetch_add(1, Ordering::SeqCst);
         model.as_mut().rust_mut().next_cursor = None;
         sync_resume_state(model.as_mut());
+        if let Some(timing) = model.as_mut().rust_mut().nav_timing.as_mut() {
+            timing.set_source("network");
+        }
         if !model.loading {
             model.as_mut().set_loading(true);
         }
@@ -336,6 +444,11 @@ fn apply_state(
             model.as_mut().set_has_next_page(false);
         }
     } else {
+        info!(
+            error = err.as_str(),
+            count = model.count,
+            "recents-diag: apply_state Errored branch (history_requested reset, entries untouched)"
+        );
         model.as_mut().rust_mut().history_requested = false;
         model.as_mut().rust_mut().history_fetching = false;
         model.as_mut().rust_mut().history_subscription = None;
@@ -351,6 +464,7 @@ fn apply_state(
         if model.loading {
             model.as_mut().set_loading(false);
         }
+        finish_nav_timing(model.as_mut(), "error", 0);
         if model.has_next_page {
             model.as_mut().set_has_next_page(false);
         }
@@ -376,7 +490,14 @@ impl ffi::RecentsModel {
         }
         let entry = &self.entries[index.row() as usize];
         match role {
-            NAME_ROLE => QVariant::from(&QString::from(entry.media_name.as_str())),
+            NAME_ROLE => QVariant::from(&QString::from(
+                display_name(
+                    &entry.media_name,
+                    &entry.media_path,
+                    self.show_original_filenames,
+                )
+                .as_str(),
+            )),
             PATH_ROLE => QVariant::from(&QString::from(entry.media_path.as_str())),
             SYSTEM_ID_ROLE => QVariant::from(&QString::from(entry.system_id.as_str())),
             COVER_KEY_ROLE => QVariant::from(&QString::from(
@@ -388,6 +509,8 @@ impl ffi::RecentsModel {
                 &entry.media_path,
                 &entry.media_name,
             ))),
+            HIDDEN_ROLE => QVariant::from(&false),
+            DISAMBIGUATING_TAGS_ROLE => QVariant::from(&QString::default()),
             _ => QVariant::default(),
         }
     }
@@ -401,6 +524,11 @@ impl ffi::RecentsModel {
         h.insert(LAUNCHER_ID_ROLE, QByteArray::from("launcherId"));
         h.insert(FAVORITE_ROLE, QByteArray::from("favorite"));
         h.insert(FILE_STEM_ROLE, QByteArray::from("fileStem"));
+        h.insert(HIDDEN_ROLE, QByteArray::from("hidden"));
+        h.insert(
+            DISAMBIGUATING_TAGS_ROLE,
+            QByteArray::from("disambiguatingTags"),
+        );
         h
     }
 
@@ -418,7 +546,20 @@ impl ffi::RecentsModel {
     }
 
     fn ensure_loaded(mut self: Pin<&mut Self>) {
-        if self.history_requested || self.history_fetching {
+        info!(
+            history_requested = self.history_requested,
+            history_fetching = self.history_fetching,
+            count = self.count,
+            loading = self.loading,
+            "recents-diag: ensure_loaded called"
+        );
+        if self.history_requested {
+            info!("recents-diag: ensure_loaded short-circuit (already-loaded), NO refetch");
+            NavTiming::new("cache").log_release("recents", "already-loaded", 0);
+            return;
+        }
+        if self.history_fetching {
+            info!("recents-diag: ensure_loaded short-circuit (already-fetching)");
             return;
         }
         self.as_mut().rust_mut().history_fetching = true;
@@ -479,6 +620,7 @@ impl ffi::RecentsModel {
     }
 
     fn start_initial_history_fetch(mut self: Pin<&mut Self>) {
+        self.as_mut().rust_mut().nav_timing = Some(NavTiming::new("network"));
         self.as_mut().rust_mut().history_subscription = None;
         if !self.loading {
             self.as_mut().set_loading(true);
@@ -502,6 +644,18 @@ impl ffi::RecentsModel {
                     systems: Vec::new(),
                 })
                 .await;
+            match &result {
+                Ok(r) => info!(
+                    entries_len = r.entries.len(),
+                    has_next_page = r.has_next_page(),
+                    next_cursor_set = r.next_cursor().is_some(),
+                    "recents-diag: initial media.history returned"
+                ),
+                Err(e) => info!(
+                    error = e.message.as_str(),
+                    "recents-diag: initial media.history failed"
+                ),
+            }
             let projected = match result {
                 Ok(result) => (Some(page_snapshot(&result)), String::new()),
                 Err(e) => (None, e.message),
@@ -606,7 +760,45 @@ impl ffi::RecentsModel {
         if index < 0 || index >= self.count {
             return QString::default();
         }
-        QString::from(self.entries[index as usize].media_name.as_str())
+        {
+            let entry = &self.entries[index as usize];
+            QString::from(
+                display_name(
+                    &entry.media_name,
+                    &entry.media_path,
+                    self.show_original_filenames,
+                )
+                .as_str(),
+            )
+        }
+    }
+
+    #[allow(
+        clippy::unused_self,
+        reason = "matches the shared model invokable signature; history has no tags"
+    )]
+    fn disambiguating_tags_at(&self, _index: i32) -> QString {
+        QString::default()
+    }
+
+    fn set_show_original_filenames(mut self: Pin<&mut Self>, value: bool) {
+        if self.show_original_filenames == value {
+            return;
+        }
+        self.as_mut().rust_mut().show_original_filenames = value;
+        self.as_mut().show_original_filenames_changed();
+        let last_row = self.count - 1;
+        if last_row >= 0 {
+            let mut roles = QList::<i32>::default();
+            roles.append(NAME_ROLE);
+            let parent = QModelIndex::default();
+            let top_left = self.as_mut().index(0, 0, &parent);
+            let bottom_right = self.as_mut().index(last_row, 0, &parent);
+            self.as_mut().data_changed(&top_left, &bottom_right, &roles);
+        }
+        // The resume banner is a computed property, not a row role — re-derive
+        // it so "Continue playing" reflects the new naming immediately.
+        sync_resume_state(self.as_mut());
     }
 
     fn path_at(&self, index: i32) -> QString {
@@ -623,6 +815,59 @@ impl ffi::RecentsModel {
         QString::from(self.entries[index as usize].system_id.as_str())
     }
 
+    // Immediate, non-debounced sibling of `load_detail_at`. Called the moment
+    // the focused row changes so the detail table reflects THIS row at once —
+    // cached metadata (instant), a memoized blank, or a clean blank while a
+    // fetch is pending — instead of holding the previous row's values through
+    // the load debounce. Also warms neighboring rows' metadata so the next
+    // move is a synchronous cache hit. Never issues a foreground RPC.
+    fn peek_detail_at(mut self: Pin<&mut Self>, index: i32) {
+        self.as_mut()
+            .rust_mut()
+            .detail_seq
+            .fetch_add(1, Ordering::SeqCst);
+        if index < 0 || index >= self.count {
+            clear_current_detail_state(self.as_mut());
+            return;
+        }
+        self.as_mut().rust_mut().detail_prefetch_row = Some(index);
+        prefetch_around_cursor(&self.entries, self.count, index, self.cover_requests_paused);
+        let entry = &self.entries[index as usize];
+        let system = entry.system_id.clone();
+        let path = entry.media_path.clone();
+        if system.trim().is_empty() || path.trim().is_empty() {
+            clear_current_detail_state(self.as_mut());
+            return;
+        }
+        // Deliberately do NOT switch the visible cover here. The cover has its
+        // own grace-window hold (BrowseDetailPane coverHold) and is settled by
+        // the debounced `load_detail_at`. Re-pointing the 512px cover Image on
+        // every keypress kept `_coverBusy` true through sustained navigation
+        // (tripping the hourglass after the grace) and monopolized Qt's async
+        // image loader so the next-row cover never got prefetched. Peek only
+        // updates the metadata table and warms the prefetch hints below.
+        refresh_adjacent_cover_prefetch(self.as_mut());
+
+        let meta_key = MediaKey::new(system.clone(), path.clone());
+        match global_media_meta_cache().lookup(&meta_key) {
+            MetaLookup::Hit(meta) => {
+                self.as_mut()
+                    .set_current_detail_tags(QString::from(detail_tags_from_meta(&meta).as_str()));
+                self.as_mut().set_current_detail_loading(false);
+            }
+            MetaLookup::Negative => {
+                self.as_mut().set_current_detail_tags(QString::default());
+                self.as_mut().set_current_detail_loading(false);
+            }
+            MetaLookup::Miss => {
+                self.as_mut().set_current_detail_tags(QString::default());
+                self.as_mut().set_current_detail_loading(true);
+            }
+        }
+
+        enqueue_meta_prefetch(&self.entries, self.count, index);
+    }
+
     fn load_detail_at(mut self: Pin<&mut Self>, index: i32) {
         let ticket = self
             .as_mut()
@@ -634,6 +879,11 @@ impl ffi::RecentsModel {
             clear_current_detail_state(self.as_mut());
             return;
         }
+        // Record the settled row before borrowing entries.
+        self.as_mut().rust_mut().detail_prefetch_row = Some(index);
+        // Re-center the byte-fetch queue on the current row so it and
+        // its neighbors are fetched ahead of the stale list backlog.
+        prefetch_around_cursor(&self.entries, self.count, index, self.cover_requests_paused);
         let entry = &self.entries[index as usize];
         let system = entry.system_id.clone();
         let path = entry.media_path.clone();
@@ -650,16 +900,44 @@ impl ffi::RecentsModel {
         self.as_mut().rust_mut().current_detail_media_key = Some(detail_key);
         self.as_mut().rust_mut().current_detail_media_id = media_id;
         sync_current_detail_image_key(self.as_mut());
+        refresh_adjacent_cover_prefetch(self.as_mut());
+
+        // Resolve synchronously from the metadata cache when warm (a neighbor
+        // prefetched while dwelling on the previous row, or a revisit), so the
+        // table fills with the correct rows on this frame and never re-fetches.
+        let meta_key = MediaKey::new(system.clone(), path.clone());
+        match global_media_meta_cache().lookup(&meta_key) {
+            MetaLookup::Hit(meta) => {
+                self.as_mut()
+                    .set_current_detail_tags(QString::from(detail_tags_from_meta(&meta).as_str()));
+                self.as_mut().set_current_detail_loading(false);
+                return;
+            }
+            MetaLookup::Negative => {
+                self.as_mut().set_current_detail_tags(QString::default());
+                self.as_mut().set_current_detail_loading(false);
+                return;
+            }
+            MetaLookup::Miss => {}
+        }
+
         self.as_mut().set_current_detail_loading(true);
         self.as_mut().set_current_detail_tags(QString::default());
         let seq = self.rust().detail_seq.clone();
         let qt_thread = self.qt_thread();
         let store = global_store();
+        let store_key = meta_key.clone();
         global_handle().spawn(async move {
             let result = store
                 .client()
                 .media_meta(MediaMetaParams::for_media(system, path.clone()))
                 .await;
+            // Cache the outcome (positive or negative) regardless of whether
+            // this callback is still current, so a later revisit is instant.
+            match &result {
+                Ok(r) => global_media_meta_cache().store(store_key, Some(r.media.clone())),
+                Err(_) => global_media_meta_cache().store(store_key, None),
+            }
             let _ = qt_thread.queue(move |mut model| {
                 if seq.load(Ordering::SeqCst) != ticket {
                     return;
@@ -799,7 +1077,14 @@ fn sync_resume_state(mut model: Pin<&mut ffi::RecentsModel>) {
     let (available, name, cover_key) = match model.resume_entry.as_ref() {
         Some(entry) => (
             true,
-            QString::from(entry.media_name.as_str()),
+            QString::from(
+                display_name(
+                    &entry.media_name,
+                    &entry.media_path,
+                    model.show_original_filenames,
+                )
+                .as_str(),
+            ),
             QString::from(resume_cover_key_for(entry, !model.cover_requests_paused).as_str()),
         ),
         None => (
@@ -914,6 +1199,32 @@ fn detail_tags_from_meta(meta: &MediaMeta) -> String {
         .join("\n")
 }
 
+// Warm the metadata cache for the rows immediately around `row` so a move to
+// a neighbor is a synchronous cache hit. Best-effort and fire-and-forget;
+// already-cached or in-flight keys are skipped inside the cache.
+fn enqueue_meta_prefetch(entries: &[MediaHistoryEntry], count: i32, row: i32) {
+    let mut requests = Vec::new();
+    for delta in [-2_i32, -1, 1, 2] {
+        let i = row + delta;
+        if i < 0 || i >= count {
+            continue;
+        }
+        let entry = &entries[i as usize];
+        let system = entry.system_id.clone();
+        let path = entry.media_path.clone();
+        if system.trim().is_empty() || path.trim().is_empty() {
+            continue;
+        }
+        requests.push((
+            MediaKey::new(system.clone(), path.clone()),
+            MediaMetaParams::for_media(system, path),
+        ));
+    }
+    if !requests.is_empty() {
+        global_media_meta_cache().prefetch(requests);
+    }
+}
+
 fn detail_value_for_aliases(source: &[TagInfo], aliases: &[&str]) -> String {
     source
         .iter()
@@ -941,6 +1252,61 @@ fn clear_current_detail_state(mut model: Pin<&mut ffi::RecentsModel>) {
     model
         .as_mut()
         .set_current_detail_image_key(QString::default());
+    clear_adjacent_cover_prefetch(model);
+}
+
+fn clear_adjacent_cover_prefetch(mut model: Pin<&mut ffi::RecentsModel>) {
+    model.as_mut().rust_mut().detail_prefetch_row = None;
+    if !model.detail_prefetch_key_next.is_empty() {
+        model
+            .as_mut()
+            .set_detail_prefetch_key_next(QString::default());
+    }
+    if !model.detail_prefetch_key_prev.is_empty() {
+        model
+            .as_mut()
+            .set_detail_prefetch_key_prev(QString::default());
+    }
+}
+
+fn refresh_adjacent_cover_prefetch(mut model: Pin<&mut ffi::RecentsModel>) {
+    let Some(row) = model.rust().detail_prefetch_row else {
+        if !model.detail_prefetch_key_next.is_empty() {
+            model
+                .as_mut()
+                .set_detail_prefetch_key_next(QString::default());
+        }
+        if !model.detail_prefetch_key_prev.is_empty() {
+            model
+                .as_mut()
+                .set_detail_prefetch_key_prev(QString::default());
+        }
+        return;
+    };
+    let count = model.count;
+    let requests_enabled = !model.cover_requests_paused;
+
+    let next_key = if row + 1 < count {
+        cover_key_for(&model.entries[(row + 1) as usize], requests_enabled)
+    } else {
+        String::new()
+    };
+    let prev_key = if row > 0 {
+        cover_key_for(&model.entries[(row - 1) as usize], requests_enabled)
+    } else {
+        String::new()
+    };
+
+    if model.detail_prefetch_key_next.to_string() != next_key {
+        model
+            .as_mut()
+            .set_detail_prefetch_key_next(QString::from(next_key.as_str()));
+    }
+    if model.detail_prefetch_key_prev.to_string() != prev_key {
+        model
+            .as_mut()
+            .set_detail_prefetch_key_prev(QString::from(prev_key.as_str()));
+    }
 }
 
 fn sync_current_detail_image_key(mut model: Pin<&mut ffi::RecentsModel>) {
@@ -981,6 +1347,17 @@ fn file_stem_or_name(path: &str, name: &str) -> String {
     }
 }
 
+/// Resolve the user-visible name, honoring the `show_original_filenames`
+/// setting: the original filename (sans extension) when enabled, otherwise
+/// Core's cleaned display name.
+fn display_name(name: &str, path: &str, show_original_filenames: bool) -> String {
+    if show_original_filenames {
+        file_stem_or_name(path, name)
+    } else {
+        name.to_string()
+    }
+}
+
 /// Schedule a cover fetch for every history row with a non-empty
 /// `(systemId, mediaPath)`. The cache enqueue is idempotent —
 /// already-cached, already-pending, or negatively-memoised keys are
@@ -996,6 +1373,57 @@ fn enqueue_recents_covers(entries: &[MediaHistoryEntry]) {
         if let Some(key) = media_key_for(entry).map(MediaKey::with_current_cover_preference) {
             cache.enqueue_search_cover_with_media_id(key, entry.media_id, PAGE_SIZE);
         }
+    }
+}
+
+/// Re-center the byte-fetch queue on the settled cursor row so covers
+/// for the current position and its immediate neighbors are fetched
+/// first, ahead of the stale top-of-list backlog.
+///
+/// Without this, the queue fills in row order at list load and drains
+/// monotonically regardless of where the user scrolls; every Down press
+/// finds the next cover still deep in the queue. Called from
+/// `load_detail_at` after the debounce fires.
+fn prefetch_around_cursor(
+    entries: &[MediaHistoryEntry],
+    count: i32,
+    row: i32,
+    requests_paused: bool,
+) {
+    let cache = global_media_image_cache();
+    if requests_paused {
+        cache.clear_pending_requests();
+        return;
+    }
+    if count <= 0 {
+        return;
+    }
+    let row = row.clamp(0, count - 1);
+    let fwd_end = (row + 1 + COVER_PREFETCH_CURSOR_NEXT).min(count);
+    let back_start = (row - COVER_PREFETCH_CURSOR_PREV).max(0);
+    let mut plan: Vec<(MediaKey, Option<i64>)> = Vec::new();
+    for i in row..fwd_end {
+        let e = &entries[i as usize];
+        if let Some(key) = media_key_for(e).map(MediaKey::with_current_cover_preference) {
+            plan.push((key, e.media_id));
+        }
+    }
+    for i in (back_start..row).rev() {
+        let e = &entries[i as usize];
+        if let Some(key) = media_key_for(e).map(MediaKey::with_current_cover_preference) {
+            plan.push((key, e.media_id));
+        }
+    }
+    cache.replace_pending_requests_ordered(plan, PAGE_SIZE);
+}
+
+fn finish_nav_timing(
+    mut model: Pin<&mut ffi::RecentsModel>,
+    reason: &'static str,
+    pending_remaining: usize,
+) {
+    if let Some(timing) = model.as_mut().rust_mut().nav_timing.take() {
+        timing.log_release("recents", reason, pending_remaining);
     }
 }
 
@@ -1084,10 +1512,15 @@ fn notify_cover_update(mut model: Pin<&mut ffi::RecentsModel>, key: &MediaKey) {
                     info!("recents: cover gate released after decode-settle window");
                     model.as_mut().set_loading(false);
                 }
+                finish_nav_timing(model.as_mut(), "covers-ready", 0);
             });
         });
         model.as_mut().rust_mut().cover_gate_timer = Some(handle);
     }
+    // Re-check the adjacent preload keys: a neighbor's bytes may have
+    // just landed, upgrading its key from `icons/Loading` to
+    // `media-image/...` so the hidden Image can start decoding.
+    refresh_adjacent_cover_prefetch(model);
 }
 
 /// Compute the set of media keys on the current page whose covers we
@@ -1126,16 +1559,27 @@ fn arm_cover_gate(mut model: Pin<&mut ffi::RecentsModel>) {
         handle.abort();
     }
     let cache = global_media_image_cache();
+    let cover_keys = model
+        .entries
+        .iter()
+        .filter_map(|entry| media_key_for(entry).map(MediaKey::with_current_cover_preference))
+        .collect::<Vec<_>>();
+    let cover_total = cover_keys.len();
+    let cover_cache_hits = cover_keys.iter().filter(|k| cache.is_cached(k)).count();
     let unresolved = compute_unresolved_keys(
         &model.entries,
         |k| cache.is_cached(k),
         |k| cache.is_negative(k) || cache.is_soft_no_image(k),
     );
+    if let Some(timing) = model.as_mut().rust_mut().nav_timing.as_mut() {
+        timing.start_gate(cover_total, cover_cache_hits, unresolved.len());
+    }
     if unresolved.is_empty() {
         model.as_mut().rust_mut().pending_first_paint_keys.clear();
         if model.loading {
             model.as_mut().set_loading(false);
         }
+        finish_nav_timing(model.as_mut(), "covers-ready", 0);
         return;
     }
     info!(
@@ -1180,6 +1624,7 @@ fn release_cover_gate_after_timeout(mut model: Pin<&mut ffi::RecentsModel>) {
     if model.loading {
         model.as_mut().set_loading(false);
     }
+    finish_nav_timing(model.as_mut(), "timeout", pending);
 }
 
 fn launch_entry(entry: &MediaHistoryEntry) {

@@ -36,6 +36,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{c_char, c_void};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
@@ -444,6 +445,7 @@ struct QueueEntry {
     key: MediaKey,
     page_size: u32,
     no_image_policy: NoImagePolicy,
+    enqueued_at: Instant,
 }
 
 #[derive(Debug)]
@@ -517,6 +519,14 @@ struct CacheState {
     /// cleaned up alongside the row in `evict_until_fits` so the
     /// sidecar can't outgrow the rest of the cache.
     media_ids: HashMap<MediaKey, i64>,
+    /// Short image type that Core resolved for each cached key.
+    /// Populated from `MediaImageResult.type_tag` (stripped of the
+    /// `property:image-` prefix) on every successful fetch. Used by the
+    /// carousel dedup: when the preference is "auto" (empty `imageTypes`),
+    /// Core may return e.g. `boxart` — the carousel tail can then drop
+    /// the concrete `boxart` key so left/right shows a genuinely different
+    /// image. Cleaned up alongside `map` in `evict_until_fits`.
+    resolved_types: HashMap<MediaKey, String>,
     /// Strictly increasing LRU clock. Bumped on every successful read
     /// or insert; the entry with the smallest value is the LRU.
     clock: u64,
@@ -533,6 +543,7 @@ impl CacheState {
             pending: HashSet::new(),
             attempts: HashMap::new(),
             media_ids: HashMap::new(),
+            resolved_types: HashMap::new(),
             clock: 0,
         }
     }
@@ -570,11 +581,11 @@ impl CacheState {
             };
             if let Some(entry) = self.map.remove(&victim) {
                 self.total_bytes = self.total_bytes.saturating_sub(entry.bytes.len());
-                // Keep the `media_ids` sidecar in lock-step with
-                // `map` — without this, the hint table grows
-                // unboundedly past `cap_bytes` because the eviction
-                // pass only touches the primary cache.
+                // Keep the sidecars in lock-step with `map` — without
+                // this the hint tables grow unboundedly past `cap_bytes`
+                // because the eviction pass only touches the primary cache.
                 self.media_ids.remove(&victim);
+                self.resolved_types.remove(&victim);
                 debug!(
                     system_id = %victim.system_id,
                     path = %victim.path,
@@ -695,6 +706,20 @@ impl MediaImageCache {
         guard.soft_no_image.contains(key)
     }
 
+    /// Return the short image type that Core resolved for `key` on its last
+    /// successful fetch (e.g. `"boxart"`). `None` when the key hasn't been
+    /// fetched successfully yet, when Core returned an empty `type_tag`
+    /// (older Core versions), or when the entry was evicted.
+    ///
+    /// Used by the carousel dedup: when the user's preference is "auto",
+    /// `ordered_detail_image_keys` needs Core's answer to know which
+    /// concrete type key in the carousel tail is a duplicate of index 0.
+    pub fn resolved_image_type(&self, key: &MediaKey) -> Option<String> {
+        #[allow(clippy::unwrap_used, reason = "RwLock poisoning is unrecoverable")]
+        let guard = self.state.read().unwrap();
+        guard.resolved_types.get(key).cloned()
+    }
+
     /// Subscribe to cache updates. Used by `GamesModel` to bridge image
     /// completions onto `dataChanged(coverKey)` on the Qt thread.
     pub fn subscribe(&self) -> broadcast::Receiver<MediaImageUpdate> {
@@ -799,6 +824,7 @@ impl MediaImageCache {
                     key,
                     page_size,
                     no_image_policy: NoImagePolicy::Memoize,
+                    enqueued_at: Instant::now(),
                 });
             }
         }
@@ -908,6 +934,7 @@ impl MediaImageCache {
                 key,
                 page_size,
                 no_image_policy,
+                enqueued_at: Instant::now(),
             });
             // Keep only the freshest MAX_QUEUE_LEN entries; the rest
             // (oldest enqueues at the front) get dropped. The dropped
@@ -942,6 +969,19 @@ impl MediaImageCache {
     /// resolves the cached bytes.
     pub fn image_key_for(key: &MediaKey) -> String {
         format!("media-image/{}", key.encode())
+    }
+
+    /// Returns the user's configured preferred image type (e.g. `"boxart"`)
+    /// if one is set, or `None` when the preference is `"auto"` or unset.
+    /// Used by callers that need to deduplicate the cover-preference key
+    /// against a list of specific image-type keys.
+    pub fn current_cover_preference_type() -> Option<String> {
+        let value = crate::models::try_with_persist_read(|s| s.settings.media_image_type.clone())?;
+        let trimmed = value.trim().to_owned();
+        if trimmed.is_empty() || trimmed == "auto" {
+            return None;
+        }
+        Some(trimmed)
     }
 }
 
@@ -1014,7 +1054,7 @@ fn process_batch_outcomes(
     queue_notify: &Arc<Notify>,
     outcomes: Vec<(QueueEntry, FetchOutcome)>,
 ) {
-    for (entry, outcome) in outcomes {
+    for (mut entry, outcome) in outcomes {
         let key = entry.key.clone();
         let is_transient = matches!(outcome, FetchOutcome::Transient);
         let is_connection_down = matches!(outcome, FetchOutcome::ConnectionDown);
@@ -1044,6 +1084,7 @@ fn process_batch_outcomes(
                 let dropped = {
                     #[allow(clippy::unwrap_used, reason = "Mutex poisoning is unrecoverable")]
                     let mut q = queue.lock().unwrap();
+                    entry.enqueued_at = Instant::now();
                     q.push_front(entry);
                     // Mirror the `enqueue_with_media_id` cap: a
                     // long-running burst of transient failures can
@@ -1137,6 +1178,10 @@ enum FetchOutcome {
     Success {
         bytes: Vec<u8>,
         ext: &'static str,
+        /// Short image type resolved by Core (e.g. `"boxart"`), stripped of
+        /// the `property:image-` prefix. Empty for older Core versions that
+        /// do not populate `type_tag`, or when the prefix is absent.
+        type_tag: String,
     },
     /// Core gave a "no image" answer for this `(system_id, path)` —
     /// empty payload, unsupported format, or per-item miss. The queue
@@ -1154,6 +1199,15 @@ enum FetchOutcome {
     ConnectionDown,
 }
 
+fn fetch_outcome_label(outcome: &FetchOutcome) -> &'static str {
+    match outcome {
+        FetchOutcome::Success { .. } => "success",
+        FetchOutcome::NoImage => "no_image",
+        FetchOutcome::Transient => "transient",
+        FetchOutcome::ConnectionDown => "connection_down",
+    }
+}
+
 /// Fetch one media image with one `media.image` JSON-RPC call. Core no
 /// longer accepts batched `items`, so queue fan-out happens entirely in
 /// this single-flight driver.
@@ -1164,6 +1218,7 @@ async fn fetch_one(
     entry: QueueEntry,
 ) -> (QueueEntry, FetchOutcome) {
     let key = entry.key.clone();
+    let queue_wait = entry.enqueued_at.elapsed();
     let (mut params, had_id_hint) = {
         #[allow(clippy::unwrap_used, reason = "RwLock poisoning is unrecoverable")]
         let guard = state.read().unwrap();
@@ -1194,17 +1249,30 @@ async fn fetch_one(
         max_size,
         "media_image_cache: media.image request"
     );
-    match store.client().media_image(params).await {
-        Ok(image) => (entry, classify_media_image_result(&key, &image)),
+    let fetch_started = Instant::now();
+    let result = store.client().media_image(params).await;
+    let fetch_duration = fetch_started.elapsed();
+    let (outcome, decode_duration) = match result {
+        Ok(image) => classify_media_image_result(&key, &image),
         Err(e) => {
             let outcome = classify_single_media_image_error(&key, &e.message, had_id_hint);
             if matches!(outcome, FetchOutcome::Transient) && had_id_hint {
                 #[allow(clippy::unwrap_used, reason = "RwLock poisoning is unrecoverable")]
                 state.write().unwrap().media_ids.remove(&key);
             }
-            (entry, outcome)
+            (outcome, Duration::ZERO)
         }
-    }
+    };
+    debug!(
+        system_id = %key.system_id,
+        path = %key.path,
+        outcome = fetch_outcome_label(&outcome),
+        queue_wait_ms = queue_wait.as_millis(),
+        fetch_ms = fetch_duration.as_millis(),
+        decode_ms = decode_duration.as_millis(),
+        "media_image_cache: cover timing",
+    );
+    (entry, outcome)
 }
 
 fn classify_single_media_image_error(
@@ -1255,25 +1323,31 @@ fn is_stable_media_image_miss(message: &str) -> bool {
         || (message.contains("media binary") && message.contains("is too large"))
 }
 
-fn classify_media_image_result(key: &MediaKey, image: &MediaImageResult) -> FetchOutcome {
+fn classify_media_image_result(
+    key: &MediaKey,
+    image: &MediaImageResult,
+) -> (FetchOutcome, Duration) {
+    let decode_started = Instant::now();
     let bytes = match BASE64_STANDARD.decode(image.data.as_bytes()) {
         Ok(b) => b,
         Err(e) => {
+            let decode_duration = decode_started.elapsed();
             warn!(
                 system_id = %key.system_id,
                 path = %key.path,
                 "media_image_cache: base64 decode failed: {e} (transient, will retry on next enqueue)",
             );
-            return FetchOutcome::Transient;
+            return (FetchOutcome::Transient, decode_duration);
         }
     };
+    let decode_duration = decode_started.elapsed();
     if bytes.is_empty() {
         warn!(
             system_id = %key.system_id,
             path = %key.path,
             "media_image_cache: media.image returned 0 bytes after base64 decode, treating as no image",
         );
-        return FetchOutcome::NoImage;
+        return (FetchOutcome::NoImage, decode_duration);
     }
     let ext = image
         .extension
@@ -1289,9 +1363,24 @@ fn classify_media_image_result(key: &MediaKey, image: &MediaImageResult) -> Fetc
             bytes_len = bytes.len(),
             "media_image_cache: unsupported extension/content_type, skipping cache",
         );
-        return FetchOutcome::NoImage;
+        return (FetchOutcome::NoImage, decode_duration);
     };
-    FetchOutcome::Success { bytes, ext }
+    // Strip the canonical prefix so the stored value is the bare type
+    // name (e.g. "boxart"), matching MediaKey::image_type values used by
+    // the carousel. Older Core versions return "" for type_tag.
+    let type_tag = image
+        .type_tag
+        .strip_prefix("property:image-")
+        .unwrap_or("")
+        .to_string();
+    (
+        FetchOutcome::Success {
+            bytes,
+            ext,
+            type_tag,
+        },
+        decode_duration,
+    )
 }
 
 fn finish_fetch(
@@ -1306,7 +1395,11 @@ fn finish_fetch(
     guard.pending.remove(key);
     let search_seen = guard.search_seen.contains(key);
     match outcome {
-        FetchOutcome::Success { bytes, ext } => {
+        FetchOutcome::Success {
+            bytes,
+            ext,
+            type_tag,
+        } => {
             if bytes.len() > cap_bytes {
                 warn!(
                     system_id = %key.system_id,
@@ -1318,8 +1411,12 @@ fn finish_fetch(
                 if no_image_policy == NoImagePolicy::Memoize && !search_seen {
                     if let Some(prev) = guard.map.remove(key) {
                         guard.total_bytes = guard.total_bytes.saturating_sub(prev.bytes.len());
-                        guard.media_ids.remove(key);
                     }
+                    // Remove unconditionally: media_ids is written in
+                    // enqueue_with_policy before the fetch result arrives, so it
+                    // may exist even when map had no entry.
+                    guard.media_ids.remove(key);
+                    guard.resolved_types.remove(key);
                     guard.soft_no_image.remove(key);
                     guard.negative.insert(key.clone());
                 } else if !guard.map.contains_key(key) {
@@ -1341,6 +1438,18 @@ fn finish_fetch(
             if let Some(prev) = guard.map.insert(key.clone(), entry) {
                 guard.total_bytes = guard.total_bytes.saturating_sub(prev.bytes.len());
             }
+            // Record the resolved type for carousel dedup. Non-empty only
+            // when Core populates type_tag (>=v0.7). Old Core versions get
+            // no dedup — the carousel may still show a duplicate in that
+            // case, which is no worse than today.
+            if type_tag.is_empty() {
+                // Empty type_tag means old Core; clear any stale entry from a
+                // previous fetch so resolved_image_type() doesn't deduplicate
+                // against outdated type information.
+                guard.resolved_types.remove(key);
+            } else {
+                guard.resolved_types.insert(key.clone(), type_tag);
+            }
             guard.soft_no_image.remove(key);
             guard.total_bytes = guard.total_bytes.saturating_add(bytes_len);
             guard.evict_until_fits(cap_bytes);
@@ -1353,8 +1462,9 @@ fn finish_fetch(
             if no_image_policy == NoImagePolicy::Memoize && !search_seen {
                 if let Some(prev) = guard.map.remove(key) {
                     guard.total_bytes = guard.total_bytes.saturating_sub(prev.bytes.len());
-                    guard.media_ids.remove(key);
                 }
+                guard.media_ids.remove(key);
+                guard.resolved_types.remove(key);
                 guard.soft_no_image.remove(key);
                 guard.negative.insert(key.clone());
             } else if !guard.map.contains_key(key) {
@@ -1486,6 +1596,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::AtomicU32;
     use std::sync::{Arc, Mutex, RwLock};
+    use std::time::Instant;
     use tokio::sync::{broadcast, Notify};
 
     /// Build a `MediaImageCache` without spawning the fetch driver.
@@ -1708,6 +1819,7 @@ mod tests {
             FetchOutcome::Success {
                 bytes: vec![1, 2, 3],
                 ext: "png",
+                type_tag: String::new(),
             },
             NoImagePolicy::Memoize,
         )
@@ -1948,6 +2060,7 @@ mod tests {
             FetchOutcome::Success {
                 bytes: vec![0; n],
                 ext: "png",
+                type_tag: String::new(),
             },
             NoImagePolicy::Memoize,
         );
@@ -2114,6 +2227,7 @@ mod tests {
             FetchOutcome::Success {
                 bytes: vec![0; cap + 1],
                 ext: "png",
+                type_tag: String::new(),
             },
             NoImagePolicy::Memoize,
         )
@@ -2170,6 +2284,7 @@ mod tests {
             key: key("NES", "/retry"),
             page_size: 15,
             no_image_policy: NoImagePolicy::Memoize,
+            enqueued_at: Instant::now(),
         };
         {
             let mut q = queue.lock().unwrap();
@@ -2177,11 +2292,13 @@ mod tests {
                 key: second.clone(),
                 page_size: 15,
                 no_image_policy: NoImagePolicy::Memoize,
+                enqueued_at: Instant::now(),
             });
             q.push_back(QueueEntry {
                 key: first.clone(),
                 page_size: 15,
                 no_image_policy: NoImagePolicy::Memoize,
+                enqueued_at: Instant::now(),
             });
         }
         state.write().unwrap().pending.insert(retry.key.clone());
@@ -2215,16 +2332,19 @@ mod tests {
             key: a.clone(),
             page_size: 15,
             no_image_policy: NoImagePolicy::Memoize,
+            enqueued_at: Instant::now(),
         });
         q.push_back(QueueEntry {
             key: b.clone(),
             page_size: 15,
             no_image_policy: NoImagePolicy::Memoize,
+            enqueued_at: Instant::now(),
         });
         q.push_back(QueueEntry {
             key: c.clone(),
             page_size: 15,
             no_image_policy: NoImagePolicy::Memoize,
+            enqueued_at: Instant::now(),
         });
         assert_eq!(q.pop_back().map(|e| e.key), Some(c));
         assert_eq!(q.pop_back().map(|e| e.key), Some(b));

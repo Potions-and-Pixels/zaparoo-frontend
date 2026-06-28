@@ -22,6 +22,11 @@
 //   * `current_language` — READ + NOTIFY. Mirrors `[general].language`
 //     from frontend.toml and is also recorded in persisted state so the
 //     settings snapshot stays coherent.
+//   * `available_clock_formats` — CONSTANT. Tri-state wall-clock format:
+//     `auto` follows the effective UI locale, `12h` and `24h` force an
+//     override.
+//   * `current_clock_format` — READ + NOTIFY, persisted. Defaults to
+//     `auto` so existing installs keep locale-driven behavior.
 //   * `available_orientations` — CONSTANT. Three display transforms:
 //     horizontal (default), rotated clockwise, rotated counter-clockwise.
 //   * `current_orientation` — READ + NOTIFY, persisted. Applied live by
@@ -32,6 +37,10 @@
 //     placeholder until the new browsing screen is built.
 //   * `current_browse_layout` — READ + NOTIFY, persisted. Defaults to
 //     "grid" so existing installs keep current behavior.
+//   * `available_system_logo_styles` — CONSTANT. "tinted" keeps the default
+//     theme-colored SVGs; "color" opts into restored full-color logos.
+//   * `current_system_logo_style` — READ + NOTIFY, persisted. Defaults to
+//     "tinted" so existing installs keep current behavior.
 //   * `available_button_layouts` — CONSTANT. Single-letter ids used to
 //     compose resources/images/buttons/<layout>/Button*.png. User-facing
 //     labels are "Style A/B/C/D" (see
@@ -44,6 +53,9 @@
 //     selection across the rename.
 //   * `current_mouse_enabled` — READ + NOTIFY, persisted. Defaults to true
 //     so existing installs keep the visible cursor and mouse hit targets.
+//   * `current_reduce_motion` — READ + NOTIFY, persisted. Defaults to false
+//     (motion on). When true, all Behavior durations in the UI collapse to
+//     0 via Motion.dur() so animations complete in one frame.
 //   * `current_debug_logging` — READ + NOTIFY, persisted. Defaults to false.
 //     Toggling it writes `[logging] debug = …` into frontend.toml; the
 //     tracing subscriber is built once at startup so the change only takes
@@ -119,10 +131,16 @@ const LANGUAGE_ALIASES: &[(&str, &str)] = &[
     ("hi_IN", "hi"),
 ];
 const DEFAULT_LANGUAGE: &str = "auto";
+const CLOCK_FORMATS: &[&str] = &["auto", "12h", "24h"];
+const DEFAULT_CLOCK_FORMAT: &str = "auto";
+const REGIONS: &[&str] = &["auto", "us", "eu", "jp"];
+const DEFAULT_REGION: &str = "auto";
 const ORIENTATIONS: &[&str] = &["horizontal", "cw", "ccw"];
 const DEFAULT_ORIENTATION: &str = "horizontal";
 const BROWSE_LAYOUTS: &[&str] = &["grid", "list"];
 const DEFAULT_BROWSE_LAYOUT: &str = "grid";
+const SYSTEM_LOGO_STYLES: &[&str] = &["tinted", "color"];
+const DEFAULT_SYSTEM_LOGO_STYLE: &str = "tinted";
 const BUTTON_LAYOUTS: &[&str] = &["a", "b", "c", "d"];
 const DEFAULT_BUTTON_LAYOUT: &str = "a";
 // Screensaver idle-timeout choices. Values are seconds as ASCII
@@ -167,19 +185,28 @@ pub struct SettingsRust {
     current_resolution: QString,
     available_languages: QStringList,
     current_language: QString,
+    available_clock_formats: QStringList,
+    current_clock_format: QString,
     available_orientations: QStringList,
     current_orientation: QString,
     available_browse_layouts: QStringList,
     current_browse_layout: QString,
+    available_system_logo_styles: QStringList,
+    current_system_logo_style: QString,
     available_button_layouts: QStringList,
     current_button_layout: QString,
     current_mouse_enabled: bool,
+    current_reduce_motion: bool,
     current_discover_arcade_alternate_versions: bool,
     current_debug_logging: bool,
+    current_show_hidden: bool,
+    current_show_original_filenames: bool,
     available_screensaver_timeouts: QStringList,
     current_screensaver_timeout: QString,
     available_media_image_types: QStringList,
     current_media_image_type: QString,
+    available_regions: QStringList,
+    current_region: QString,
     // ----- Kiosk lockdown -----
     // READ + CONSTANT: set once at Initialize from `frontend.toml`,
     // never mutated from QML. Hiding the Settings screen (which
@@ -211,19 +238,28 @@ pub mod ffi {
         #[qproperty(QString, current_resolution, READ, WRITE = set_resolution, NOTIFY)]
         #[qproperty(QStringList, available_languages, READ, CONSTANT)]
         #[qproperty(QString, current_language, READ, WRITE = set_language, NOTIFY)]
+        #[qproperty(QStringList, available_clock_formats, READ, CONSTANT)]
+        #[qproperty(QString, current_clock_format, READ, WRITE = set_clock_format, NOTIFY)]
         #[qproperty(QStringList, available_orientations, READ, CONSTANT)]
         #[qproperty(QString, current_orientation, READ, WRITE = set_orientation, NOTIFY)]
         #[qproperty(QStringList, available_browse_layouts, READ, CONSTANT)]
         #[qproperty(QString, current_browse_layout, READ, WRITE = set_browse_layout, NOTIFY)]
+        #[qproperty(QStringList, available_system_logo_styles, READ, CONSTANT)]
+        #[qproperty(QString, current_system_logo_style, READ, WRITE = set_system_logo_style, NOTIFY)]
         #[qproperty(QStringList, available_button_layouts, READ, CONSTANT)]
         #[qproperty(QString, current_button_layout, READ, WRITE = set_button_layout, NOTIFY)]
         #[qproperty(bool, current_mouse_enabled, READ, WRITE = set_mouse_enabled, NOTIFY)]
+        #[qproperty(bool, current_reduce_motion, READ, WRITE = set_reduce_motion, NOTIFY)]
         #[qproperty(bool, current_discover_arcade_alternate_versions, READ, WRITE = set_discover_arcade_alternate_versions, NOTIFY)]
         #[qproperty(bool, current_debug_logging, READ, WRITE = set_debug_logging, NOTIFY)]
+        #[qproperty(bool, current_show_hidden, READ, WRITE = set_show_hidden, NOTIFY)]
+        #[qproperty(bool, current_show_original_filenames, READ, WRITE = set_show_original_filenames, NOTIFY)]
         #[qproperty(QStringList, available_screensaver_timeouts, READ, CONSTANT)]
         #[qproperty(QString, current_screensaver_timeout, READ, WRITE = set_screensaver_timeout, NOTIFY)]
         #[qproperty(QStringList, available_media_image_types, READ, CONSTANT)]
         #[qproperty(QString, current_media_image_type, READ, WRITE = set_media_image_type, NOTIFY)]
+        #[qproperty(QStringList, available_regions, READ, CONSTANT)]
+        #[qproperty(QString, current_region, READ, WRITE = set_region, NOTIFY)]
         // Kiosk lockdown flags — READ + CONSTANT, admin-set via
         // frontend.toml. See SettingsRust doc comment.
         #[qproperty(bool, current_hide_settings, READ, CONSTANT)]
@@ -240,16 +276,25 @@ pub mod ffi {
         fn set_language(self: Pin<&mut Settings>, value: QString);
 
         #[qinvokable]
+        fn set_clock_format(self: Pin<&mut Settings>, value: QString);
+
+        #[qinvokable]
         fn set_orientation(self: Pin<&mut Settings>, value: QString);
 
         #[qinvokable]
         fn set_browse_layout(self: Pin<&mut Settings>, value: QString);
 
         #[qinvokable]
+        fn set_system_logo_style(self: Pin<&mut Settings>, value: QString);
+
+        #[qinvokable]
         fn set_button_layout(self: Pin<&mut Settings>, value: QString);
 
         #[qinvokable]
         fn set_mouse_enabled(self: Pin<&mut Settings>, value: bool);
+
+        #[qinvokable]
+        fn set_reduce_motion(self: Pin<&mut Settings>, value: bool);
 
         #[qinvokable]
         fn set_discover_arcade_alternate_versions(self: Pin<&mut Settings>, value: bool);
@@ -262,6 +307,15 @@ pub mod ffi {
 
         #[qinvokable]
         fn set_media_image_type(self: Pin<&mut Settings>, value: QString);
+
+        #[qinvokable]
+        fn set_show_hidden(self: Pin<&mut Settings>, value: bool);
+
+        #[qinvokable]
+        fn set_show_original_filenames(self: Pin<&mut Settings>, value: bool);
+
+        #[qinvokable]
+        fn set_region(self: Pin<&mut Settings>, value: QString);
     }
 
     impl cxx_qt::Initialize for Settings {}
@@ -287,25 +341,35 @@ impl Initialize for ffi::Settings {
         self.as_mut().rust_mut().current_resolution = QString::from(merged.resolution.as_str());
         self.as_mut().rust_mut().available_languages = languages();
         self.as_mut().rust_mut().current_language = QString::from(merged.language.as_str());
+        self.as_mut().rust_mut().available_clock_formats = clock_formats();
+        self.as_mut().rust_mut().current_clock_format = QString::from(merged.clock_format.as_str());
         self.as_mut().rust_mut().available_orientations = orientations();
         self.as_mut().rust_mut().current_orientation = QString::from(merged.orientation.as_str());
         self.as_mut().rust_mut().available_browse_layouts = browse_layouts();
         self.as_mut().rust_mut().current_browse_layout =
             QString::from(merged.browse_layout.as_str());
+        self.as_mut().rust_mut().available_system_logo_styles = system_logo_styles();
+        self.as_mut().rust_mut().current_system_logo_style =
+            QString::from(merged.system_logo_style.as_str());
         self.as_mut().rust_mut().available_button_layouts = button_layouts();
         self.as_mut().rust_mut().current_button_layout =
             QString::from(merged.button_layout.as_str());
         self.as_mut().rust_mut().current_mouse_enabled = merged.mouse_enabled;
+        self.as_mut().rust_mut().current_reduce_motion = merged.reduce_motion;
         self.as_mut()
             .rust_mut()
             .current_discover_arcade_alternate_versions = merged.discover_arcade_alternate_versions;
         self.as_mut().rust_mut().current_debug_logging = merged.debug_logging;
+        self.as_mut().rust_mut().current_show_hidden = merged.show_hidden;
+        self.as_mut().rust_mut().current_show_original_filenames = merged.show_original_filenames;
         self.as_mut().rust_mut().available_screensaver_timeouts = screensaver_timeouts();
         self.as_mut().rust_mut().current_screensaver_timeout =
             QString::from(merged.screensaver_timeout.as_str());
         self.as_mut().rust_mut().available_media_image_types = media_image_types();
         self.as_mut().rust_mut().current_media_image_type =
             QString::from(merged.media_image_type.as_str());
+        self.as_mut().rust_mut().available_regions = regions();
+        self.as_mut().rust_mut().current_region = QString::from(merged.region.as_str());
         // Kiosk lockdown flags — read straight from Config, no
         // persist/state.toml involvement (they're not user-toggleable;
         // there's no UI to toggle them from since `hide_settings`
@@ -362,6 +426,21 @@ impl ffi::Settings {
         clippy::needless_pass_by_value,
         reason = "cxx-qt qinvokable signature requires QString by value"
     )]
+    fn set_clock_format(mut self: Pin<&mut Self>, value: QString) {
+        let value_str = normalize_clock_format(&value.to_string()).to_string();
+        if self.current_clock_format.to_string() == value_str {
+            return;
+        }
+        let snapshot = persist_settings(|s| s.clock_format.clone_from(&value_str));
+        mirror_settings_to_config(&config_file_path(), &snapshot.settings);
+        self.as_mut().rust_mut().current_clock_format = QString::from(value_str.as_str());
+        self.as_mut().current_clock_format_changed();
+    }
+
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "cxx-qt qinvokable signature requires QString by value"
+    )]
     fn set_orientation(mut self: Pin<&mut Self>, value: QString) {
         let value_str = normalize_orientation(&value.to_string()).to_string();
         if self.current_orientation.to_string() == value_str {
@@ -392,6 +471,21 @@ impl ffi::Settings {
         clippy::needless_pass_by_value,
         reason = "cxx-qt qinvokable signature requires QString by value"
     )]
+    fn set_system_logo_style(mut self: Pin<&mut Self>, value: QString) {
+        let value_str = normalize_system_logo_style(&value.to_string()).to_string();
+        if self.current_system_logo_style.to_string() == value_str {
+            return;
+        }
+        let snapshot = persist_settings(|s| s.system_logo_style.clone_from(&value_str));
+        mirror_settings_to_config(&config_file_path(), &snapshot.settings);
+        self.as_mut().rust_mut().current_system_logo_style = QString::from(value_str.as_str());
+        self.as_mut().current_system_logo_style_changed();
+    }
+
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "cxx-qt qinvokable signature requires QString by value"
+    )]
     fn set_button_layout(mut self: Pin<&mut Self>, value: QString) {
         let value_str = normalize_button_layout(&value.to_string()).to_string();
         if self.current_button_layout.to_string() == value_str {
@@ -411,6 +505,16 @@ impl ffi::Settings {
         mirror_settings_to_config(&config_file_path(), &snapshot.settings);
         self.as_mut().rust_mut().current_mouse_enabled = value;
         self.as_mut().current_mouse_enabled_changed();
+    }
+
+    fn set_reduce_motion(mut self: Pin<&mut Self>, value: bool) {
+        if self.current_reduce_motion == value {
+            return;
+        }
+        let snapshot = persist_settings(|s| s.reduce_motion = value);
+        mirror_settings_to_config(&config_file_path(), &snapshot.settings);
+        self.as_mut().rust_mut().current_reduce_motion = value;
+        self.as_mut().current_reduce_motion_changed();
     }
 
     fn set_discover_arcade_alternate_versions(mut self: Pin<&mut Self>, value: bool) {
@@ -465,9 +569,46 @@ impl ffi::Settings {
         self.as_mut().rust_mut().current_media_image_type = QString::from(value_str.as_str());
         self.as_mut().current_media_image_type_changed();
     }
+
+    fn set_show_hidden(mut self: Pin<&mut Self>, value: bool) {
+        if self.current_show_hidden == value {
+            return;
+        }
+        let snapshot = persist_settings(|s| s.show_hidden = value);
+        mirror_settings_to_config(&config_file_path(), &snapshot.settings);
+        self.as_mut().rust_mut().current_show_hidden = value;
+        self.as_mut().current_show_hidden_changed();
+    }
+
+    fn set_show_original_filenames(mut self: Pin<&mut Self>, value: bool) {
+        if self.current_show_original_filenames == value {
+            return;
+        }
+        let snapshot = persist_settings(|s| s.show_original_filenames = value);
+        mirror_settings_to_config(&config_file_path(), &snapshot.settings);
+        self.as_mut().rust_mut().current_show_original_filenames = value;
+        self.as_mut().current_show_original_filenames_changed();
+    }
+
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "cxx-qt qinvokable signature requires QString by value"
+    )]
+    fn set_region(mut self: Pin<&mut Self>, value: QString) {
+        let value_str = normalize_region(&value.to_string()).to_string();
+        if self.current_region.to_string() == value_str {
+            return;
+        }
+        let snapshot = persist_settings(|s| s.region.clone_from(&value_str));
+        mirror_settings_to_config(&config_file_path(), &snapshot.settings);
+        self.as_mut().rust_mut().current_region = QString::from(value_str.as_str());
+        self.as_mut().current_region_changed();
+    }
 }
 
-fn persist_settings<F: FnOnce(&mut SettingsState)>(mutator: F) -> persist::PersistedState {
+pub(super) fn persist_settings<F: FnOnce(&mut SettingsState)>(
+    mutator: F,
+) -> persist::PersistedState {
     let snapshot = with_persist_mut(|s| {
         mutator(&mut s.settings);
         s.clone()
@@ -487,20 +628,29 @@ fn persist_if_changed(current: &SettingsState, merged: &SettingsState) {
     persist::save(&snapshot);
 }
 
-fn mirror_settings_to_config(config_path: &std::path::Path, settings: &SettingsState) {
+pub(super) fn mirror_settings_to_config(config_path: &std::path::Path, settings: &SettingsState) {
     if let Err(e) = save_settings_mirror(
         config_path,
         SettingsMirror {
             resolution: settings.resolution.as_str(),
             language: settings.language.as_str(),
             orientation: settings.orientation.as_str(),
+            clock_format: settings.clock_format.as_str(),
             browse_layout: settings.browse_layout.as_str(),
+            system_logo_style: settings.system_logo_style.as_str(),
             button_layout: settings.button_layout.as_str(),
             mouse_enabled: settings.mouse_enabled,
+            reduce_motion: settings.reduce_motion,
             discover_arcade_alternate_versions: settings.discover_arcade_alternate_versions,
             debug_logging: settings.debug_logging,
             screensaver_timeout: settings.screensaver_timeout.as_str(),
             media_image_type: settings.media_image_type.as_str(),
+            show_hidden: settings.show_hidden,
+            show_original_filenames: settings.show_original_filenames,
+            region: settings.region.as_str(),
+            crt_video_standard: settings.crt_video_standard.as_str(),
+            crt_h_offset: settings.crt_h_offset,
+            crt_v_offset: settings.crt_v_offset,
         },
     ) {
         warn!(
@@ -510,7 +660,33 @@ fn mirror_settings_to_config(config_path: &std::path::Path, settings: &SettingsS
     }
 }
 
+// Resolve the native-CRT settings (video standard plus clamped centering
+// trims) from config-over-snapshot. Split out of `merge_settings` so that
+// function stays within the clippy line budget.
+fn merge_crt_settings(snapshot: &SettingsState, config: &Config) -> (String, i32, i32) {
+    let (h_offset, v_offset) = zaparoo_core::config::clamp_crt_offsets(
+        config
+            .settings
+            .crt_h_offset
+            .unwrap_or(snapshot.crt_h_offset),
+        config
+            .settings
+            .crt_v_offset
+            .unwrap_or(snapshot.crt_v_offset),
+    );
+    let standard = zaparoo_core::config::normalize_crt_video_standard(
+        config
+            .settings
+            .crt_video_standard
+            .as_deref()
+            .unwrap_or(snapshot.crt_video_standard.as_str()),
+    )
+    .to_string();
+    (standard, h_offset, v_offset)
+}
+
 fn merge_settings(snapshot: &SettingsState, config: &Config) -> SettingsState {
+    let (crt_video_standard, crt_h_offset, crt_v_offset) = merge_crt_settings(snapshot, config);
     SettingsState {
         resolution: if config.video_explicit {
             format!("{}x{}", config.video_width, config.video_height)
@@ -526,12 +702,28 @@ fn merge_settings(snapshot: &SettingsState, config: &Config) -> SettingsState {
                 .unwrap_or(snapshot.orientation.as_str()),
         )
         .to_string(),
+        clock_format: normalize_clock_format(
+            config
+                .settings
+                .clock_format
+                .as_deref()
+                .unwrap_or(snapshot.clock_format.as_str()),
+        )
+        .to_string(),
         browse_layout: normalize_browse_layout(
             config
                 .settings
                 .browse_layout
                 .as_deref()
                 .unwrap_or(snapshot.browse_layout.as_str()),
+        )
+        .to_string(),
+        system_logo_style: normalize_system_logo_style(
+            config
+                .settings
+                .system_logo_style
+                .as_deref()
+                .unwrap_or(snapshot.system_logo_style.as_str()),
         )
         .to_string(),
         button_layout: normalize_button_layout(
@@ -546,6 +738,10 @@ fn merge_settings(snapshot: &SettingsState, config: &Config) -> SettingsState {
             .settings
             .mouse_enabled
             .unwrap_or(snapshot.mouse_enabled),
+        reduce_motion: config
+            .settings
+            .reduce_motion
+            .unwrap_or(snapshot.reduce_motion),
         discover_arcade_alternate_versions: config
             .settings
             .discover_arcade_alternate_versions
@@ -569,6 +765,22 @@ fn merge_settings(snapshot: &SettingsState, config: &Config) -> SettingsState {
                 .unwrap_or(snapshot.media_image_type.as_str()),
         )
         .to_string(),
+        show_hidden: config.settings.show_hidden.unwrap_or(snapshot.show_hidden),
+        show_original_filenames: config
+            .settings
+            .show_original_filenames
+            .unwrap_or(snapshot.show_original_filenames),
+        region: normalize_region(
+            config
+                .settings
+                .region
+                .as_deref()
+                .unwrap_or(snapshot.region.as_str()),
+        )
+        .to_string(),
+        crt_video_standard,
+        crt_h_offset,
+        crt_v_offset,
     }
 }
 
@@ -584,6 +796,14 @@ fn button_layouts() -> QStringList {
     let mut list = QStringList::default();
     for layout in BUTTON_LAYOUTS {
         list.append(QString::from(*layout));
+    }
+    list
+}
+
+fn system_logo_styles() -> QStringList {
+    let mut list = QStringList::default();
+    for style in SYSTEM_LOGO_STYLES {
+        list.append(QString::from(*style));
     }
     list
 }
@@ -612,6 +832,14 @@ fn languages() -> QStringList {
     list
 }
 
+fn clock_formats() -> QStringList {
+    let mut list = QStringList::default();
+    for format in CLOCK_FORMATS {
+        list.append(QString::from(*format));
+    }
+    list
+}
+
 fn screensaver_timeouts() -> QStringList {
     let mut list = QStringList::default();
     #[cfg(debug_assertions)]
@@ -628,6 +856,14 @@ fn media_image_types() -> QStringList {
     let mut list = QStringList::default();
     for value in MEDIA_IMAGE_TYPES {
         list.append(QString::from(*value));
+    }
+    list
+}
+
+fn regions() -> QStringList {
+    let mut list = QStringList::default();
+    for region in REGIONS {
+        list.append(QString::from(*region));
     }
     list
 }
@@ -650,6 +886,15 @@ fn normalize_language(value: &str) -> &str {
         .unwrap_or(DEFAULT_LANGUAGE)
 }
 
+fn normalize_clock_format(value: &str) -> &'static str {
+    let trimmed = value.trim();
+    CLOCK_FORMATS
+        .iter()
+        .copied()
+        .find(|format| *format == trimmed)
+        .unwrap_or(DEFAULT_CLOCK_FORMAT)
+}
+
 fn normalize_orientation(value: &str) -> &'static str {
     let trimmed = value.trim();
     ORIENTATIONS
@@ -666,6 +911,15 @@ fn normalize_browse_layout(value: &str) -> &'static str {
         .copied()
         .find(|layout| *layout == trimmed)
         .unwrap_or(DEFAULT_BROWSE_LAYOUT)
+}
+
+fn normalize_system_logo_style(value: &str) -> &'static str {
+    let trimmed = value.trim();
+    SYSTEM_LOGO_STYLES
+        .iter()
+        .copied()
+        .find(|style| *style == trimmed)
+        .unwrap_or(DEFAULT_SYSTEM_LOGO_STYLE)
 }
 
 fn normalize_screensaver_timeout(value: &str) -> &'static str {
@@ -694,6 +948,15 @@ fn normalize_media_image_type(value: &str) -> &'static str {
         .unwrap_or(DEFAULT_MEDIA_IMAGE_TYPE)
 }
 
+fn normalize_region(value: &str) -> &'static str {
+    let trimmed = value.trim();
+    REGIONS
+        .iter()
+        .copied()
+        .find(|r| *r == trimmed)
+        .unwrap_or(DEFAULT_REGION)
+}
+
 fn normalize_button_layout(value: &str) -> &'static str {
     let trimmed = value.trim();
     // Legacy alias map: state files written by builds before the
@@ -715,10 +978,13 @@ fn normalize_button_layout(value: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        browse_layouts, button_layouts, curated_resolutions, languages, normalize_browse_layout,
-        normalize_button_layout, normalize_language, normalize_orientation, orientations,
-        BROWSE_LAYOUTS, BUTTON_LAYOUTS, DEFAULT_BROWSE_LAYOUT, DEFAULT_BUTTON_LAYOUT,
-        DEFAULT_LANGUAGE, DEFAULT_ORIENTATION, LANGUAGES, MISTER_RESOLUTIONS, ORIENTATIONS,
+        browse_layouts, button_layouts, clock_formats, curated_resolutions, languages,
+        normalize_browse_layout, normalize_button_layout, normalize_clock_format,
+        normalize_language, normalize_orientation, normalize_region, normalize_system_logo_style,
+        orientations, regions, system_logo_styles, BROWSE_LAYOUTS, BUTTON_LAYOUTS, CLOCK_FORMATS,
+        DEFAULT_BROWSE_LAYOUT, DEFAULT_BUTTON_LAYOUT, DEFAULT_CLOCK_FORMAT, DEFAULT_LANGUAGE,
+        DEFAULT_ORIENTATION, DEFAULT_REGION, DEFAULT_SYSTEM_LOGO_STYLE, LANGUAGES,
+        MISTER_RESOLUTIONS, ORIENTATIONS, REGIONS, SYSTEM_LOGO_STYLES,
     };
 
     #[test]
@@ -759,6 +1025,14 @@ mod tests {
     }
 
     #[test]
+    fn clock_formats_preserve_order() {
+        let list = clock_formats();
+        let collected: Vec<String> = list.iter().map(String::from).collect();
+        let expected: Vec<String> = CLOCK_FORMATS.iter().map(|s| (*s).to_string()).collect();
+        assert_eq!(collected, expected);
+    }
+
+    #[test]
     fn orientations_preserve_order() {
         let list = orientations();
         let collected: Vec<String> = list.iter().map(String::from).collect();
@@ -775,11 +1049,42 @@ mod tests {
     }
 
     #[test]
+    fn system_logo_styles_preserve_order() {
+        let list = system_logo_styles();
+        let collected: Vec<String> = list.iter().map(String::from).collect();
+        let expected: Vec<String> = SYSTEM_LOGO_STYLES
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        assert_eq!(collected, expected);
+    }
+
+    #[test]
     fn browse_layout_normalization_defaults_to_grid() {
         assert_eq!(normalize_browse_layout(""), DEFAULT_BROWSE_LAYOUT);
         assert_eq!(normalize_browse_layout("detail"), DEFAULT_BROWSE_LAYOUT);
         assert_eq!(normalize_browse_layout("grid"), "grid");
         assert_eq!(normalize_browse_layout("list"), "list");
+    }
+
+    #[test]
+    fn system_logo_style_normalization_defaults_to_tinted() {
+        assert_eq!(normalize_system_logo_style(""), DEFAULT_SYSTEM_LOGO_STYLE);
+        assert_eq!(
+            normalize_system_logo_style("sepia"),
+            DEFAULT_SYSTEM_LOGO_STYLE
+        );
+        assert_eq!(normalize_system_logo_style("tinted"), "tinted");
+        assert_eq!(normalize_system_logo_style("color"), "color");
+    }
+
+    #[test]
+    fn clock_format_normalization_defaults_to_auto() {
+        assert_eq!(normalize_clock_format(""), DEFAULT_CLOCK_FORMAT);
+        assert_eq!(normalize_clock_format("system"), DEFAULT_CLOCK_FORMAT);
+        assert_eq!(normalize_clock_format("auto"), "auto");
+        assert_eq!(normalize_clock_format("12h"), "12h");
+        assert_eq!(normalize_clock_format("24h"), "24h");
     }
 
     #[test]
@@ -848,5 +1153,31 @@ mod tests {
         assert_eq!(normalize_button_layout("nintendo"), "a");
         assert_eq!(normalize_button_layout("xbox"), "b");
         assert_eq!(normalize_button_layout("sony"), "c");
+    }
+
+    #[test]
+    fn regions_preserve_order() {
+        let list = regions();
+        let collected: Vec<String> = list.iter().map(String::from).collect();
+        let expected: Vec<String> = REGIONS.iter().map(|s| (*s).to_string()).collect();
+        assert_eq!(collected, expected);
+    }
+
+    #[test]
+    fn region_normalization_defaults_to_auto() {
+        assert_eq!(normalize_region(""), DEFAULT_REGION);
+        assert_eq!(normalize_region("unknown"), DEFAULT_REGION);
+        assert_eq!(normalize_region("  "), DEFAULT_REGION);
+        assert_eq!(normalize_region("auto"), "auto");
+        assert_eq!(normalize_region("us"), "us");
+        assert_eq!(normalize_region("eu"), "eu");
+        assert_eq!(normalize_region("jp"), "jp");
+    }
+
+    #[test]
+    fn region_values_are_lowercase() {
+        for region in REGIONS {
+            assert_eq!(*region, region.to_ascii_lowercase());
+        }
     }
 }

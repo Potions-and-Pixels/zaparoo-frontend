@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Wizzo Pty Ltd and the Zaparoo Project contributors.
 // SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0
 
+use crate::models::{with_hidden_browse_prefs_read, with_persist_read};
 use cxx_qt::CxxQtType;
 use cxx_qt_lib::{QByteArray, QHash, QHashPair_i32_QByteArray, QModelIndex, QString, QVariant};
 use std::pin::Pin;
@@ -12,17 +13,35 @@ use zaparoo_core::systems_catalog::CatalogData;
 
 const NAME_ROLE: i32 = 256 + 1; // Qt::UserRole + 1
 const COVER_KEY_ROLE: i32 = 256 + 2;
+const HIDDEN_ROLE: i32 = 256 + 3;
 
-// Categories Core surfaces but the frontend doesn't expose. `Other` is
-// the synthesized bucket for systems with no upstream category and adds
-// no value in the UI; `Media` is reserved for non-game content the
-// frontend doesn't have a screen for yet. Tracked in #21.
-const HIDDEN_CATEGORIES: &[&str] = &["Other", "Media"];
+// Categories Core surfaces but the frontend doesn't expose. `Media` is
+// reserved for non-game content the frontend doesn't have a screen for
+// yet (tracked in #21). `Other` — the synthesized bucket for systems with
+// no upstream category — is now surfaced: Core's launchables (launch-only
+// virtual systems) land there, so it carries real, launchable content.
+const HIDDEN_CATEGORIES: &[&str] = &["Media"];
 
 #[derive(Default)]
 pub struct CategoriesModelRust {
+    /// Raw category list received from Core. Stored so `reproject()` can
+    /// re-filter without waiting for a catalog refetch.
+    raw: Vec<String>,
+    /// Filtered+visible category names in display order.
     categories: Vec<String>,
+    /// Parallel to `categories`: true when the category is user-hidden but
+    /// visible because `show_hidden` is on. Always false for unhidden items.
+    hidden_flags: Vec<bool>,
     count: i32,
+    raw_count: i32,
+    /// Count of indexed (non-launchable) systems in the catalog. Distinct
+    /// from `count` (visible categories) and `raw_count` (all categories):
+    /// Core's launchables surface as systems under the `Other` category
+    /// even with no media-db index, so `count`/`raw_count` are non-zero on
+    /// a fresh device. `indexed_count` ignores launchables, so the first-
+    /// run scan prompt in `Main.qml` can tell "no games indexed yet" apart
+    /// from "only launchables present".
+    indexed_count: i32,
     // Sticky-true flag: flips to true the first time the catalog
     // resolves Ready, never resets. The first-run modal in
     // `Main.qml` gates on `loaded && count === 0` so it only fires
@@ -55,6 +74,8 @@ pub mod ffi {
         #[qml_element]
         #[qml_singleton]
         #[qproperty(i32, count)]
+        #[qproperty(i32, raw_count)]
+        #[qproperty(i32, indexed_count)]
         #[qproperty(bool, loaded)]
         #[qproperty(QString, error_message)]
         type CategoriesModel = super::CategoriesModelRust;
@@ -64,6 +85,17 @@ pub mod ffi {
 
         #[qinvokable]
         fn index_for_category(self: &CategoriesModel, name: &QString) -> i32;
+
+        /// Returns true when the category at `index` is user-hidden and
+        /// `show_hidden` is on.
+        #[qinvokable]
+        fn is_hidden_at(self: &CategoriesModel, index: i32) -> bool;
+
+        /// Re-filter the categories list using the current persisted hidden set
+        /// and `show_hidden`. Call after any hide/unhide/toggle so the hub grid
+        /// reflects new visibility without waiting for a catalog refetch.
+        #[qinvokable]
+        fn reproject(self: Pin<&mut CategoriesModel>);
 
         #[inherit]
         #[cxx_name = "beginResetModel"]
@@ -94,11 +126,16 @@ crate::bind_to_endpoint! {
 }
 
 /// Pull the two pieces this model cares about out of the unified
-/// `ResourceStatus`: the category list (only present on `Ready`) and the
-/// surfaced error message (empty unless `Errored`).
-fn project(status: &ResourceStatus<CatalogData>) -> (Option<Vec<String>>, String) {
+/// `ResourceStatus`: the raw category list (only present on `Ready`) and the
+/// surfaced error message (empty unless `Errored`). Filtering is deferred to
+/// `apply_state` / `reproject_inner` so `reproject()` can re-filter in-place
+/// without waiting for a catalog refetch.
+fn project(status: &ResourceStatus<CatalogData>) -> (Option<(Vec<String>, i32)>, String) {
     match status {
-        ResourceStatus::Ready(data) => (Some(visible_categories(&data.categories)), String::new()),
+        ResourceStatus::Ready(data) => (
+            Some((data.categories.clone(), data.indexed_count() as i32)),
+            String::new(),
+        ),
         ResourceStatus::Errored { message, .. } => (None, message.clone()),
         ResourceStatus::Idle | ResourceStatus::Loading => (None, String::new()),
     }
@@ -122,11 +159,21 @@ fn position_of(haystack: &[String], needle: &str) -> i32 {
         .map_or(-1, |i| i as i32)
 }
 
-/// Apply the frontend-side category presentation rules to the raw list
-/// from Core: drop hidden categories. Pulled out of `project` for
-/// unit-test coverage.
-fn visible_categories(raw: &[String]) -> Vec<String> {
-    let mut out = Vec::with_capacity(raw.len());
+/// Apply the frontend-side category presentation rules to the raw list from
+/// Core, returning the filtered names and a parallel hidden-flag vector.
+///
+/// Always drops built-in `HIDDEN_CATEGORIES` (case-insensitive). For
+/// `user_hidden` (case-sensitive equality — matches the persisted category
+/// string exactly): drops the entry when `show_hidden` is false, includes it
+/// with `hidden = true` when true. Pulled out of `apply_state` for test
+/// coverage.
+fn visible_categories(
+    raw: &[String],
+    user_hidden: &[String],
+    show_hidden: bool,
+) -> (Vec<String>, Vec<bool>) {
+    let mut names = Vec::with_capacity(raw.len());
+    let mut flags = Vec::with_capacity(raw.len());
     for c in raw {
         if HIDDEN_CATEGORIES
             .iter()
@@ -134,30 +181,52 @@ fn visible_categories(raw: &[String]) -> Vec<String> {
         {
             continue;
         }
-        out.push(c.clone());
+        let is_user_hidden = user_hidden.iter().any(|h| h == c);
+        if is_user_hidden && !show_hidden {
+            continue;
+        }
+        names.push(c.clone());
+        flags.push(is_user_hidden);
     }
-    out
+    (names, flags)
+}
+
+/// Re-run the visibility filter in-place using the current persisted state.
+/// Wraps `begin/endResetModel` + `count_changed` + the `loaded` sticky flag.
+fn reproject_inner(mut model: Pin<&mut ffi::CategoriesModel>) {
+    let user_hidden = with_hidden_browse_prefs_read(|p| p.hidden_categories.clone());
+    let show_hidden = with_persist_read(|s| s.settings.show_hidden);
+    let raw = model.rust().raw.clone();
+    let (names, flags) = visible_categories(&raw, &user_hidden, show_hidden);
+    let count = names.len() as i32;
+    debug!(count, categories = ?names, "categories: reproject_inner");
+    model.as_mut().begin_reset_model();
+    model.as_mut().rust_mut().categories = names;
+    model.as_mut().rust_mut().hidden_flags = flags;
+    model.as_mut().rust_mut().count = count;
+    model.as_mut().end_reset_model();
+    model.as_mut().count_changed();
+    if !model.loaded {
+        model.as_mut().set_loaded(true);
+    }
 }
 
 fn apply_state(
     mut model: Pin<&mut ffi::CategoriesModel>,
-    (categories, err): (Option<Vec<String>>, String),
+    (ready, err): (Option<(Vec<String>, i32)>, String),
 ) {
-    if let Some(categories) = categories {
-        let count = categories.len() as i32;
-        debug!(
-            count,
-            categories = ?categories,
-            "categories: apply_state filled list",
-        );
-        model.as_mut().begin_reset_model();
-        model.as_mut().rust_mut().categories = categories;
-        model.as_mut().rust_mut().count = count;
-        model.as_mut().end_reset_model();
-        model.as_mut().count_changed();
-        if !model.loaded {
-            model.as_mut().set_loaded(true);
+    if let Some((raw, indexed_count)) = ready {
+        let raw_count = raw.len() as i32;
+        model.as_mut().rust_mut().raw = raw;
+        if model.raw_count != raw_count {
+            model.as_mut().rust_mut().raw_count = raw_count;
+            model.as_mut().raw_count_changed();
         }
+        if model.indexed_count != indexed_count {
+            model.as_mut().rust_mut().indexed_count = indexed_count;
+            model.as_mut().indexed_count_changed();
+        }
+        reproject_inner(model.as_mut());
     }
     let qerr = QString::from(err.as_str());
     if model.error_message != qerr {
@@ -178,9 +247,10 @@ impl ffi::CategoriesModel {
         if !index.is_valid() || index.row() < 0 || index.row() >= self.count {
             return QVariant::default();
         }
+        let row = index.row() as usize;
         match role {
             NAME_ROLE => {
-                let s = &self.categories[index.row() as usize];
+                let s = &self.categories[row];
                 QVariant::from(&QString::from(s.as_str()))
             }
             COVER_KEY_ROLE => {
@@ -188,9 +258,10 @@ impl ffi::CategoriesModel {
                 // Categories without a curated PNG (anything we haven't
                 // bundled yet) still emit a key — Tile's Image fails to
                 // resolve and the procedural fallback takes over.
-                let s = &self.categories[index.row() as usize];
+                let s = &self.categories[row];
                 QVariant::from(&QString::from(format!("categories/{s}").as_str()))
             }
+            HIDDEN_ROLE => QVariant::from(&self.hidden_flags[row]),
             _ => QVariant::default(),
         }
     }
@@ -199,6 +270,7 @@ impl ffi::CategoriesModel {
         let mut hash = QHash::<QHashPair_i32_QByteArray>::default();
         hash.insert(NAME_ROLE, QByteArray::from("name"));
         hash.insert(COVER_KEY_ROLE, QByteArray::from("coverKey"));
+        hash.insert(HIDDEN_ROLE, QByteArray::from("hidden"));
         hash
     }
 
@@ -211,6 +283,17 @@ impl ffi::CategoriesModel {
 
     fn index_for_category(&self, name: &QString) -> i32 {
         position_of(&self.categories, &name.to_string())
+    }
+
+    fn is_hidden_at(&self, index: i32) -> bool {
+        if index < 0 || index >= self.count {
+            return false;
+        }
+        self.hidden_flags[index as usize]
+    }
+
+    fn reproject(self: Pin<&mut Self>) {
+        reproject_inner(self);
     }
 }
 
@@ -255,32 +338,79 @@ mod tests {
     #[test]
     fn raw_categories_pass_through_in_order() {
         let raw = vec!["Consoles".to_string(), "Arcade".to_string()];
-        let visible = visible_categories(&raw);
-        assert_eq!(visible, vec!["Consoles", "Arcade"]);
+        let (names, flags) = visible_categories(&raw, &[], false);
+        assert_eq!(names, vec!["Consoles", "Arcade"]);
+        assert_eq!(flags, vec![false, false]);
     }
 
     #[test]
-    fn other_and_media_are_filtered_case_insensitively() {
+    fn media_is_filtered_case_insensitively_but_other_is_surfaced() {
         let raw = vec![
             "Arcade".to_string(),
             "Other".to_string(),
             "media".to_string(),
             "Consoles".to_string(),
         ];
-        let visible = visible_categories(&raw);
-        assert_eq!(visible, vec!["Arcade", "Consoles"]);
+        let (names, flags) = visible_categories(&raw, &[], false);
+        // `media` is dropped; `Other` now passes through (it holds launchables).
+        assert_eq!(names, vec!["Arcade", "Other", "Consoles"]);
+        assert_eq!(flags, vec![false, false, false]);
     }
 
     #[test]
     fn empty_raw_yields_empty_visible_list() {
-        let visible = visible_categories(&[]);
-        assert!(visible.is_empty());
+        let (names, flags) = visible_categories(&[], &[], false);
+        assert!(names.is_empty());
+        assert!(flags.is_empty());
     }
 
     #[test]
     fn original_casing_is_preserved_for_visible_entries() {
         let raw = vec!["arcade".to_string(), "CONSOLES".to_string()];
-        let visible = visible_categories(&raw);
-        assert_eq!(visible, vec!["arcade", "CONSOLES"]);
+        let (names, _) = visible_categories(&raw, &[], false);
+        assert_eq!(names, vec!["arcade", "CONSOLES"]);
+    }
+
+    #[test]
+    fn user_hidden_category_excluded_when_show_hidden_false() {
+        let raw = vec!["Arcade".to_string(), "Consoles".to_string()];
+        let user_hidden = vec!["Consoles".to_string()];
+        let (names, _) = visible_categories(&raw, &user_hidden, false);
+        assert_eq!(names, vec!["Arcade"]);
+    }
+
+    #[test]
+    fn user_hidden_category_shown_with_flag_when_show_hidden_true() {
+        let raw = vec!["Arcade".to_string(), "Consoles".to_string()];
+        let user_hidden = vec!["Consoles".to_string()];
+        let (names, flags) = visible_categories(&raw, &user_hidden, true);
+        assert_eq!(names, vec!["Arcade", "Consoles"]);
+        assert_eq!(flags, vec![false, true]);
+    }
+
+    #[test]
+    fn user_hidden_is_case_sensitive() {
+        // The category string in user_hidden must match the raw string exactly.
+        // A case mismatch does not hide the category.
+        let raw = vec!["Consoles".to_string()];
+        let user_hidden = vec!["consoles".to_string()];
+        let (names, flags) = visible_categories(&raw, &user_hidden, false);
+        assert_eq!(names, vec!["Consoles"]);
+        assert_eq!(flags, vec![false]);
+    }
+
+    #[test]
+    fn builtin_hidden_categories_never_user_unhideable() {
+        // Even if "Media" somehow ends up in user_hidden (which should never
+        // happen since it's never surfaced as a tile), the builtin filter
+        // still drops it before we check user_hidden.
+        let raw = vec!["Arcade".to_string(), "Media".to_string()];
+        let user_hidden = vec!["Media".to_string()];
+        let (names_off, _) = visible_categories(&raw, &user_hidden, false);
+        let (names_on, flags_on) = visible_categories(&raw, &user_hidden, true);
+        // Media is always gone, regardless of show_hidden.
+        assert_eq!(names_off, vec!["Arcade"]);
+        assert_eq!(names_on, vec!["Arcade"]);
+        assert_eq!(flags_on, vec![false]);
     }
 }

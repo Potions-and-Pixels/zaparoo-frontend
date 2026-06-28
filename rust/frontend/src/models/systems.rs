@@ -2,9 +2,15 @@
 // Copyright (c) 2026 Wizzo Pty Ltd and the Zaparoo Project contributors.
 // SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0
 
-use crate::models::{global_handle, global_store};
+use crate::models::{
+    global_handle, global_store, with_hidden_browse_prefs_read, with_persist_read,
+};
+use crate::system_region::Region;
+use crate::{image_overrides, system_logos, system_name_overrides, system_names, system_region};
 use cxx_qt::{CxxQtType, Threading};
-use cxx_qt_lib::{QByteArray, QHash, QHashPair_i32_QByteArray, QModelIndex, QString, QVariant};
+use cxx_qt_lib::{
+    QByteArray, QHash, QHashPair_i32_QByteArray, QModelIndex, QString, QStringList, QVariant,
+};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -26,13 +32,48 @@ const NAME_ROLE: i32 = 256 + 2;
 const CATEGORY_ROLE: i32 = 256 + 3;
 const FAVORITE_ROLE: i32 = 256 + 4;
 const FILE_STEM_ROLE: i32 = 256 + 5;
+const HIDDEN_ROLE: i32 = 256 + 6;
+// Systems have no disambiguating tags; the role exists only so the shared
+// grid/list delegates (which require it for media rows) bind cleanly here.
+const DISAMBIGUATING_TAGS_ROLE: i32 = 256 + 7;
 
 pub struct SystemInfo {
     pub id: String,
     pub name: String,
+    /// Cover key emitted to QML. One of:
+    /// - `"systems/{stem}"` — tinted SVG via the `tinted-svg` provider
+    ///   (stem comes from `system_logos::logo_artwork_stem` for regional variants).
+    /// - `"custom-image/{path}"` — user-supplied override via the `custom-image`
+    ///   provider; no tint applied.
+    pub cover_key: String,
     pub category: String,
     pub release_date: Option<String>,
     pub manufacturer: Option<String>,
+    /// True when the user has hidden this system and `show_hidden` is on.
+    /// The tile renders dimmed with a "Hidden" badge.
+    pub hidden: bool,
+    /// `zaparoo://...` launch URI for launch-only "virtual" systems
+    /// (Core's launchables). Empty for normal systems. When present the
+    /// system is launched by running this script directly instead of
+    /// being browsed via `media.browse`.
+    pub zap_script: String,
+}
+
+/// A launch-only system carries a `zaparoo://...` launch URI instead of
+/// browsable media. Trimmed so whitespace-only never reads as launchable.
+fn is_launchable(system: &SystemInfo) -> bool {
+    !system.zap_script.trim().is_empty()
+}
+
+/// `ZapScript` to run (or write to a card) for a system. Launchables run
+/// their own `zaparoo://...` URI; normal systems use the `**launch.system`
+/// directive that launches the system's default core/launcher.
+fn launch_text_for(system: &SystemInfo) -> String {
+    if is_launchable(system) {
+        system.zap_script.clone()
+    } else {
+        format!("**launch.system:{}", system.id)
+    }
 }
 
 #[derive(Default)]
@@ -81,6 +122,7 @@ pub mod ffi {
         type QHash_i32_QByteArray = cxx_qt_lib::QHash<cxx_qt_lib::QHashPair_i32_QByteArray>;
         type QByteArray = cxx_qt_lib::QByteArray;
         type QString = cxx_qt_lib::QString;
+        type QStringList = cxx_qt_lib::QStringList;
     }
 
     unsafe extern "RustQt" {
@@ -102,6 +144,13 @@ pub mod ffi {
         #[qinvokable]
         fn system_id_at(self: &SystemsModel, index: i32) -> QString;
 
+        /// Returns the cover key for the system at `index`, including any
+        /// regional artwork stem (e.g. `"systems/Genesis.eu"`). Use this in
+        /// prefetch loops instead of building `"systems/" + system_id_at(i)`,
+        /// which would miss regional variants.
+        #[qinvokable]
+        fn cover_key_at(self: &SystemsModel, index: i32) -> QString;
+
         #[qinvokable]
         fn system_name_at(self: &SystemsModel, index: i32) -> QString;
 
@@ -117,11 +166,40 @@ pub mod ffi {
         #[qinvokable]
         fn launch_text_at(self: &SystemsModel, index: i32) -> QString;
 
+        /// True when the system with `system_id` is a launch-only (virtual)
+        /// system. The router launches it directly rather than browsing.
+        #[qinvokable]
+        fn is_launchable_system(self: &SystemsModel, system_id: &QString) -> bool;
+
+        /// Run the launch script for the launch-only system `system_id`.
+        #[qinvokable]
+        fn launch_system_id(self: Pin<&mut SystemsModel>, system_id: &QString);
+
         #[qinvokable]
         fn cancel_card_write(self: Pin<&mut SystemsModel>);
 
         #[qinvokable]
         fn index_for_system_id(self: &SystemsModel, id: &QString) -> i32;
+
+        /// Returns true when the system at `index` is user-hidden and
+        /// `show_hidden` is on (i.e. visible but dimmed). Always false when
+        /// the system is fully filtered out (`show_hidden = false`).
+        #[qinvokable]
+        fn is_hidden_at(self: &SystemsModel, index: i32) -> bool;
+
+        /// Re-run the current category filter using the persisted hidden set
+        /// and `show_hidden`. Call after any hide/unhide/toggle action so the
+        /// grid reflects the new visibility without waiting for a catalog
+        /// refetch. Bumps `seq` to invalidate any in-flight `set_category`
+        /// workers.
+        #[qinvokable]
+        fn reproject(self: Pin<&mut SystemsModel>);
+
+        /// Return all system IDs in `category` from the last-known-good
+        /// catalog, ignoring the current hide filter. Used by `Main.qml` to
+        /// build a system list for category-level index/scrape operations.
+        #[qinvokable]
+        fn system_ids_for_category(self: &SystemsModel, category: &QString) -> QStringList;
 
         #[inherit]
         #[cxx_name = "beginResetModel"]
@@ -165,7 +243,7 @@ fn project(status: &ResourceStatus<CatalogData>) -> (Option<CatalogData>, String
 /// position as i32, or -1 if not found / empty needle. The
 /// case-sensitive contract is deliberate: `SystemsState.system_id` is
 /// persisted as the exact ID Core surfaced, and the artwork bundled
-/// under `resources/images/systems/<id>.png` matches that exact case
+/// under `resources/images/systems/<id>.svg` matches that exact case
 /// (Linux qrc lookups are case-sensitive). A case-insensitive lookup
 /// would mask an upstream case drift in Core. Pulled out so the
 /// contract is unit-testable.
@@ -182,16 +260,51 @@ fn position_of_system_id(systems: &[SystemInfo], needle: &str) -> i32 {
 /// Filter `catalog`'s systems to the named category and re-shape them
 /// into the local row type. Returns empty when `catalog` is `None` so
 /// `set_category` and `apply_state` share one filter+map definition.
-fn rows_for_category(catalog: Option<&CatalogData>, cat: &str) -> Vec<SystemInfo> {
+///
+/// `hidden_ids` is the current persisted set of user-hidden system IDs.
+/// When `show_hidden` is false, systems in that set are dropped entirely.
+/// When true, they are included with `hidden = true` so the tile renders
+/// dimmed with a "Hidden" badge.
+///
+/// `region` drives both the localized display name (via `system_names`) and
+/// the logo artwork stem (via `system_logos`). Resolve it once before calling
+/// this function and pass it in so the caller controls the snapshot.
+fn rows_for_category(
+    catalog: Option<&CatalogData>,
+    cat: &str,
+    hidden_ids: &[String],
+    show_hidden: bool,
+    region: Region,
+) -> Vec<SystemInfo> {
     catalog.map_or_else(Vec::new, |c| {
         c.systems_by_category(cat)
             .into_iter()
-            .map(|s| SystemInfo {
-                id: s.id,
-                name: s.name,
-                category: s.category,
-                release_date: s.release_date,
-                manufacturer: s.manufacturer,
+            .filter_map(|s| {
+                let is_hidden = hidden_ids.contains(&s.id);
+                if is_hidden && !show_hidden {
+                    return None;
+                }
+                // Display name priority: user `[system_names]` override, then
+                // Names_MiSTer localized data, then the Core catalog name so
+                // unknown systems still show.
+                let name = system_name_overrides::lookup(&s.id)
+                    .or_else(|| system_names::localized_name(&s.id, region))
+                    .unwrap_or(s.name);
+                // Cover key: user override takes priority over bundled art.
+                let cover_key = image_overrides::override_path("systems", &s.id).map_or_else(
+                    || format!("systems/{}", system_logos::logo_artwork_stem(&s.id, region)),
+                    |p| format!("custom-image/{}", p.display()),
+                );
+                Some(SystemInfo {
+                    id: s.id,
+                    name,
+                    cover_key,
+                    category: s.category,
+                    release_date: s.release_date,
+                    manufacturer: s.manufacturer,
+                    hidden: is_hidden,
+                    zap_script: s.zap_script,
+                })
             })
             .collect()
     })
@@ -211,7 +324,10 @@ fn apply_state(mut model: Pin<&mut ffi::SystemsModel>, (data, err): (Option<Cata
             // authoritative writer for the moment, and stale rows
             // win.
             model.rust().seq.fetch_add(1, Ordering::SeqCst);
-            let rows = rows_for_category(Some(&data), &cat);
+            let hidden_ids = with_hidden_browse_prefs_read(|p| p.hidden_system_ids.clone());
+            let show_hidden = with_persist_read(|s| s.settings.show_hidden);
+            let region = system_region::current_region();
+            let rows = rows_for_category(Some(&data), &cat, &hidden_ids, show_hidden, region);
             let count = rows.len() as i32;
             let ids: Vec<&str> = rows.iter().map(|s| s.id.as_str()).collect();
             debug!(
@@ -267,14 +383,17 @@ impl ffi::SystemsModel {
         let s = &self.systems[index.row() as usize];
         match role {
             COVER_KEY_ROLE => {
-                // Relative path under `resources/images/` (no extension).
-                // Tile resolves the PNG via `images/<coverKey>.png`, so
-                // category, system and game tiles share one URL builder.
-                QVariant::from(&QString::from(format!("systems/{}", s.id).as_str()))
+                // `cover_key` is set at row-build time in `rows_for_category`:
+                // either `"custom-image/{path}"` for a user override or
+                // `"systems/{stem}"` for bundled artwork. `Resources.qml`
+                // resolves this to the appropriate image:// URL.
+                QVariant::from(&QString::from(s.cover_key.as_str()))
             }
             NAME_ROLE | FILE_STEM_ROLE => QVariant::from(&QString::from(s.name.as_str())),
             CATEGORY_ROLE => QVariant::from(&QString::from(s.category.as_str())),
             FAVORITE_ROLE => QVariant::from(&0_i32),
+            HIDDEN_ROLE => QVariant::from(&s.hidden),
+            DISAMBIGUATING_TAGS_ROLE => QVariant::from(&QString::default()),
             _ => QVariant::default(),
         }
     }
@@ -286,6 +405,11 @@ impl ffi::SystemsModel {
         h.insert(CATEGORY_ROLE, QByteArray::from("category"));
         h.insert(FAVORITE_ROLE, QByteArray::from("favorite"));
         h.insert(FILE_STEM_ROLE, QByteArray::from("fileStem"));
+        h.insert(HIDDEN_ROLE, QByteArray::from("hidden"));
+        h.insert(
+            DISAMBIGUATING_TAGS_ROLE,
+            QByteArray::from("disambiguatingTags"),
+        );
         h
     }
 
@@ -344,18 +468,23 @@ impl ffi::SystemsModel {
         let seq = self.rust().seq.clone();
         let ticket = seq.fetch_add(1, Ordering::SeqCst) + 1;
 
-        // Snapshot the catalog for the worker. Reading from
-        // `last_ready` rather than the live `ResourceStatus` means a
-        // transient `Loading` (a refetch in flight) doesn't wipe the
-        // grid between the user's category change and the refetch
-        // completing. The clone is small (~hundreds of `SystemInfo`
-        // rows, microseconds on ARM) and unavoidable without
-        // Arc-wrapping `last_ready`, which is out of scope.
+        // Snapshot the catalog and current hidden state for the worker.
+        // Reading from `last_ready` rather than the live `ResourceStatus`
+        // means a transient `Loading` (a refetch in flight) doesn't wipe
+        // the grid between the user's category change and the refetch
+        // completing. The clone is small (~hundreds of `SystemInfo` rows,
+        // microseconds on ARM) and unavoidable without Arc-wrapping
+        // `last_ready`, which is out of scope.
         let catalog = self.rust().last_ready.clone();
+        let hidden_ids = with_hidden_browse_prefs_read(|p| p.hidden_system_ids.clone());
+        let show_hidden = with_persist_read(|s| s.settings.show_hidden);
+        // Resolve region on the Qt thread so the async worker captures a
+        // snapshot rather than reading global state from a tokio thread.
+        let region = system_region::current_region();
 
         let qt_thread = self.qt_thread();
         let handle = global_handle().spawn(async move {
-            let rows = rows_for_category(catalog.as_ref(), &cat);
+            let rows = rows_for_category(catalog.as_ref(), &cat, &hidden_ids, show_hidden, region);
             let count = rows.len() as i32;
             let cat_for_log = cat.clone();
             let ids_for_log: Vec<String> = rows.iter().map(|s| s.id.clone()).collect();
@@ -396,6 +525,13 @@ impl ffi::SystemsModel {
         QString::from(self.systems[index as usize].id.as_str())
     }
 
+    fn cover_key_at(&self, index: i32) -> QString {
+        if index < 0 || index >= self.count {
+            return QString::default();
+        }
+        QString::from(self.systems[index as usize].cover_key.as_str())
+    }
+
     fn system_name_at(&self, index: i32) -> QString {
         if index < 0 || index >= self.count {
             return QString::default();
@@ -418,7 +554,7 @@ impl ffi::SystemsModel {
         if system.id.is_empty() {
             return QString::default();
         }
-        QString::from(format!("**launch.system:{}", system.id).as_str())
+        QString::from(launch_text_for(system).as_str())
     }
 
     fn write_card_at(mut self: Pin<&mut Self>, index: i32) {
@@ -435,7 +571,7 @@ impl ffi::SystemsModel {
             self.as_mut().set_card_write_pending(false);
             return;
         }
-        let text = format!("**launch.system:{}", system.id);
+        let text = launch_text_for(system);
         let name = system.name.clone();
         let store = global_store();
         let seq = self.rust().card_write_seq.clone();
@@ -472,7 +608,39 @@ impl ffi::SystemsModel {
         if system.id.is_empty() {
             return;
         }
-        let text = format!("**launch.system:{}", system.id);
+        let text = launch_text_for(system);
+        let name = system.name.clone();
+        let store = global_store();
+        global_handle().spawn(async move {
+            if let Err(e) = store.run_mutation::<RunMutation>(RunParams { text }).await {
+                warn!("run failed for {name}: {}", e.message);
+            }
+        });
+    }
+
+    /// True when the system with `system_id` is a launch-only (virtual)
+    /// system carrying a `zaparoo://...` script. The router uses this to
+    /// launch the system directly instead of routing into a games browse.
+    fn is_launchable_system(&self, system_id: &QString) -> bool {
+        let id = system_id.to_string();
+        if id.is_empty() {
+            return false;
+        }
+        self.systems
+            .iter()
+            .find(|s| s.id == id)
+            .is_some_and(is_launchable)
+    }
+
+    /// Run the launch script for the system with `system_id`. Used by the
+    /// router for launchable systems, where selection is an action rather
+    /// than navigation; lookup is by id since the router has no index.
+    fn launch_system_id(self: Pin<&mut Self>, system_id: &QString) {
+        let id = system_id.to_string();
+        let Some(system) = self.systems.iter().find(|s| s.id == id) else {
+            return;
+        };
+        let text = launch_text_for(system);
         let name = system.name.clone();
         let store = global_store();
         global_handle().spawn(async move {
@@ -498,6 +666,64 @@ impl ffi::SystemsModel {
     fn index_for_system_id(&self, id: &QString) -> i32 {
         position_of_system_id(&self.systems, &id.to_string())
     }
+
+    fn is_hidden_at(&self, index: i32) -> bool {
+        if index < 0 || index >= self.count {
+            return false;
+        }
+        self.systems[index as usize].hidden
+    }
+
+    fn reproject(mut self: Pin<&mut Self>) {
+        let cat = self.rust().current_category.to_string();
+        if cat.is_empty() {
+            return;
+        }
+        let hidden_ids = with_hidden_browse_prefs_read(|p| p.hidden_system_ids.clone());
+        let show_hidden = with_persist_read(|s| s.settings.show_hidden);
+        let region = system_region::current_region();
+        // Bump seq to invalidate any in-flight set_category workers; their
+        // stale result would undo the reproject if they ran after us.
+        let seq = self.rust().seq.clone();
+        seq.fetch_add(1, Ordering::SeqCst);
+        let catalog = self.rust().last_ready.clone();
+        let rows = rows_for_category(catalog.as_ref(), &cat, &hidden_ids, show_hidden, region);
+        let count = rows.len() as i32;
+        debug!(category = %cat, count, "systems: reproject");
+        self.as_mut().begin_reset_model();
+        self.as_mut().rust_mut().systems = rows;
+        self.as_mut().rust_mut().count = count;
+        self.as_mut().end_reset_model();
+        self.as_mut().count_changed();
+        if self.loading {
+            self.as_mut().set_loading(false);
+        }
+    }
+
+    fn system_ids_for_category(&self, category: &QString) -> QStringList {
+        let cat = category.to_string();
+        let mut list = QStringList::default();
+        if let Some(ref c) = self.rust().last_ready {
+            for id in indexable_system_ids(c, &cat) {
+                list.append(QString::from(id.as_str()));
+            }
+        }
+        list
+    }
+}
+
+/// Ids of the indexable systems in `category` (the ones a category-level
+/// index/scrape can act on). Launch-only systems carry a `zap_script` and
+/// have no indexed media, so they are skipped. A category whose members are
+/// all launch-only yields an empty list, which is how the systems context
+/// menu decides to omit the dead index/scrape actions.
+fn indexable_system_ids(catalog: &CatalogData, category: &str) -> Vec<String> {
+    catalog
+        .systems_by_category(category)
+        .into_iter()
+        .filter(|s| s.zap_script.trim().is_empty())
+        .map(|s| s.id)
+        .collect()
 }
 
 fn detail_tags_for_system(system: &SystemInfo) -> String {
@@ -522,7 +748,11 @@ fn detail_tags_for_system(system: &SystemInfo) -> String {
                 .to_string(),
         ),
     ];
+    // Drop rows with no value so a system missing metadata (common for
+    // launch-only systems, which carry no releaseDate/manufacturer) shows
+    // only the fields it actually has rather than blank detail rows.
     rows.into_iter()
+        .filter(|(_, value)| !value.is_empty())
         .map(|(label, value)| format!("{label}\t{value}"))
         .collect::<Vec<_>>()
         .join("\n")
@@ -538,8 +768,10 @@ mod tests {
     )]
 
     use super::{
-        detail_tags_for_system, position_of_system_id, project, rows_for_category, SystemInfo,
+        detail_tags_for_system, indexable_system_ids, is_launchable, launch_text_for,
+        position_of_system_id, project, rows_for_category, SystemInfo,
     };
+    use crate::system_region::Region;
     use zaparoo_core::media_types::SystemInfo as MediaSystemInfo;
     use zaparoo_core::remote_resource::ResourceStatus;
     use zaparoo_core::systems_catalog::CatalogData;
@@ -607,7 +839,7 @@ mod tests {
 
     #[test]
     fn rows_for_category_none_returns_empty() {
-        let rows = rows_for_category(None, "Arcade");
+        let rows = rows_for_category(None, "Arcade", &[], false, Region::Us);
         assert!(rows.is_empty());
     }
 
@@ -618,12 +850,13 @@ mod tests {
             sys("snk", "SNK Heroes", "Arcade"),
             sys("zelda", "Zelda", "Consoles"),
         ]);
-        let rows = rows_for_category(Some(&catalog), "Consoles");
+        let rows = rows_for_category(Some(&catalog), "Consoles", &[], false, Region::Us);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].id, "smb");
         assert_eq!(rows[0].name, "Super Mario Bros");
         assert_eq!(rows[0].category, "Consoles");
         assert_eq!(rows[1].id, "zelda");
+        assert!(!rows[0].hidden);
     }
 
     #[test]
@@ -632,10 +865,47 @@ mod tests {
         nes.release_date = Some("1983".into());
         nes.manufacturer = Some("Nintendo".into());
         let catalog = catalog_with(vec![nes]);
-        let rows = rows_for_category(Some(&catalog), "Consoles");
+        let rows = rows_for_category(Some(&catalog), "Consoles", &[], false, Region::Us);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].release_date.as_deref(), Some("1983"));
         assert_eq!(rows[0].manufacturer.as_deref(), Some("Nintendo"));
+    }
+
+    #[test]
+    fn rows_for_category_hidden_system_excluded_when_show_hidden_false() {
+        let catalog = catalog_with(vec![
+            sys("nes", "NES", "Consoles"),
+            sys("snes", "SNES", "Consoles"),
+        ]);
+        let hidden = vec!["snes".to_string()];
+        let rows = rows_for_category(Some(&catalog), "Consoles", &hidden, false, Region::Us);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "nes");
+    }
+
+    #[test]
+    fn rows_for_category_hidden_system_shown_dimmed_when_show_hidden_true() {
+        let catalog = catalog_with(vec![
+            sys("nes", "NES", "Consoles"),
+            sys("snes", "SNES", "Consoles"),
+        ]);
+        let hidden = vec!["snes".to_string()];
+        let rows = rows_for_category(Some(&catalog), "Consoles", &hidden, true, Region::Us);
+        assert_eq!(rows.len(), 2);
+        assert!(!rows[0].hidden);
+        assert!(rows[1].hidden);
+        assert_eq!(rows[1].id, "snes");
+    }
+
+    #[test]
+    fn rows_for_category_empty_hidden_ids_no_change() {
+        let catalog = catalog_with(vec![sys("nes", "NES", "Consoles")]);
+        let rows_off = rows_for_category(Some(&catalog), "Consoles", &[], false, Region::Us);
+        let rows_on = rows_for_category(Some(&catalog), "Consoles", &[], true, Region::Us);
+        assert_eq!(rows_off.len(), 1);
+        assert_eq!(rows_on.len(), 1);
+        assert!(!rows_off[0].hidden);
+        assert!(!rows_on[0].hidden);
     }
 
     #[test]
@@ -652,7 +922,7 @@ mod tests {
     #[test]
     fn rows_for_category_unknown_returns_empty() {
         let catalog = catalog_with(vec![sys("smb", "SMB", "Consoles")]);
-        let rows = rows_for_category(Some(&catalog), "DoesNotExist");
+        let rows = rows_for_category(Some(&catalog), "DoesNotExist", &[], false, Region::Us);
         assert!(rows.is_empty());
     }
 
@@ -660,9 +930,12 @@ mod tests {
         SystemInfo {
             id: id.into(),
             name: id.into(),
+            cover_key: format!("systems/{id}"),
             category: "Consoles".into(),
             release_date: None,
             manufacturer: None,
+            hidden: false,
+            zap_script: String::new(),
         }
     }
 
@@ -676,7 +949,7 @@ mod tests {
     fn position_of_system_id_is_case_sensitive() {
         let systems = vec![local_sys("NES"), local_sys("SNES")];
         // SystemsState.system_id is persisted exact and the bundled
-        // artwork (`resources/images/systems/<id>.png`) matches that
+        // artwork (`resources/images/systems/<id>.svg`) matches that
         // exact case — case-insensitive lookup would silently mask a
         // Core case-drift bug.
         assert_eq!(position_of_system_id(&systems, "snes"), -1);
@@ -693,5 +966,90 @@ mod tests {
     fn position_of_system_id_missing_returns_minus_one() {
         let systems = vec![local_sys("NES")];
         assert_eq!(position_of_system_id(&systems, "Missing"), -1);
+    }
+
+    #[test]
+    fn detail_tags_for_system_omits_empty_metadata_rows() {
+        // A launch-only system typically has no release date or
+        // manufacturer; those rows must be dropped, not rendered blank.
+        let system = local_sys("Chess");
+        assert_eq!(detail_tags_for_system(&system), "Category\tConsoles");
+    }
+
+    #[test]
+    fn detail_tags_for_system_keeps_populated_rows_only() {
+        let mut system = local_sys("NES");
+        system.manufacturer = Some("Nintendo".into());
+        // Release date stays None -> its row is dropped, Manufacturer kept.
+        assert_eq!(
+            detail_tags_for_system(&system),
+            "Category\tConsoles\nManufacturer\tNintendo"
+        );
+    }
+
+    #[test]
+    fn launchable_detection_ignores_whitespace_only_script() {
+        let mut system = local_sys("NES");
+        assert!(!is_launchable(&system));
+        system.zap_script = "   ".into();
+        assert!(!is_launchable(&system));
+        system.zap_script = "zaparoo://abc/Chess".into();
+        assert!(is_launchable(&system));
+    }
+
+    #[test]
+    fn launch_text_uses_zap_script_for_launchables() {
+        let mut system = local_sys("Chess");
+        system.zap_script = "zaparoo://abc/Chess".into();
+        assert_eq!(launch_text_for(&system), "zaparoo://abc/Chess");
+    }
+
+    #[test]
+    fn launch_text_uses_launch_system_directive_for_normal_systems() {
+        let system = local_sys("NES");
+        assert_eq!(launch_text_for(&system), "**launch.system:NES");
+    }
+
+    #[test]
+    fn rows_for_category_propagates_zap_script() {
+        // Launchables land in the synthesized "Other" bucket, which matches
+        // systems with an empty upstream category.
+        let mut chess = sys("chess", "Chess", "");
+        chess.zap_script = "zaparoo://abc/Chess".into();
+        let catalog = catalog_with(vec![chess]);
+        let rows = rows_for_category(Some(&catalog), "Other", &[], false, Region::Us);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].zap_script, "zaparoo://abc/Chess");
+        assert!(is_launchable(&rows[0]));
+    }
+
+    #[test]
+    fn indexable_system_ids_excludes_launch_only_in_mixed_category() {
+        // A category can mix indexable systems (NESMusic) with launch-only
+        // ones (a launchable in the same bucket). The category-level
+        // index/scrape must target only the indexable members, so the
+        // launch-only system's id must not appear.
+        let mut launchable = sys("chess", "Chess", "Other");
+        launchable.zap_script = "zaparoo://abc/Chess".into();
+        let catalog = catalog_with(vec![
+            sys("NESMusic", "NES Music", "Other"),
+            launchable,
+            sys("SNESMusic", "SNES Music", "Other"),
+        ]);
+        let ids = indexable_system_ids(&catalog, "Other");
+        assert_eq!(ids, vec!["NESMusic".to_string(), "SNESMusic".to_string()]);
+    }
+
+    #[test]
+    fn indexable_system_ids_empty_when_category_all_launch_only() {
+        // A category whose members are all launch-only yields no indexable
+        // ids; the context menu uses this to omit the dead index/scrape
+        // actions entirely.
+        let mut a = sys("a", "A", "Other");
+        a.zap_script = "zaparoo://abc/A".into();
+        let mut b = sys("b", "B", "Other");
+        b.zap_script = "zaparoo://abc/B".into();
+        let catalog = catalog_with(vec![a, b]);
+        assert!(indexable_system_ids(&catalog, "Other").is_empty());
     }
 }

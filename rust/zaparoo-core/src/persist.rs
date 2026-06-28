@@ -41,8 +41,8 @@ pub struct HubState {
     /// (categories), 1 = bottom (action tiles).
     pub selected_row: u32,
     /// The bottom-row action tile that last had focus. One of
-    /// `"favorites"`, `"recents"` or `"settings"`. Empty defaults
-    /// to the leftmost action when restored.
+    /// `"favorites"`, `"recents"`, `"update"` or `"settings"`.
+    /// Empty defaults to the leftmost action when restored.
     pub selected_action: String,
 }
 
@@ -92,19 +92,31 @@ pub struct FavoritesState {
 /// from `[mister.video_*]` in `frontend.toml` is left in place.
 /// `language` mirrors `[general].language` in `frontend.toml` so the UI
 /// settings snapshot stays coherent with the config-backed startup path.
+/// `clock_format` is `auto`, `12h`, or `24h`; `auto` follows the effective
+/// UI locale.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "flat settings mirror; each bool is an independent user-visible toggle"
+)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SettingsState {
     pub resolution: String,
     pub language: String,
+    #[serde(default = "default_clock_format")]
+    pub clock_format: String,
     #[serde(default = "default_orientation")]
     pub orientation: String,
     #[serde(default = "default_browse_layout")]
     pub browse_layout: String,
+    #[serde(default = "default_system_logo_style")]
+    pub system_logo_style: String,
     #[serde(default = "default_button_layout")]
     pub button_layout: String,
     #[serde(default = "default_mouse_enabled")]
     pub mouse_enabled: bool,
+    #[serde(default)]
+    pub reduce_motion: bool,
     #[serde(default)]
     pub discover_arcade_alternate_versions: bool,
     #[serde(default)]
@@ -113,6 +125,32 @@ pub struct SettingsState {
     pub screensaver_timeout: String,
     #[serde(default = "default_media_image_type")]
     pub media_image_type: String,
+    /// When true, hidden systems and categories reappear in the browse UI
+    /// dimmed with a "Hidden" badge and the options menu offers "Unhide".
+    #[serde(default)]
+    pub show_hidden: bool,
+    /// When true, game items display their original filename (without the
+    /// extension) instead of Core's cleaned display name, everywhere a game
+    /// name is shown.
+    #[serde(default)]
+    pub show_original_filenames: bool,
+    /// Region variant for system names and logos. `"auto"` (default) derives
+    /// the region from the effective UI locale: `en` → US, `ja` → JP, all
+    /// others → EU. Explicit values are `"us"`, `"eu"`, `"jp"`.
+    #[serde(default = "default_region")]
+    pub region: String,
+    /// Native CRT video standard: `"ntsc"` (352x240@60), `"pal"`
+    /// (352x288@50), or `"480i"` (720x480@60i, not exposed in the UI
+    /// yet). Restart-applied; only meaningful when the frontend runs
+    /// with `--crt`.
+    #[serde(default = "default_crt_video_standard")]
+    pub crt_video_standard: String,
+    /// Native CRT centering trims in pixels/lines, within the Menu
+    /// fork core's honored ranges (-8..=8 horizontal, -8..=2 vertical).
+    #[serde(default)]
+    pub crt_h_offset: i32,
+    #[serde(default)]
+    pub crt_v_offset: i32,
 }
 
 impl Default for SettingsState {
@@ -120,16 +158,37 @@ impl Default for SettingsState {
         Self {
             resolution: String::new(),
             language: String::new(),
+            clock_format: default_clock_format(),
             orientation: default_orientation(),
             browse_layout: default_browse_layout(),
+            system_logo_style: default_system_logo_style(),
             button_layout: default_button_layout(),
             mouse_enabled: default_mouse_enabled(),
+            reduce_motion: false,
             discover_arcade_alternate_versions: false,
             debug_logging: false,
             screensaver_timeout: default_screensaver_timeout(),
             media_image_type: default_media_image_type(),
+            show_hidden: false,
+            show_original_filenames: false,
+            region: default_region(),
+            crt_video_standard: default_crt_video_standard(),
+            crt_h_offset: 0,
+            crt_v_offset: 0,
         }
     }
+}
+
+fn default_region() -> String {
+    "auto".into()
+}
+
+fn default_crt_video_standard() -> String {
+    "ntsc".into()
+}
+
+fn default_clock_format() -> String {
+    "auto".into()
 }
 
 fn default_orientation() -> String {
@@ -138,6 +197,10 @@ fn default_orientation() -> String {
 
 fn default_browse_layout() -> String {
     "grid".into()
+}
+
+fn default_system_logo_style() -> String {
+    "tinted".into()
 }
 
 fn default_button_layout() -> String {
@@ -263,7 +326,7 @@ mod tests {
         let original = PersistedState {
             active_screen: "games".into(),
             hub: HubState {
-                category: "Consoles".into(),
+                category: "Console".into(),
                 selected_row: 1,
                 selected_action: "settings".into(),
             },
@@ -284,19 +347,50 @@ mod tests {
             settings: SettingsState {
                 resolution: "1920x1080".into(),
                 language: "it_IT".into(),
+                clock_format: "24h".into(),
                 orientation: "cw".into(),
                 browse_layout: "list".into(),
+                system_logo_style: "color".into(),
                 button_layout: "b".into(),
                 mouse_enabled: false,
+                reduce_motion: true,
                 discover_arcade_alternate_versions: true,
                 debug_logging: true,
                 screensaver_timeout: "300".into(),
                 media_image_type: "auto".into(),
+                show_hidden: true,
+                show_original_filenames: true,
+                region: "us".into(),
+                crt_video_standard: "pal".into(),
+                crt_h_offset: -3,
+                crt_v_offset: 2,
             },
         };
         save_to(&path, &original);
         let loaded = load_from(&path);
         assert_eq!(loaded, original);
+    }
+
+    #[test]
+    fn new_settings_fields_default_on_old_state_file() {
+        // Forward-compat: a state file written before newer settings fields were
+        // added must load cleanly with defaults.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.toml");
+        let on_disk = r#"[hub]
+category = "Console"
+
+[systems]
+system_id = "NES"
+
+[settings]
+resolution = "1920x1080"
+"#;
+        std::fs::write(&path, on_disk).expect("write");
+        let state = load_from(&path);
+        assert!(!state.settings.show_hidden);
+        // reduce_motion absent from an older state file defaults to false.
+        assert!(!state.settings.reduce_motion);
     }
 
     #[test]
@@ -383,10 +477,14 @@ mod tests {
         let state = load_from(&path);
         assert_eq!(state.settings.resolution, "1920x1080");
         assert_eq!(state.settings.language, "");
+        assert_eq!(state.settings.clock_format, "auto");
         assert_eq!(state.settings.browse_layout, "grid");
         assert_eq!(state.settings.button_layout, "a");
         assert!(state.settings.mouse_enabled);
         assert!(!state.settings.debug_logging);
+        assert_eq!(state.settings.crt_video_standard, "ntsc");
+        assert_eq!(state.settings.crt_h_offset, 0);
+        assert_eq!(state.settings.crt_v_offset, 0);
     }
 
     #[test]

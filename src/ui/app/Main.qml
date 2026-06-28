@@ -37,18 +37,31 @@ MainLayout {
     readonly property string modalGameInfo: "game_info"
     readonly property string modalQrCode: "qr_code"
     readonly property string modalCommercialNotice: "commercial_notice"
+    readonly property string modalCoreVersion: "core_version_warning"
     readonly property string modalFirstRunIndex: "first_run_index"
     readonly property string modalLogUpload: "log_upload"
     readonly property string modalQuitConfirm: "quit_confirm"
     readonly property string modalListPicker: "list_picker"
+    readonly property string modalLetterJump: "letter_jump"
     readonly property string modalSettingNeedsRestart: "restart_confirm"
+    readonly property string modalCrtCalibration: "crt_calibration"
 
     // One-shot session flag: the first-run modal is shown at most
     // once per frontend process, even if the WS link drops and the
     // mediadb-empty condition would otherwise be satisfied again.
     property bool _firstRunIndexShown: false
+    // One-shot guard for the Core-version warning, same lifetime as
+    // _firstRunIndexShown: show it at most once per process even if the
+    // link drops and reconnects to the same old Core.
+    property bool _coreVersionWarningShown: false
     property string _pendingLanguageSelection: ""
     property string _pendingResolutionSelection: ""
+    property string _pendingCrtStandardSelection: ""
+    // Staged CRT-mode toggle awaiting the restart-confirm modal:
+    // "" (none), "on", or "off". Confirming writes the 1-byte enable
+    // file and exits with code 42 so Main_MiSTer respawns the frontend
+    // with the new mode (see Browse.CrtVideo).
+    property string _pendingCrtToggle: ""
     property bool _discoverMenuPending: false
     property bool _pendingResumeLaunch: false
     property bool _startupRestorePending: false
@@ -65,6 +78,37 @@ MainLayout {
     readonly property bool activeCardWritePending: root.cardWriteOwner === "systems" ? Browse.SystemsModel.card_write_pending : root.cardWriteOwner === "games" ? Browse.GamesModel.card_write_pending : root.cardWriteOwner === "favorites" ? Browse.FavoritesModel.card_write_pending : false
     readonly property string activeCardWriteError: root.cardWriteOwner === "systems" ? Browse.SystemsModel.card_write_error : root.cardWriteOwner === "games" ? Browse.GamesModel.card_write_error : root.cardWriteOwner === "favorites" ? Browse.FavoritesModel.card_write_error : ""
 
+    // Feed the Motion singleton's master switch from the persisted
+    // reduce-motion setting. Keeping Motion dependency-free (no
+    // Browse import) means Zaparoo.Theme stays independent; the app
+    // layer is the only place that crosses the module boundary.
+    Binding {
+        target: Motion
+        property: "enabled"
+        value: !Browse.Settings.current_reduce_motion
+    }
+
+    // Mirror the "Show original filenames" setting onto every model that
+    // surfaces a game name. Bound centrally (not per-screen) so browse,
+    // favorites, recents, the resume banner, and launch/now-playing titles
+    // all flip together regardless of which screen is mounted. Each model's
+    // setter re-emits dataChanged so already-built delegates refresh in place.
+    Binding {
+        target: (root.gamesScreenRequested || root.activeScreen === root.screenGames) ? Browse.GamesModel : null
+        property: "show_original_filenames"
+        value: Browse.Settings.current_show_original_filenames
+    }
+    Binding {
+        target: (root.favoritesScreenRequested || root.activeScreen === root.screenFavorites) ? Browse.FavoritesModel : null
+        property: "show_original_filenames"
+        value: Browse.Settings.current_show_original_filenames
+    }
+    Binding {
+        target: (root._firstFrameSeen || root.recentsScreenRequested || root.activeScreen === root.screenRecents) ? Browse.RecentsModel : null
+        property: "show_original_filenames"
+        value: Browse.Settings.current_show_original_filenames
+    }
+
     // Bound here (not in GamesScreen.qml) because `set_system` can fire
     // from the accept handler before the games screen mounts; binding
     // inside the screen fires only on `Component.onCompleted`, after the
@@ -77,7 +121,10 @@ MainLayout {
     readonly property int _gamesGridColumns: root._gamesGridShape.columns
     readonly property int _gamesGridRows: root._gamesGridShape.rows
     readonly property int _gamesPageSize: Browse.Settings.current_browse_layout === "list" ? root._gamesListFetchSize : root._gamesGridColumns * root._gamesGridRows
-    on_GamesPageSizeChanged: Browse.GamesModel.page_size = root._gamesPageSize
+    on_GamesPageSizeChanged: {
+        if (root.gamesScreenRequested || root.activeScreen === root.screenGames)
+            root._syncGamesModelLayout();
+    }
     // Maximum cover dimension requested from Core. Computed from the tile
     // pixel size with 2x headroom so the resized image looks sharp even
     // when the grid zooms slightly. Core fits the image within a
@@ -88,7 +135,10 @@ MainLayout {
         const tileH = Math.ceil(Sizing.screenHeight / Math.max(1, root._gamesGridRows));
         return Math.max(tileW, tileH) * 2;
     }
-    on_GamesCoverMaxSizeChanged: Browse.GamesModel.set_cover_max_size(root._gamesCoverMaxSize)
+    on_GamesCoverMaxSizeChanged: {
+        if (root.gamesScreenRequested || root.activeScreen === root.screenGames)
+            root._syncGamesModelLayout();
+    }
 
     // Bind Sizing to the scene's logical dimensions, not the
     // ApplicationWindow's. Outside CRT preview the scene fills the
@@ -110,9 +160,10 @@ MainLayout {
     function _requestScreen(screen: string): void {
         if (screen === root.screenSystems)
             root.systemsScreenRequested = true;
-        else if (screen === root.screenGames)
+        else if (screen === root.screenGames) {
             root.gamesScreenRequested = true;
-        else if (screen === root.screenFavorites)
+            root._syncGamesModelLayout();
+        } else if (screen === root.screenFavorites)
             root.favoritesScreenRequested = true;
         else if (screen === root.screenRecents)
             root.recentsScreenRequested = true;
@@ -132,17 +183,9 @@ MainLayout {
             root.potionsPixelsScreenRequested = true;
     }
 
-    function _primeStartupRestoreScreen(screen: string): void {
-        if (screen === root.screenSystems) {
-            root._requestScreen(root.screenSystems);
-            return;
-        }
-        if (screen === root.screenGames) {
-            root._requestScreen(root.screenSystems);
-            root._requestScreen(root.screenGames);
-            return;
-        }
-        root._requestScreen(screen);
+    function _syncGamesModelLayout(): void {
+        Browse.GamesModel.page_size = root._gamesPageSize;
+        Browse.GamesModel.set_cover_max_size(root._gamesCoverMaxSize);
     }
 
     function _screenItem(screen: string): var {
@@ -206,6 +249,8 @@ MainLayout {
             root.qrCodeModalRequested = true;
         else if (modal === root.modalCommercialNotice)
             root.commercialNoticeModalRequested = true;
+        else if (modal === root.modalCoreVersion)
+            root.coreVersionModalRequested = true;
         else if (modal === root.modalFirstRunIndex)
             root.firstRunIndexModalRequested = true;
         else if (modal === root.modalLogUpload)
@@ -214,8 +259,12 @@ MainLayout {
             root.quitConfirmModalRequested = true;
         else if (modal === root.modalListPicker)
             root.listPickerModalRequested = true;
+        else if (modal === root.modalLetterJump)
+            root.letterJumpModalRequested = true;
         else if (modal === root.modalSettingNeedsRestart)
             root.settingNeedsRestartModalRequested = true;
+        else if (modal === root.modalCrtCalibration)
+            root.crtCalibrationModalRequested = true;
     }
 
     Component.onCompleted: {
@@ -227,28 +276,24 @@ MainLayout {
         if (!root.fullScreen && root._crtPreviewActive) {
             root.applyCrtPreviewScale(root._crtPreviewInitialScale);
         }
-        Browse.GamesModel.page_size = root._gamesPageSize;
         const savedScreen = root._validStartupScreen(Browse.AppState.active_screen);
-        root.startupRestoreCurtainVisible = savedScreen !== "" && savedScreen !== root.screenHub;
-        if (root.startupRestoreCurtainVisible) {
+        root.activeScreen = root.screenHub;
+        if (savedScreen !== "" && savedScreen !== root.screenHub) {
             root._startupRestorePending = true;
             root._startupRestoreScreen = savedScreen;
-            root._primeStartupRestoreScreen(savedScreen);
-            root.activeScreen = savedScreen;
-            startupRestoreKickTimer.restart();
+            // MainLayout seeds this before Component.onCompleted so no first-frame
+            // ghost Hub can leak during non-Hub restores; assign here to break the
+            // initial binding and keep the router-owned curtain explicit.
+            root.startupRestoreCurtainVisible = true;
         } else {
-            root.activeScreen = root.screenHub;
+            root.startupRestoreCurtainVisible = false;
         }
         root._startupTrace("startup/qml Component.onCompleted", "savedScreen=" + savedScreen, "initialActiveScreen=" + root.activeScreen, "startupRestorePending=" + root._startupRestorePending, "connectionState=" + Browse.AppStatus.connection_state);
-        Browse.FavoritesModel.cover_requests_paused = root.activeScreen !== root.screenFavorites;
-        Browse.RecentsModel.cover_requests_paused = root.activeScreen !== root.screenRecents;
-        // If the catalog is already ready, fire the restore here so
-        // the cascade (set_category → SystemsModel reset → seed
-        // currentIndex → set_system → GamesModel reset) lands before
-        // first paint. Otherwise the CategoriesModel.onModelReset
-        // Connection below fires it on first delivery.
-        if (Browse.CategoriesModel.count > 0)
-            root.hubScreen.restoreFromCategoriesReset();
+        // Fire the focus restore here so Hub focus is seated and marked ready
+        // before first paint. Do not cascade into SystemsModel yet: first
+        // paint stays Hub-only, and the post-frame handler below runs the
+        // cascade needed by saved-screen restore and later drill-downs.
+        root.hubScreen.restoreFromCategoriesReset(false);
         root._maybeArmHubResumeFocus();
         // Open the commercial-use notice on first paint of an unacked
         // install. Sits in front of the media-DB first-run modal in the
@@ -264,8 +309,40 @@ MainLayout {
         root._maybeStartStartupRestore();
     }
 
+    on_FirstFrameSeenChanged: {
+        if (root._firstFrameSeen) {
+            Browse.ImageOverrides.load_hub_overrides();
+            if (Browse.CategoriesModel.count > 0)
+                root.hubScreen.restoreFromCategoriesReset(true);
+            root._maybeStartStartupRestore();
+        }
+    }
+
+    Connections {
+        target: Browse.ImageOverrides
+        function onHub_loadedChanged(): void {
+            if (Browse.ImageOverrides.hub_loaded)
+                Browse.ImageOverrides.load_system_overrides();
+        }
+        function onSystems_loadedChanged(): void {
+            if (Browse.ImageOverrides.systems_loaded && Browse.CategoriesModel.count > 0)
+                Browse.SystemsModel.reproject();
+        }
+    }
+
+    function _isStableNavigationScreen(screen: string): bool {
+        if (screen === root.screenHub || screen === root.screenSystems || screen === root.screenGames || screen === root.screenFavorites || screen === root.screenRecents || screen === root.screenSettings || screen === root.screenAbout)
+            return true;
+        // ArtCade-fork: Credits / Sponsors / DevTeam / Artists / PotionsPixels
+        // screens are durable navigation surfaces — they should survive a
+        // startup-restore cycle the same way Settings + About do.
+        if (screen === root.screenCredits || screen === root.screenSponsors || screen === root.screenDevTeam || screen === root.screenArtists || screen === root.screenPotionsPixels)
+            return true;
+        return false;
+    }
+
     function _validStartupScreen(screen: string): string {
-        if (screen === root.screenHub || screen === root.screenSystems || screen === root.screenGames || screen === root.screenFavorites || screen === root.screenRecents || screen === root.screenSettings || screen === root.screenAbout || screen === root.screenCredits || screen === root.screenSponsors || screen === root.screenDevTeam || screen === root.screenArtists || screen === root.screenPotionsPixels)
+        if (root._isStableNavigationScreen(screen))
             return screen;
         return "";
     }
@@ -284,7 +361,7 @@ MainLayout {
     Connections {
         target: Browse.CategoriesModel
         function onModelReset(): void {
-            root.hubScreen.restoreFromCategoriesReset();
+            root.hubScreen.restoreFromCategoriesReset(root._firstFrameSeen);
             root._maybeStartStartupRestore();
             root._maybeContinueOptimisticTransitions();
         }
@@ -296,7 +373,7 @@ MainLayout {
         }
     }
     Connections {
-        target: Browse.SystemsModel
+        target: root._systemsModelConnectionsEnabled ? Browse.SystemsModel : null
         // On a games-screen restore, GamesState.system_id is authoritative;
         // fall back to SystemsState.system_id only if it's empty (edge case:
         // user pressed Enter on an empty systems grid and we flipped the
@@ -315,7 +392,7 @@ MainLayout {
         }
     }
     Connections {
-        target: Browse.GamesModel
+        target: root._gamesModelConnectionsEnabled ? Browse.GamesModel : null
         function onModelReset(): void {
             if (root.gamesScreen === null) {
                 root._whenScreenReady(root.screenGames, function () {
@@ -380,18 +457,81 @@ MainLayout {
     }
 
     // Cross-screen transitions: each screen signals its intent and this
-    // router writes persistence + flips ScreenManager. Keeps the screens
-    // themselves ignorant of AppState so they can be reused in test
-    // harnesses that don't wire the full persistence layer.
-    //
-    // The runtime + persistence writes always go together — naming the
-    // pair as a single helper makes the invariant explicit and keeps
-    // the four request handlers below a single line each.
+    // router flips ScreenManager, then applies route policy such as
+    // launch-resume persistence. Keeps the screens themselves ignorant
+    // of AppState so they can be reused in test harnesses that don't
+    // wire the full persistence layer.
     function _goto(screen: string): void {
         root._requestScreen(screen);
         root._startupTrace("startup/qml goto", "from=" + root.activeScreen, "to=" + screen, "pendingTransition=" + root.pendingTransition);
         ScreenManager.activeScreen = screen;
-        Browse.AppState.active_screen = screen;
+        if (root._isLaunchResumeScreen(screen))
+            Browse.AppState.active_screen = screen;
+    }
+
+    // Long-running operational screens should not be restored after the
+    // process is killed. Resume only stable navigation destinations.
+    function _isLaunchResumeScreen(screen: string): bool {
+        return root._isStableNavigationScreen(screen);
+    }
+
+    function _allowsScreensaver(screen: string): bool {
+        if (screen === root.screenUpdate)
+            return root.updateScreen !== null && root.updateScreen.allowsScreensaver;
+        return true;
+    }
+
+    function _backTargetReady(screen: string): bool {
+        const item = root._screenItem(screen);
+        if (item === null || item === undefined)
+            return false;
+        if (screen === root.screenHub)
+            return true;
+        if (screen === root.screenSystems)
+            return !Browse.SystemsModel.loading;
+        if (screen === root.screenGames)
+            return !Browse.GamesModel.loading;
+        if (screen === root.screenFavorites)
+            return !Browse.FavoritesModel.loading;
+        if (screen === root.screenRecents)
+            return !Browse.RecentsModel.loading;
+        return true;
+    }
+
+    function _maybeCompleteBackTransition(): void {
+        if (root.pendingTransition !== "back")
+            return;
+        const target = root._backTransitionTarget;
+        if (target === "" || !root._backTargetReady(target))
+            return;
+        root._backTransitionTarget = "";
+        backTransitionTimer.stop();
+        root._completeTransition(target);
+    }
+
+    // Back navigation is usually a return to an already-mounted, already-filled
+    // screen. Cut immediately in that case. Keep the delayed Loading cue only
+    // when real work is pending: lazy screen mount, catalog boot, or a model
+    // fill still in flight.
+    function _navigateBackToScreen(screen: string): void {
+        if (screen === root.activeScreen)
+            return;
+        root._backTransitionTarget = "";
+        backTransitionTimer.stop();
+        if (root._backTargetReady(screen)) {
+            root._goto(screen);
+            root._resetIdle();
+            return;
+        }
+        root._backTransitionTarget = screen;
+        root.pendingTransition = "back";
+        root._whenScreenReady(screen, function () {
+            if (root.pendingTransition !== "back" || root._backTransitionTarget !== screen)
+                return;
+            root._maybeCompleteBackTransition();
+            if (root.pendingTransition === "back")
+                backTransitionTimer.restart();
+        });
     }
 
     // Single-shot callback slots fired by the loadingChanged
@@ -414,6 +554,11 @@ MainLayout {
     // complete the transition before our own `set_category` has been
     // issued.
     property bool _deferredCategoryPending: false
+    property bool _deferredSystemPending: false
+    readonly property bool _systemsModelConnectionsEnabled: root.systemsScreenRequested || (root._firstFrameSeen && root._startupRestorePending) || root._categoryReadyCallback !== null || root._deferredCategoryPending || root._catalogWaitCategory !== ""
+    readonly property bool _gamesModelConnectionsEnabled: root.gamesScreenRequested || root._systemReadyCallback !== null || root._deferredSystemPending
+    readonly property bool _favoritesModelConnectionsEnabled: root.favoritesScreenRequested || root._favoritesReadyCallback !== null
+    readonly property bool _recentsModelConnectionsEnabled: root.recentsScreenRequested || root._recentsReadyCallback !== null || root._pendingResumeLaunch
     // Saved games-screen entry path that wasn't on the freshly seeded
     // page 1 of MediaBrowse. The GamesModel.onCountChanged watcher
     // below paginates forward via fetch_more until the path is found
@@ -421,6 +566,18 @@ MainLayout {
     // any navigation that starts a new browse target so a stale
     // restore can't keep paginating after the user moves on.
     property string _pendingGameRestorePath: ""
+    property string _backTransitionTarget: ""
+    property string _pendingFolderBackTargetPath: ""
+    property string _pendingFolderBackSystemId: ""
+    property var _folderBackReadyCallback: null
+    // System-cover prefetch gate. `_prefetchSystemCovers` populates
+    // `_systemCoverPrefetchUrls` with the first-page logos and stores the
+    // completion callback in `_systemCoverPrefetchCallback`. When every
+    // Image signals Ready/Error (or `systemCoverPrefetchTimer` expires),
+    // `_completePrefetchSystemCovers` fires the callback and clears state.
+    property var _systemCoverPrefetchUrls: []
+    property var _systemCoverPrefetchCallback: null
+    property int _systemCoverPrefetchPending: 0
 
     function _catalogStillBooting(): bool {
         return !Browse.CategoriesModel.loaded && (Browse.CategoriesModel.error_message ?? "") === "";
@@ -438,6 +595,31 @@ MainLayout {
         root._startupTrace("startup/qml deferred category ready", "category=" + targetCategory + " count=" + Browse.SystemsModel.count);
         const cb = root._categoryReadyCallback;
         root._categoryReadyCallback = null;
+        cb();
+        return true;
+    }
+
+    function _completeDeferredSystemIfReady(targetSystemId: string): bool {
+        if (root._systemReadyCallback === null)
+            return false;
+        if (Browse.GamesModel.loading)
+            return false;
+        if (Browse.GamesModel.current_system_id !== targetSystemId)
+            return false;
+        root._startupTrace("startup/qml deferred system ready", "systemId=" + targetSystemId + " count=" + Browse.GamesModel.count);
+        const cb = root._systemReadyCallback;
+        root._systemReadyCallback = null;
+        cb();
+        return true;
+    }
+
+    function _completeFolderBackRebrowseIfReady(): bool {
+        if (root._folderBackReadyCallback === null)
+            return false;
+        if (Browse.GamesModel.loading)
+            return false;
+        const cb = root._folderBackReadyCallback;
+        root._folderBackReadyCallback = null;
         cb();
         return true;
     }
@@ -461,6 +643,7 @@ MainLayout {
                 if (root.pendingTransition === "settings")
                     root._completeTransition(root.screenSettings);
             });
+        root._maybeCompleteBackTransition();
     }
 
     // Listen for SystemsModel fills owned by an in-flight transition.
@@ -473,7 +656,7 @@ MainLayout {
     // is consumed at most once per transition; a stray fire when no
     // transition is pending is a no-op.
     Connections {
-        target: Browse.SystemsModel
+        target: root._systemsModelConnectionsEnabled ? Browse.SystemsModel : null
         function onLoadingChanged(): void {
             if (Browse.SystemsModel.loading)
                 return;
@@ -490,35 +673,47 @@ MainLayout {
             if (root._catalogWaitCategory !== "" && root._catalogStillBooting())
                 return;
             const cb = root._categoryReadyCallback;
-            if (cb === null)
+            if (cb === null) {
+                root._maybeCompleteBackTransition();
                 return;
+            }
             root._categoryReadyCallback = null;
             cb();
+            root._maybeCompleteBackTransition();
         }
     }
     Connections {
-        target: Browse.GamesModel
+        target: root._gamesModelConnectionsEnabled ? Browse.GamesModel : null
         function onLoadingChanged(): void {
             if (Browse.GamesModel.loading)
                 return;
-            const cb = root._systemReadyCallback;
-            if (cb === null)
+            if (root._deferredSystemPending) {
+                root._startupTrace("startup/qml system loading edge ignored", "reason=deferred-pending systemId=" + Browse.GamesModel.current_system_id + " count=" + Browse.GamesModel.count);
                 return;
-            root._systemReadyCallback = null;
-            cb();
+            }
+            const cb = root._systemReadyCallback;
+            if (cb !== null) {
+                root._systemReadyCallback = null;
+                cb();
+            }
+            root._completeFolderBackRebrowseIfReady();
+            root._maybeCompleteBackTransition();
         }
     }
     Connections {
-        target: Browse.RecentsModel
+        target: root._recentsModelConnectionsEnabled ? Browse.RecentsModel : null
         function onLoadingChanged(): void {
             if (Browse.RecentsModel.loading)
                 return;
             root._maybeCompletePendingResumeLaunch();
             const cb = root._recentsReadyCallback;
-            if (cb === null)
+            if (cb === null) {
+                root._maybeCompleteBackTransition();
                 return;
+            }
             root._recentsReadyCallback = null;
             cb();
+            root._maybeCompleteBackTransition();
         }
 
         function onResume_availableChanged(): void {
@@ -526,15 +721,18 @@ MainLayout {
         }
     }
     Connections {
-        target: Browse.FavoritesModel
+        target: root._favoritesModelConnectionsEnabled ? Browse.FavoritesModel : null
         function onLoadingChanged(): void {
             if (Browse.FavoritesModel.loading)
                 return;
             const cb = root._favoritesReadyCallback;
-            if (cb === null)
+            if (cb === null) {
+                root._maybeCompleteBackTransition();
                 return;
+            }
             root._favoritesReadyCallback = null;
             cb();
+            root._maybeCompleteBackTransition();
         }
     }
 
@@ -543,13 +741,9 @@ MainLayout {
     // populated — a re-Accept after Esc-back); the set_category call
     // is still made for parity with the prior behaviour even though
     // Rust early-returns when the category already matches. Async
-    // path waits for loadingChanged; the 50 ms defer hides
-    // set_category's synchronous teardown of SystemsScreen's bound
-    // tile delegates behind the transition overlay, so the user sees
-    // overlay → frozen-under-overlay → grid instead of freeze →
-    // flash → grid. Qt.callLater is not enough; it fires inside the
-    // same event loop iteration before the next render polish/sync
-    // pass.
+    // path waits for loadingChanged. The timer keeps the loadingChanged
+    // bookkeeping on the same asynchronous path without deliberately
+    // holding the transition long enough to show the global loading cue.
     function _ensureCategory(category: string, cb, waitForCatalog): void {
         if (waitForCatalog && root._catalogStillBooting()) {
             root._startupTrace("startup/qml catalog wait arm", "category=" + category);
@@ -567,6 +761,7 @@ MainLayout {
         root._categoryReadyCallback = cb;
         root._deferredCategoryPending = true;
         deferredCategorySetTimer.targetCategory = category;
+        deferredCategorySetTimer.interval = 1;
         deferredCategorySetTimer.restart();
     }
 
@@ -576,7 +771,9 @@ MainLayout {
     // but the cached result applies inline through the watcher's seed
     // — loading flips back to false before set_system returns — so we
     // can call cb() synchronously on this path. Cold-load goes through
-    // the systemReadyCallback waiter below.
+    // the systemReadyCallback waiter below; when replacing populated
+    // games rows during a transition, defer to the delayed loading cue
+    // for the same pre-feedback-freeze reason as _ensureCategory.
     function _ensureSystem(systemId: string, cb): void {
         if (Browse.GamesModel.current_system_id === systemId && Browse.GamesModel.count > 0) {
             Browse.GamesModel.set_system(systemId);
@@ -584,7 +781,10 @@ MainLayout {
             return;
         }
         root._systemReadyCallback = cb;
-        Browse.GamesModel.set_system(systemId);
+        root._deferredSystemPending = true;
+        deferredSystemSetTimer.targetSystemId = systemId;
+        deferredSystemSetTimer.interval = root.pendingTransition !== "" && Browse.GamesModel.count > 0 ? root.loadingIndicatorDelayMs + 50 : 1;
+        deferredSystemSetTimer.restart();
     }
 
     // Hub Accept routing. Empty-row passthrough preserves the committed
@@ -636,6 +836,18 @@ MainLayout {
             root._goto(root.screenHub);
     }
 
+    // Fire the actual resume launch and arm the desktop safety-clear. The
+    // "Loading game…" cue (pendingTransition === "resume") stays up through
+    // the launch: on MiSTer the process is replaced by the game before the
+    // timer fires, so the cue covers the core swap; on desktop nothing
+    // replaces us, so resumeLaunchCueTimer clears the cue and restores input.
+    // Started only here, at dispatch — never while still waiting on the
+    // connection — so a slow coalesce keeps the cue for as long as it needs.
+    function _dispatchResumeLaunch(): void {
+        Browse.RecentsModel.launch_resume();
+        resumeLaunchCueTimer.restart();
+    }
+
     function _maybeCompletePendingResumeLaunch(): void {
         if (!root._pendingResumeLaunch || root.pendingTransition !== "resume")
             return;
@@ -643,7 +855,7 @@ MainLayout {
             return;
         if (Browse.RecentsModel.resume_available) {
             root._pendingResumeLaunch = false;
-            Browse.RecentsModel.launch_resume();
+            root._dispatchResumeLaunch();
             return;
         }
         if (Browse.AppStatus.connection_state === 2 || Browse.AppStatus.connection_state === 3)
@@ -658,12 +870,16 @@ MainLayout {
     }
 
     function _navigateResumeFromHub(): void {
+        // Optimistic loader, same contract as the other Hub actions: paint
+        // the "Loading game…" cue (and hide the ghost-Hub tiles / gate input)
+        // immediately, before we know whether the launch can proceed.
+        // _cancelResumeLaunch clears it on the no-resumable-game branch.
+        root.pendingTransition = "resume";
         if (!Browse.RecentsModel.resume_loading && Browse.RecentsModel.resume_available) {
-            Browse.RecentsModel.launch_resume();
+            root._dispatchResumeLaunch();
             return;
         }
         if (Browse.RecentsModel.resume_loading || Browse.AppStatus.connection_state !== 2) {
-            root.pendingTransition = "resume";
             resumeLaunchTimer.restart();
             return;
         }
@@ -732,6 +948,14 @@ MainLayout {
     function _navigateToRecents(): void {
         root.pendingTransition = "recents";
         recentsTransitionTimer.restart();
+    }
+
+    // Hub → Update transition. Placeholder screen with no async data,
+    // so the flip is instant.
+    function _navigateToUpdate(): void {
+        if (!root.updateEnabled)
+            return;
+        root._goto(root.screenUpdate);
     }
 
     function _resumeFavoritesCovers(): void {
@@ -845,6 +1069,10 @@ MainLayout {
         const savedSystem = root.activeScreen === root.screenGames ? (Browse.GamesState.system_id !== "" ? Browse.GamesState.system_id : Browse.SystemsState.system_id) : Browse.SystemsState.system_id;
         const idx = savedSystem === "" ? -1 : Browse.SystemsModel.index_for_system_id(savedSystem);
         root.systemsScreen.systemsGrid.setCurrentIndexImmediate(idx >= 0 ? idx : 0);
+        // Focus is now finalized from persisted state; let the grid render
+        // focus (snapped, since the screen's _focusArmed is still false until
+        // the first user input).
+        root.systemsScreen._restoreDone = true;
         if (idx >= 0) {
             Browse.GamesModel.set_system(savedSystem);
             const stack = Browse.GamesState.path_stack;
@@ -862,6 +1090,9 @@ MainLayout {
         root.gamesScreen.suppressSelectionPersist = true;
         root.gamesScreen.gamesGrid.setCurrentIndexImmediate(index);
         root.gamesScreen.suppressSelectionPersist = false;
+        // Selection finalized from persisted state; let the grid render focus
+        // (snapped, since _focusArmed is still false until the first input).
+        root.gamesScreen._restoreDone = true;
     }
 
     function _restoreGamesScreenSelection(): bool {
@@ -924,12 +1155,19 @@ MainLayout {
         Browse.GamesModel.set_path(path);
     }
 
-    // Folder pop-up inside the games screen. Pops the deepest level off
-    // the stack, then drives the model back to the parent path. If we
-    // pop to the root level (path_stack[0] is always "") the call goes
-    // through `set_system` so the model re-runs the
-    // single-root-auto-nav decision rather than browsing the literal
-    // empty path with no system filter.
+    function _rebrowseGamesFolderTarget(path: string, systemId: string): void {
+        if (path === "") {
+            if (systemId !== "")
+                Browse.GamesModel.set_system(systemId);
+        } else {
+            Browse.GamesModel.set_path(path);
+        }
+    }
+
+    // Folder pop-up inside the games screen. Cached parents take the same direct
+    // path as folder drill-down, so Back does not show fake global Loading for a
+    // browse result we can seed synchronously. Cold parents keep the delayed cue
+    // before rebrowse so the UI does not look dead if the reset/RPC stalls.
     function _navigateOutOfFolder(): void {
         const stack = Browse.GamesState.path_stack;
         if (stack.length <= 1)
@@ -937,13 +1175,38 @@ MainLayout {
         Browse.GamesState.pop_level();
         const newStack = Browse.GamesState.path_stack;
         const target = newStack[newStack.length - 1];
-        if (target === "") {
-            const sid = Browse.GamesState.system_id;
-            if (sid !== "")
-                Browse.GamesModel.set_system(sid);
-        } else {
-            Browse.GamesModel.set_path(target);
+        const systemId = target === "" ? Browse.GamesState.system_id : "";
+        root._pendingFolderBackTargetPath = "";
+        root._pendingFolderBackSystemId = "";
+        folderBackTransitionTimer.stop();
+        if (Browse.GamesModel.browse_cached_for_path(target)) {
+            root._rebrowseGamesFolderTarget(target, systemId);
+            root._resetIdle();
+            return;
         }
+        root.pendingTransition = "folder_back";
+        root._pendingFolderBackTargetPath = target;
+        root._pendingFolderBackSystemId = systemId;
+        folderBackTransitionTimer.restart();
+    }
+
+    function _completeFolderBackTransition(): void {
+        const target = root._pendingFolderBackTargetPath;
+        const systemId = root._pendingFolderBackSystemId;
+        root._pendingFolderBackTargetPath = "";
+        root._pendingFolderBackSystemId = "";
+        if (root.pendingTransition !== "folder_back")
+            return;
+        root._folderBackReadyCallback = root._finishFolderBackTransition;
+        root._rebrowseGamesFolderTarget(target, systemId);
+        root._completeFolderBackRebrowseIfReady();
+    }
+
+    function _finishFolderBackTransition(): void {
+        if (root.pendingTransition !== "folder_back")
+            return;
+        root.pendingTransition = "";
+        root._resetIdle();
     }
 
     // Clear the pending flag, then flip. Order matters: clearing
@@ -963,13 +1226,15 @@ MainLayout {
     }
 
     function _finishStartupRestore(): void {
-        root._startupTrace("startup/qml finishStartupRestore", "target=" + root._startupRestoreScreen, "activeScreen=" + root.activeScreen);
+        const restoredScreen = root._startupRestoreScreen;
+        root._startupTrace("startup/qml finishStartupRestore", "target=" + restoredScreen, "activeScreen=" + root.activeScreen);
         startupRestoreKickTimer.stop();
         root._startupRestorePending = false;
         root._startupRestoreStarted = false;
         root._startupRestoreScreen = "";
         root.startupRestoreCurtainVisible = false;
-        root._maybeArmHubResumeFocus();
+        if (restoredScreen === "" || restoredScreen === root.screenHub)
+            root._maybeArmHubResumeFocus();
     }
 
     function _maybeArmHubResumeFocus(): void {
@@ -980,6 +1245,8 @@ MainLayout {
 
     function _maybeStartStartupRestore(): void {
         if (!root._startupRestorePending || root._startupRestoreStarted)
+            return;
+        if (!root._firstFrameSeen)
             return;
         if (startupRestoreKickTimer.running)
             return;
@@ -1001,6 +1268,7 @@ MainLayout {
         }
         if (targetScreen === root.screenFavorites) {
             root._whenScreenReady(root.screenFavorites, function () {
+                root._resumeFavoritesCovers();
                 if (Browse.FavoritesModel.loading) {
                     root._favoritesReadyCallback = function () {
                         root.favoritesScreen.restoreSelection();
@@ -1017,6 +1285,8 @@ MainLayout {
         }
         if (targetScreen === root.screenRecents) {
             root._whenScreenReady(root.screenRecents, function () {
+                Browse.RecentsModel.ensure_loaded();
+                root._resumeRecentsCovers();
                 if (Browse.RecentsModel.loading) {
                     root._recentsReadyCallback = function () {
                         root.recentsScreen.restoreSelection();
@@ -1044,7 +1314,7 @@ MainLayout {
             return;
         }
         if (targetScreen === root.screenHub) {
-            root.hubScreen.restoreFromCategoriesReset();
+            root.hubScreen.restoreFromCategoriesReset(true);
             root._finishStartupRestore();
             root._goto(root.screenHub);
             return;
@@ -1141,17 +1411,23 @@ MainLayout {
         function onRequestRecentsScreen(): void {
             root._navigateToRecents();
         }
+        function onRequestUpdateScreen(): void {
+            root._navigateToUpdate();
+        }
         function onRequestSettingsScreen(): void {
             root._navigateToSettings();
         }
         function onRequestCreditsScreen(): void {
             root._navigateToCredits();
         }
+        function onRequestContextMenu(index: int, anchorRect): void {
+            root.openContextMenu("categories", index, anchorRect);
+        }
     }
     Connections {
         target: root.favoritesScreen
         function onRequestHubScreen(): void {
-            root._goto(root.screenHub);
+            root._navigateBackToScreen(root.screenHub);
         }
         function onRequestContextMenu(index: int, anchorRect): void {
             root.openContextMenu("favorites", index, anchorRect);
@@ -1160,10 +1436,16 @@ MainLayout {
     Connections {
         target: root.recentsScreen
         function onRequestHubScreen(): void {
-            root._goto(root.screenHub);
+            root._navigateBackToScreen(root.screenHub);
         }
         function onRequestContextMenu(index: int, anchorRect): void {
             root.openContextMenu("recents", index, anchorRect);
+        }
+    }
+    Connections {
+        target: root.updateScreen
+        function onRequestHubScreen(): void {
+            root._goto(root.screenHub);
         }
     }
     Connections {
@@ -1176,6 +1458,10 @@ MainLayout {
                 root.openLogUploadModal();
             else if (actionId === "aboutLicense")
                 root._navigateToAbout();
+            else if (actionId === "crtEnable" || actionId === "crtDisable")
+                root.stageCrtToggle(actionId === "crtEnable");
+            else if (actionId === "crtCalibration")
+                root.openCrtCalibrationModal();
         }
         function onRequestListPicker(title: string, entries: var, initialId: string, fieldId: string): void {
             root.openListPickerModal(title, entries, initialId, fieldId);
@@ -1274,10 +1560,17 @@ MainLayout {
                     Browse.SystemsModel.set_category(cat);
                 return;
             }
+            // Launch-only (virtual) systems carry a zapScript and have no
+            // browsable media. Run them directly and stay on the systems
+            // grid; never route into an empty games browse.
+            if (Browse.SystemsModel.is_launchable_system(systemId)) {
+                Browse.SystemsModel.launch_system_id(systemId);
+                return;
+            }
             root._navigateFromSystems(systemId);
         }
         function onRequestHubScreen(): void {
-            root._goto(root.screenHub);
+            root._navigateBackToScreen(root.screenHub);
         }
         function onRequestContextMenu(index: int, anchorRect): void {
             root.openContextMenu("systems", index, anchorRect);
@@ -1318,10 +1611,10 @@ MainLayout {
         function onRequestSystemsScreen(): void {
             const arcadeBypassActive = Browse.Platform.is_mister && Browse.Platform.ready && Browse.SystemsModel.current_category === CategoryIds.arcadeId && Browse.SystemsModel.count === 1 && Browse.GamesModel.current_system_id === CategoryIds.arcadeId;
             if (arcadeBypassActive) {
-                root._goto(root.screenHub);
+                root._navigateBackToScreen(root.screenHub);
                 return;
             }
-            root._goto(root.screenSystems);
+            root._navigateBackToScreen(root.screenSystems);
         }
         function onRequestNavigateIntoFolder(path: string): void {
             root._navigateIntoFolder(path);
@@ -1331,6 +1624,9 @@ MainLayout {
         }
         function onRequestContextMenu(index: int, anchorRect): void {
             root.openContextMenu("games", index, anchorRect);
+        }
+        function onRequestPageMenu(): void {
+            root.openPageMenu();
         }
     }
 
@@ -1378,7 +1674,7 @@ MainLayout {
     // caller saw `entries.length === 0` despite the function pushing 3
     // items in. Plain `var` round-trips cleanly and silences the
     // "insufficiently annotated" coercion warning at the call site.
-    function buildContextMenuEntries(owner: string, entryType: string, mediaCapable: bool, hasNfc: bool, isFavorite: bool, systemId: string) {
+    function buildContextMenuEntries(owner: string, entryType: string, mediaCapable: bool, hasNfc: bool, isFavorite: bool, systemId: string, isHidden: bool, category: string) {
         if (owner === "systems") {
             const entries = [
                 {
@@ -1386,19 +1682,51 @@ MainLayout {
                     label: qsTr("Launch core")
                 }
             ];
-            if (!Browse.SystemLaunchers.loading && Browse.SystemLaunchers.error_message === "" && Browse.SystemLaunchers.launcher_count_for_system(systemId) > 0) {
+            // Launch-only (virtual) systems have no media and no launcher
+            // choice, so omit launcher/index/scrape actions for them.
+            const launchable = Browse.SystemsModel.is_launchable_system(systemId);
+            if (!launchable && !Browse.SystemLaunchers.loading && Browse.SystemLaunchers.error_message === "" && Browse.SystemLaunchers.launcher_count_for_system(systemId) > 0) {
                 entries.push({
                     id: "change_launcher",
                     label: qsTr("Change launcher")
                 });
             }
             const mediaBusy = Browse.MediaStatus.indexing || Browse.MediaStatus.optimizing || Browse.MediaStatus.scraping;
-            if (!mediaBusy) {
+            if (!launchable && !mediaBusy) {
                 entries.push({
                     id: "index_system",
                     label: qsTr("Update media database")
                 }, {
                     id: "scrape_system",
+                    label: qsTr("Scrape metadata")
+                });
+            }
+            entries.push({
+                id: "toggle_hide_system",
+                label: isHidden ? qsTr("Unhide") : qsTr("Hide")
+            });
+            return entries;
+        }
+        if (owner === "categories") {
+            const mediaBusy = Browse.MediaStatus.indexing || Browse.MediaStatus.optimizing || Browse.MediaStatus.scraping;
+            const entries = [
+                {
+                    id: "toggle_hide_category",
+                    label: isHidden ? qsTr("Unhide") : qsTr("Hide")
+                }
+            ];
+            // Index/scrape act on the category's indexable systems, which
+            // excludes launch-only ones. Show the actions only when the
+            // category has at least one indexable system; a category whose
+            // members are all launch-only yields none and the actions would
+            // no-op, so omit them rather than show dead entries.
+            const hasIndexable = category !== "" && Browse.SystemsModel.system_ids_for_category(category).length > 0;
+            if (!mediaBusy && hasIndexable) {
+                entries.push({
+                    id: "index_category",
+                    label: qsTr("Update media database")
+                }, {
+                    id: "scrape_category",
                     label: qsTr("Scrape metadata")
                 });
             }
@@ -1496,10 +1824,18 @@ MainLayout {
         let isFavorite = false;
         let systemId = "";
         let mediaCapable = false;
+        let isHidden = false;
+        let category = "";
         if (owner === "systems") {
             if (index >= Browse.SystemsModel.count)
                 return;
             systemId = Browse.SystemsModel.system_id_at(index);
+            isHidden = Browse.SystemsModel.is_hidden_at(index);
+        } else if (owner === "categories") {
+            if (index >= Browse.CategoriesModel.count)
+                return;
+            category = Browse.CategoriesModel.category_at(index);
+            isHidden = Browse.CategoriesModel.is_hidden_at(index);
         } else if (owner === "games") {
             if (index >= Browse.GamesModel.count)
                 return;
@@ -1515,7 +1851,7 @@ MainLayout {
             if (index >= Browse.RecentsModel.count)
                 return;
         }
-        const entries = root.buildContextMenuEntries(owner, entryType, mediaCapable, Browse.SystemStatus.has_nfc, isFavorite, systemId);
+        const entries = root.buildContextMenuEntries(owner, entryType, mediaCapable, Browse.SystemStatus.has_nfc, isFavorite, systemId, isHidden, category);
         if (entries.length === 0)
             return;
         root.contextMenuEntries = entries;
@@ -1612,6 +1948,38 @@ MainLayout {
             const systemId = Browse.SystemsModel.system_id_at(targetIndex);
             if (systemId !== "")
                 Browse.MediaStatus.start_scrape_for_system(systemId);
+        } else if (id === "toggle_hide_system") {
+            const systemId = Browse.SystemsModel.system_id_at(targetIndex);
+            if (systemId !== "") {
+                if (Browse.SystemsState.is_system_hidden(systemId))
+                    Browse.SystemsState.unhide_system(systemId);
+                else
+                    Browse.SystemsState.hide_system(systemId);
+                Browse.SystemsModel.reproject();
+            }
+        } else if (id === "toggle_hide_category") {
+            const categoryName = Browse.CategoriesModel.category_at(targetIndex);
+            if (categoryName !== "") {
+                if (Browse.HubState.is_category_hidden(categoryName))
+                    Browse.HubState.unhide_category(categoryName);
+                else
+                    Browse.HubState.hide_category(categoryName);
+                Browse.CategoriesModel.reproject();
+            }
+        } else if (id === "index_category") {
+            const categoryName = Browse.CategoriesModel.category_at(targetIndex);
+            if (categoryName !== "") {
+                const systemIds = Browse.SystemsModel.system_ids_for_category(categoryName);
+                if (systemIds.length > 0)
+                    Browse.MediaStatus.start_index_for_systems(systemIds);
+            }
+        } else if (id === "scrape_category") {
+            const categoryName = Browse.CategoriesModel.category_at(targetIndex);
+            if (categoryName !== "") {
+                const systemIds = Browse.SystemsModel.system_ids_for_category(categoryName);
+                if (systemIds.length > 0)
+                    Browse.MediaStatus.start_scrape_for_systems(systemIds);
+            }
         } else if (id === "launch_game") {
             if (owner === "favorites")
                 Browse.FavoritesModel.launch_at(targetIndex);
@@ -1695,17 +2063,19 @@ MainLayout {
     }
 
     // First-run modal lifecycle. Push exactly once per session, the
-    // moment the catalog resolves Ready and reports zero systems
-    // (`CategoriesModel.loaded === true && count === 0`). 0 visible
-    // categories implies a 0-system response from `media.systems` — a
-    // mediadb that's missing or never indexed — and the frontend has
-    // no UI to render past the hub. The `loaded` gate is critical:
-    // the singleton's Default state has `count: 0` before the catalog
-    // fetch lands, so without it we'd fire the modal on cold launch
-    // before Core has answered. Gating on the catalog instead of
-    // MediaStatus.exists/seeded avoids the case where Core reports
-    // `database.exists: true` for an empty file — there the catalog
-    // is the authoritative "are there games to show?" signal.
+    // moment the catalog resolves Ready and reports zero *indexed*
+    // systems (`CategoriesModel.loaded === true && indexed_count === 0`).
+    // We gate on `indexed_count`, not `count`: since Core's launchables
+    // feature, a device with no mediadb still returns launch-only virtual
+    // systems (non-empty `zapScript`) that land in the `Other` category,
+    // so `count`/`raw_count` are non-zero even when nothing is indexed.
+    // `indexed_count` ignores launchables, so it answers "are there
+    // indexed games to show?" — which is exactly the first-run question.
+    // The `loaded` gate is critical: the singleton's Default state has
+    // `indexed_count: 0` before the catalog fetch lands, so without it
+    // we'd fire the modal on cold launch before Core has answered. Gating
+    // on the catalog instead of MediaStatus.exists/seeded avoids the case
+    // where Core reports `database.exists: true` for an empty file.
     function _maybeOpenFirstRunIndex(): void {
         if (root._firstRunIndexShown)
             return;
@@ -1714,11 +2084,26 @@ MainLayout {
         // we avoid stacking two modals at the same time.
         if (!Browse.Notice.commercial_ack)
             return;
+        // Never open while the Core-version warning is still on screen —
+        // `_coreVersionWarningShown` flips true when the warning *opens*, so
+        // without this guard a model signal arriving before the user
+        // dismisses it would stack the first-run modal on top.
+        if (root.coreVersionModalVisible)
+            return;
+        // Defer to the Core-version warning, which sits between the notice
+        // and this modal in the chain. Until that gate has resolved (shown
+        // or skipped, flipping `_coreVersionWarningShown`), hand off to it
+        // and let it call back here — so the two never stack and the
+        // warning always comes first.
+        if (!root._coreVersionWarningShown) {
+            root._maybeOpenCoreVersionWarning();
+            return;
+        }
         if (Browse.AppStatus.connection_state !== 2)
             return;
         if (!Browse.CategoriesModel.loaded)
             return;
-        if (Browse.CategoriesModel.count > 0)
+        if (Browse.CategoriesModel.indexed_count > 0)
             return;
         root._firstRunIndexShown = true;
         root._requestModal(root.modalFirstRunIndex);
@@ -1762,9 +2147,49 @@ MainLayout {
         root.commercialNoticeModalVisible = false;
         if (ScreenManager.topModal === root.modalCommercialNotice)
             ScreenManager.popModal();
-        // Now that the notice is dismissed, re-check the media-DB gate
-        // — if the catalog had already settled empty behind the notice,
-        // this opens that modal as the next step in the chain.
+        // Now that the notice is dismissed, advance the first-run chain:
+        // commercial notice → Core-version warning → media-DB first run.
+        // Each gate early-returns until its own condition holds, so this
+        // is safe to call unconditionally.
+        root._maybeOpenCoreVersionWarning();
+    }
+
+    // Core-version warning lifecycle. Shown once per session, behind the
+    // commercial notice, when Core reports a version older than the
+    // frontend's minimum. Warn-only: the OK button dismisses it and the
+    // chain advances to the media-DB first-run check. `core_version_checked`
+    // gates the open so we don't evaluate before the async `version` fetch
+    // has answered; `core_version_supported` defaults true so we never
+    // flash the warning pre-check.
+    function _maybeOpenCoreVersionWarning(): void {
+        if (root._coreVersionWarningShown) {
+            // Already handled this session — make sure the next gate still
+            // runs so a re-entry from another trigger doesn't stall the chain.
+            root._maybeOpenFirstRunIndex();
+            return;
+        }
+        if (!Browse.Notice.commercial_ack)
+            return;
+        if (!Browse.AppStatus.core_version_checked)
+            return;
+        if (Browse.AppStatus.core_version_supported) {
+            // Version is fine — skip straight to the media-DB gate.
+            root._coreVersionWarningShown = true;
+            root._maybeOpenFirstRunIndex();
+            return;
+        }
+        root._coreVersionWarningShown = true;
+        root._requestModal(root.modalCoreVersion);
+        root.coreVersionModalVisible = true;
+        if (ScreenManager.topModal !== root.modalCoreVersion)
+            ScreenManager.pushModal(root.modalCoreVersion);
+    }
+
+    function closeCoreVersionModal(): void {
+        root.coreVersionModalVisible = false;
+        if (ScreenManager.topModal === root.modalCoreVersion)
+            ScreenManager.popModal();
+        // Advance to the media-DB first-run check.
         root._maybeOpenFirstRunIndex();
     }
 
@@ -1838,6 +2263,54 @@ MainLayout {
             ScreenManager.popModal();
     }
 
+    // Open the page/list-scoped operations menu (West button), the "View"
+    // counterpart to North's item-scoped "Options". For now it holds a single
+    // entry, Go to..., kept pre-focused so the common path is a fixed
+    // West-then-Accept chord; future list ops (sort/filter/layout) append here.
+    // The facet fetch is kicked off here so the buckets are likely ready by the
+    // time the user advances into the grid.
+    function openPageMenu(): void {
+        Browse.GamesModel.load_letter_index();
+        const entries = [
+            {
+                "id": "jump_letter",
+                "label": qsTr("Go to...")
+            }
+        ];
+        root.openListPickerModal(qsTr("View"), entries, "jump_letter", "page_menu");
+    }
+
+    // Re-parse the model's facet JSON into the live grid entries. Bound through
+    // a Connections below so the grid populates the instant the fetch lands.
+    function _refreshLetterJumpEntries(): void {
+        const scheme = Browse.GamesModel.letter_index_scheme;
+        let parsed = [];
+        try {
+            parsed = JSON.parse(Browse.GamesModel.letter_index_json);
+        } catch (e) {
+            parsed = [];
+        }
+        root.letterJumpEntries = Array.isArray(parsed) ? parsed : [];
+        // Empty scheme = facet still resolving; anything else is final.
+        root.letterJumpLoading = scheme === "";
+    }
+
+    function openLetterJumpModal(): void {
+        root._refreshLetterJumpEntries();
+        root._requestModal(root.modalLetterJump);
+        root.letterJumpModalVisible = true;
+        if (ScreenManager.topModal !== root.modalLetterJump)
+            ScreenManager.pushModal(root.modalLetterJump);
+    }
+
+    function closeLetterJumpModal(): void {
+        root.letterJumpModalVisible = false;
+        root.letterJumpEntries = [];
+        root.letterJumpLoading = false;
+        if (ScreenManager.topModal === root.modalLetterJump)
+            ScreenManager.popModal();
+    }
+
     function openSettingNeedsRestartModal(): void {
         root._requestModal(root.modalSettingNeedsRestart);
         root.settingNeedsRestartModalVisible = true;
@@ -1856,31 +2329,90 @@ MainLayout {
             root._pendingLanguageSelection = selectedId;
         else if (fieldId === "resolution")
             root._pendingResolutionSelection = selectedId;
+        else if (fieldId === "crtVideoStandard")
+            root._pendingCrtStandardSelection = selectedId;
+        root.openSettingNeedsRestartModal();
+    }
+
+    function stageCrtToggle(enable: bool): void {
+        root._pendingCrtToggle = enable ? "on" : "off";
         root.openSettingNeedsRestartModal();
     }
 
     function cancelPendingRestart(): void {
         root._pendingLanguageSelection = "";
         root._pendingResolutionSelection = "";
+        root._pendingCrtStandardSelection = "";
+        root._pendingCrtToggle = "";
         root.closeSettingNeedsRestartModal();
     }
 
     function confirmPendingRestart(): void {
+        // CRT-mode toggle takes a different exit: Main_MiSTer owns the
+        // respawn (the new mode needs a different fb setup and --crt
+        // flag), so persist the flag byte and exit with the reserved
+        // reload code instead of the in-process execvp restart. If the
+        // flag write fails, stay up rather than respawn into the old
+        // mode and let the user retry.
+        if (root._pendingCrtToggle !== "") {
+            const enable = root._pendingCrtToggle === "on";
+            root._pendingCrtToggle = "";
+            root.closeSettingNeedsRestartModal();
+            if (Browse.CrtVideo.write_crt_enable_file(enable))
+                Qt.exit(42);
+            return;
+        }
         const language = root._pendingLanguageSelection;
         const resolution = root._pendingResolutionSelection;
+        const crtStandard = root._pendingCrtStandardSelection;
         root._pendingLanguageSelection = "";
         root._pendingResolutionSelection = "";
+        root._pendingCrtStandardSelection = "";
         root.closeSettingNeedsRestartModal();
         if (language !== "")
             Browse.Settings.set_language(language);
         if (resolution !== "")
             Browse.Settings.set_resolution(resolution);
+        if (crtStandard !== "") {
+            Browse.CrtVideo.set_video_standard(crtStandard);
+            // A standard change must respawn through Main_MiSTer (exit
+            // 42), not the in-process execvp restart: Main owns the fb
+            // geometry (programs it pre-spawn and re-asserts ~1 s in,
+            // reading the mode byte from the CRT state file), so it
+            // has to re-read the new mode before the next frontend
+            // boots. The desktop preview has no Main; the execvp
+            // restart below re-reads frontend.toml and resizes the
+            // preview canvas.
+            if (Browse.Settings.is_mister) {
+                if (Browse.CrtVideo.write_crt_enable_file(true))
+                    Qt.exit(42);
+                return;
+            }
+        }
         root.restartApp();
     }
 
     function restartApp() {
         Qt.exit(1000);
     }
+
+    // CRT calibration lifecycle. Full-bleed test pattern mounted
+    // outside the safe-area inset (see MainLayout); arrows nudge the
+    // centering trims live through Browse.CrtVideo.
+    function openCrtCalibrationModal(): void {
+        root._requestModal(root.modalCrtCalibration);
+        root.crtCalibrationModalVisible = true;
+        if (ScreenManager.topModal !== root.modalCrtCalibration)
+            ScreenManager.pushModal(root.modalCrtCalibration);
+    }
+
+    function closeCrtCalibrationModal(): void {
+        root.crtCalibrationModalVisible = false;
+        if (ScreenManager.topModal === root.modalCrtCalibration)
+            ScreenManager.popModal();
+    }
+
+    onCloseCrtCalibrationRequested: root.closeCrtCalibrationModal()
 
     function beginSystemLauncherUpdate(systemId: string, selectedId: string): void {
         root._pendingLauncherSystemId = systemId;
@@ -1931,6 +2463,12 @@ MainLayout {
     }
 
     onListPickerAccepted: (fieldId, selectedId) => {
+        if (fieldId === "page_menu") {
+            root.closeListPickerModal();
+            if (selectedId === "jump_letter")
+                root.openLetterJumpModal();
+            return;
+        }
         if (fieldId === "system_launcher_pending")
             return;
         if (fieldId === "system_launcher_error") {
@@ -1955,8 +2493,16 @@ MainLayout {
             return;
         } else if (fieldId === "orientation") {
             Browse.Settings.set_orientation(selectedId);
+        } else if (fieldId === "clockFormat")
+            Browse.Settings.set_clock_format(selectedId);
+        else if (fieldId === "region") {
+            Browse.Settings.set_region(selectedId);
+            Browse.SystemsModel.reproject();
+            Browse.CategoriesModel.reproject();
         } else if (fieldId === "browseLayout")
             Browse.Settings.set_browse_layout(selectedId);
+        else if (fieldId === "systemLogoStyle")
+            Browse.Settings.set_system_logo_style(selectedId);
         else if (fieldId === "buttonLayout")
             Browse.Settings.set_button_layout(selectedId);
         else if (fieldId === "resolution") {
@@ -1968,9 +2514,38 @@ MainLayout {
             Browse.Settings.set_screensaver_timeout(selectedId);
         else if (fieldId === "mediaImageType")
             Browse.Settings.set_media_image_type(selectedId);
+        else if (fieldId === "crtVideoStandard") {
+            root.closeListPickerModal();
+            if (selectedId !== Browse.CrtVideo.current_video_standard)
+                root.stageSettingRestart(fieldId, selectedId);
+            return;
+        }
         root.closeListPickerModal();
     }
     onListPickerCloseRequested: root.handleListPickerCloseRequested()
+
+    onLetterJumpAccepted: offset => {
+        root.closeLetterJumpModal();
+        if (root.gamesScreen !== null)
+            root.gamesScreen.jumpToItem(offset);
+    }
+    onLetterJumpCloseRequested: root.closeLetterJumpModal()
+
+    // Keep the open grid in sync with the facet as it lands. The model clears
+    // its facet to the loading state on `load_letter_index`, then fills it; this
+    // re-parses into the live grid entries each time either changes.
+    Connections {
+        target: root.letterJumpModalRequested ? Browse.GamesModel : null
+        enabled: root.letterJumpModalRequested
+        function onLetter_index_jsonChanged(): void {
+            if (root.letterJumpModalVisible)
+                root._refreshLetterJumpEntries();
+        }
+        function onLetter_index_schemeChanged(): void {
+            if (root.letterJumpModalVisible)
+                root._refreshLetterJumpEntries();
+        }
+    }
 
     Connections {
         target: Browse.SystemLaunchers
@@ -1993,6 +2568,11 @@ MainLayout {
             root._maybeCompleteBoot();
             root._maybeStartStartupRestore();
             root._maybeCompletePendingResumeLaunch();
+        }
+        // The version fetch resolves asynchronously after connect; this is
+        // the edge that lets the chain advance past the version-warning gate.
+        function onCore_version_checkedChanged(): void {
+            root._maybeOpenCoreVersionWarning();
         }
     }
 
@@ -2033,6 +2613,7 @@ MainLayout {
 
     onCloseFirstRunIndexRequested: root.closeFirstRunIndexModal()
     onCloseCommercialNoticeRequested: root.closeCommercialNoticeModal()
+    onCloseCoreVersionRequested: root.closeCoreVersionModal()
 
     function beginCardWrite(owner: string): void {
         if (owner === "systems")
@@ -2092,7 +2673,10 @@ MainLayout {
         // press goes through the normal routing below.
         if (root._maybeDismissScreensaver())
             return;
-        if (root._startupRestorePending && root.startupRestoreCurtainVisible && root.activeScreen === root._startupRestoreScreen && !ScreenManager.hasModal)
+        // Swallow input while the warm-resume curtain is up. The target
+        // screen restores behind a hidden Hub (activeScreen stays Hub), so
+        // any press here would drive the ghost Hub the user can't see.
+        if (root._startupRestorePending && root.startupRestoreCurtainVisible && !ScreenManager.hasModal)
             return;
         root._resetIdle();
         // Input gate. While a forward transition is in flight, swallow
@@ -2103,8 +2687,8 @@ MainLayout {
         // first so an Accept/Esc on a card-write modal isn't
         // accidentally swallowed if a transition is pending behind
         // it (the modal owns input regardless).
-        if (root.pendingTransition !== "" && !ScreenManager.hasModal) {
-            root._startupTrace("input/qml drop", "reason=pending-transition", "action=" + action, "pendingTransition=" + root.pendingTransition);
+        if ((root.pendingTransition !== "" || root.transitionCueVisible) && !ScreenManager.hasModal) {
+            root._startupTrace("input/qml drop", "reason=pending-transition", "action=" + action, "pendingTransition=" + root.pendingTransition, "transitionCueVisible=" + root.transitionCueVisible);
             return;
         }
         if (ScreenManager.hasModal) {
@@ -2133,6 +2717,9 @@ MainLayout {
             } else if (ScreenManager.topModal === root.modalCommercialNotice) {
                 if (root.commercialNoticeModal !== null)
                     root.commercialNoticeModal.handleAction(action);
+            } else if (ScreenManager.topModal === root.modalCoreVersion) {
+                if (root.coreVersionModal !== null)
+                    root.coreVersionModal.handleAction(action);
             } else if (ScreenManager.topModal === root.modalLogUpload) {
                 if (root.logUploadModal !== null)
                     root.logUploadModal.handleAction(action);
@@ -2145,6 +2732,12 @@ MainLayout {
             } else if (ScreenManager.topModal === root.modalListPicker) {
                 if (root.listPickerModal !== null)
                     root.listPickerModal.handleAction(action);
+            } else if (ScreenManager.topModal === root.modalLetterJump) {
+                if (root.letterJumpModal !== null)
+                    root.letterJumpModal.handleAction(action);
+            } else if (ScreenManager.topModal === root.modalCrtCalibration) {
+                if (root.crtCalibrationModal !== null)
+                    root.crtCalibrationModal.handleAction(action);
             }
             // While a modal owns input, swallow everything not handled
             // above rather than leak it to the root screen.
@@ -2163,6 +2756,9 @@ MainLayout {
         } else if (root.activeScreen === root.screenRecents) {
             if (root.recentsScreen !== null)
                 root.recentsScreen.handleAction(action);
+        } else if (root.activeScreen === root.screenUpdate) {
+            if (root.updateScreen !== null)
+                root.updateScreen.handleAction(action);
         } else if (root.activeScreen === root.screenSettings) {
             if (root.settingsScreen !== null)
                 root.settingsScreen.handleAction(action);
@@ -2377,7 +2973,7 @@ MainLayout {
     }
 
     function _resetIdle(): void {
-        if (root._idleScreensaverMs <= 0) {
+        if (root._idleScreensaverMs <= 0 || !root._allowsScreensaver(root.activeScreen)) {
             idleTimer.stop();
             return;
         }
@@ -2405,7 +3001,7 @@ MainLayout {
         // `_maybeCompleteBoot` and `_completeTransition` call
         // `_resetIdle()` so the countdown restarts cleanly the moment
         // the gate clears.
-        if (!root.bootComplete || root.pendingTransition !== "")
+        if (!root.bootComplete || root.pendingTransition !== "" || root.transitionCueVisible || !root._allowsScreensaver(root.activeScreen))
             return;
         const lg = root.headerBar.logoItem;
         if (!lg)
@@ -2424,7 +3020,7 @@ MainLayout {
         id: idleTimer
         interval: root._idleScreensaverMs > 0 ? root._idleScreensaverMs : 60000
         repeat: false
-        running: root._idleScreensaverMs > 0
+        running: root._idleScreensaverMs > 0 && root._allowsScreensaver(root.activeScreen)
         onTriggered: root._activateScreensaver()
     }
 
@@ -2439,10 +3035,14 @@ MainLayout {
     // events fall through to the screensaver overlay's own MouseArea
     // (when armed) or to whatever clickable sits underneath in normal
     // operation. `hoverEnabled: true` is what gets us positionChanged
-    // on bare cursor moves without a button being pressed.
+    // on bare cursor moves without a button being pressed. Disable
+    // this root-level hover area when mouse support is off so the
+    // scene-level blank-cursor blocker owns both cursor and clicks.
     MouseArea {
         anchors.fill: parent
         z: 9001
+        visible: Browse.Settings.current_mouse_enabled
+        enabled: visible
         hoverEnabled: true
         acceptedButtons: Qt.NoButton
         onPositionChanged: {
@@ -2539,24 +3139,33 @@ MainLayout {
         }
     }
 
-    // Forward-transition cue. Item, not Rectangle — the source
-    // screen's existing background and circuit-trace texture stay
-    // visible underneath; never paint a full-screen fill. The
-    // source screen's primary content is hidden by `transitioning`
-    // bindings so the centred "Loading…" reads alone in the cleared
-    // band. Sized to the full window so anchors.centerIn parks
-    // the row in the geometric centre regardless of which screen
-    // is the source.
+    // Transition cue. Item, not Rectangle — the source screen's existing
+    // background and circuit-trace texture stay visible underneath; never
+    // paint a full-screen fill. The delayed indicator suppresses flashes
+    // for quick loads; once it appears, screen `transitioning` bindings hide
+    // primary content so the centered "Loading…" reads alone in the cleared
+    // band. Do not apply a minimum-visible tail here: when the work completes
+    // near the delay threshold, the destination must not paint underneath a
+    // stale loading label. Sized to the full window so anchors.centerIn parks
+    // the row in the geometric center regardless of which screen is the source.
     Item {
         anchors.fill: parent
-        visible: (root.pendingTransition !== "" && !root.startupRestoreCurtainVisible) || (root.startupRestoreCurtainVisible && root._startupRestoreScreen !== "")
+        visible: transitionCueActive || transitionCue.showing
         z: 100
 
+        readonly property bool startupRestoreCueActive: root.bootComplete && root.startupRestoreCurtainVisible && root._startupRestoreScreen !== ""
+        readonly property bool transitionCueActive: (root.pendingTransition !== "" && !root.startupRestoreCurtainVisible) || startupRestoreCueActive
         readonly property string cueScreen: root.pendingTransition !== "" ? root.pendingTransition : root._startupRestoreScreen
 
-        LoadingIndicator {
+        DelayedLoadingIndicator {
+            id: transitionCue
+            active: parent.transitionCueActive
+            delayMs: parent.startupRestoreCueActive ? 0 : root.loadingIndicatorDelayMs
+            minimumVisibleMs: 0
             x: Sizing.center(parent.width, width)
             y: Sizing.center(parent.height, height)
+            onShowingChanged: root.transitionCueVisible = showing
+            Component.onCompleted: root.transitionCueVisible = showing
             text: {
                 switch (parent.cueScreen) {
                 case "systems":
@@ -2576,104 +3185,80 @@ MainLayout {
                 }
             }
         }
-    }
 
-    // Hidden cover-decode loop driven by `_prefetchSystemCovers`.
-    // While `active`, mounts an Image per SystemsModel row using
-    // the same `source` / `sourceSize.width` / `cache` /
-    // `asynchronous` settings as Tile.qml's cover Image so the
-    // prefetch and the visible Tile share a QPixmapCache slot.
-    // As each Image hits Ready or Error, the delegate calls back
-    // into `_onCoverDecoded`, which fires the doneCallback and
-    // unwinds once every cover is counted. Without this warmup
-    // the destination SystemsScreen paints with each Tile showing
-    // its procedural text fallback for tens of ms while the PNG
-    // decodes — the visible "text → logo pop-in" the deferred
-    // flip alone can't fix.
-    //
-    // Bounded by `systemsCoverPrefetchTimeout` so a missing PNG
-    // (silent decode failure that doesn't emit Image.Error) or a
-    // genuinely stuck async load never strands the user on the
-    // loading overlay.
-    Item {
-        id: systemsCoverPrefetcher
-        visible: false
-        property bool active: false
-        property var doneCallback: null
-        property int total: 0
-        property int done: 0
-
-        function _markDone(): void {
-            systemsCoverPrefetcher.done++;
-            if (systemsCoverPrefetcher.done >= systemsCoverPrefetcher.total) {
-                systemsCoverPrefetcher.active = false;
-                systemsCoverPrefetchTimeout.stop();
-                const cb = systemsCoverPrefetcher.doneCallback;
-                systemsCoverPrefetcher.doneCallback = null;
-                if (cb !== null)
-                    cb();
-            }
-        }
-
+        // Hidden Image pool driven by `_prefetchSystemCovers`. Each Image
+        // renders the tinted SVG logo off-screen at the same sourceSize as
+        // the visible Tile so they share one QPixmapCache entry. When every
+        // Image signals Ready or Error, `_systemCoverPrefetchPending` reaches
+        // zero and `_completePrefetchSystemCovers` fires the transition
+        // callback. `_systemCoverPrefetchUrls` is reset to [] when the gate
+        // resolves, which destroys the delegates immediately. No background
+        // fill is added — this Item is already a transparent overlay.
         Repeater {
-            model: systemsCoverPrefetcher.active ? Browse.SystemsModel : null
+            model: root._systemCoverPrefetchUrls
             delegate: Image {
-                required property string coverKey
-                source: coverKey === "" ? "" : Resources.coverUrl(coverKey)
+                required property url modelData
+                source: modelData
                 sourceSize.width: 256
                 asynchronous: true
-                cache: true
-
-                // Each delegate contributes exactly once.
-                // Component.onCompleted catches a synchronous Ready
-                // (cache hit during construction); onStatusChanged
-                // catches the normal async path. `_counted` dedupes
-                // so a delegate whose status flips Null → Ready
-                // inside construction (and again as the binding
-                // settles) tallies once.
-                property bool _counted: false
-                function _markDone(): void {
-                    if (_counted)
-                        return;
-                    _counted = true;
-                    systemsCoverPrefetcher._markDone();
-                }
-
-                Component.onCompleted: {
-                    if (status === Image.Ready || status === Image.Error || coverKey === "")
-                        _markDone();
-                }
+                visible: false
+                width: 0
+                height: 0
                 onStatusChanged: {
-                    if (status === Image.Ready || status === Image.Error)
-                        _markDone();
+                    if (status !== Image.Ready && status !== Image.Error)
+                        return;
+                    root._systemCoverPrefetchPending = Math.max(0, root._systemCoverPrefetchPending - 1);
+                    if (root._systemCoverPrefetchPending <= 0)
+                        root._completePrefetchSystemCovers();
                 }
             }
         }
     }
 
+    // System-cover prefetch gate. Holds the "Loading systems…" transition
+    // overlay until the first visible page of tinted SVG logos has decoded
+    // (or the cap timer fires), then calls cb(). This ensures the Systems
+    // grid reveals fully painted instead of showing name-text placeholders
+    // that pop into logos one-by-one. Fast/re-entry navigations complete
+    // within the 300ms DelayedLoadingIndicator threshold so no cue appears.
+    // The hidden prefetch Repeater lives in the transition-cue Item above;
+    // it watches `_systemCoverPrefetchUrls` and reports back via
+    // `_systemCoverPrefetchPending`.
     function _prefetchSystemCovers(cb): void {
-        systemsCoverPrefetcher.total = Browse.SystemsModel.count;
-        systemsCoverPrefetcher.done = 0;
-        if (systemsCoverPrefetcher.total === 0) {
+        const pageSize = Sizing.visibleCovers * 4;
+        const count = Math.min(Browse.SystemsModel.count, pageSize);
+        if (count === 0) {
             cb();
             return;
         }
-        systemsCoverPrefetcher.doneCallback = cb;
-        systemsCoverPrefetcher.active = true;
-        systemsCoverPrefetchTimeout.restart();
+        const urls = [];
+        for (let i = 0; i < count; ++i) {
+            const key = Browse.SystemsModel.cover_key_at(i);
+            // Warm both the unfocused and focused tint ramps up front so the
+            // first d-pad move never triggers an async SVG re-render.
+            const unfocusedUrl = Resources.coverUrl(key, Theme.logoPrimary, Theme.logoSecondary, Theme.logoShadow);
+            urls.push(unfocusedUrl);
+            const focusedUrl = Resources.coverUrl(key, Theme.logoFocusPrimary, Theme.logoFocusSecondary, Theme.logoFocusShadow);
+            // custom-image/ keys ignore tint params (served as-is), so both
+            // URLs are identical — skip the duplicate to avoid redundant fetches.
+            if (focusedUrl !== unfocusedUrl) {
+                urls.push(focusedUrl);
+            }
+        }
+        root._systemCoverPrefetchCallback = cb;
+        root._systemCoverPrefetchPending = urls.length;
+        root._systemCoverPrefetchUrls = urls;
+        systemCoverPrefetchTimer.restart();
     }
 
-    Timer {
-        id: systemsCoverPrefetchTimeout
-        interval: 1500
-        repeat: false
-        onTriggered: {
-            systemsCoverPrefetcher.active = false;
-            const cb = systemsCoverPrefetcher.doneCallback;
-            systemsCoverPrefetcher.doneCallback = null;
-            if (cb !== null)
-                cb();
-        }
+    function _completePrefetchSystemCovers(): void {
+        systemCoverPrefetchTimer.stop();
+        root._systemCoverPrefetchUrls = [];
+        root._systemCoverPrefetchPending = 0;
+        const cb = root._systemCoverPrefetchCallback;
+        root._systemCoverPrefetchCallback = null;
+        if (cb !== null)
+            cb();
     }
 
     Timer {
@@ -2681,6 +3266,20 @@ MainLayout {
         interval: 50
         repeat: false
         onTriggered: root._startResumeLaunch()
+    }
+
+    // Desktop safety-clear for the resume "Loading game…" cue. On MiSTer the
+    // launch replaces this process before this fires, so it never triggers and
+    // the cue covers the core swap. On desktop nothing replaces us, so clear
+    // the cue (and ungate input) once the launch has had time to take.
+    Timer {
+        id: resumeLaunchCueTimer
+        interval: 8000
+        repeat: false
+        onTriggered: {
+            if (root.pendingTransition === "resume")
+                root.pendingTransition = "";
+        }
     }
 
     Timer {
@@ -2697,12 +3296,38 @@ MainLayout {
         onTriggered: root._startRecentsTransitionLoad()
     }
 
-    // Deferred set_category trigger. Lets the transition overlay
-    // paint a frame before set_category's synchronous teardown of
-    // SystemsScreen's tile delegates freezes the GUI thread. The
-    // 50 ms interval covers a single frame even at MiSTer's ~20 fps
-    // software renderer; Qt.callLater / interval 0 fire inside the
-    // same event loop iteration before the next render.
+    Timer {
+        id: backTransitionTimer
+        interval: root.loadingIndicatorDelayMs + 50
+        repeat: false
+        onTriggered: root._maybeCompleteBackTransition()
+    }
+
+    Timer {
+        id: folderBackTransitionTimer
+        interval: root.loadingIndicatorDelayMs + 50
+        repeat: false
+        onTriggered: root._completeFolderBackTransition()
+    }
+
+    // Safety cap for the system-cover prefetch gate. If some logos haven't
+    // decoded by this deadline they paint in after the screen reveals,
+    // identical to the Games cover-gate timeout behavior. Cap = 300ms
+    // (loadingIndicatorDelayMs) — logos that land faster than the
+    // DelayedLoadingIndicator threshold complete the transition silently;
+    // logos that are slower get a brief "Loading systems…" cue then pop in.
+    Timer {
+        id: systemCoverPrefetchTimer
+        interval: root.loadingIndicatorDelayMs
+        repeat: false
+        onTriggered: root._completePrefetchSystemCovers()
+    }
+
+    // Deferred set_category trigger. When the existing model has rows,
+    // the caller stretches the interval to the delayed cue threshold plus
+    // one frame so the transition indicator is visible before synchronous
+    // delegate teardown can freeze the GUI thread. Qt.callLater / interval
+    // 0 fire inside the same event loop iteration before the next render.
     Timer {
         id: deferredCategorySetTimer
         interval: 50
@@ -2718,6 +3343,20 @@ MainLayout {
             // edge will arrive; complete synchronously in that no-op case.
             root._deferredCategoryPending = false;
             root._completeDeferredCategoryIfReady(category);
+        }
+    }
+
+    Timer {
+        id: deferredSystemSetTimer
+        interval: 1
+        repeat: false
+        property string targetSystemId: ""
+        onTriggered: {
+            const systemId = deferredSystemSetTimer.targetSystemId;
+            root._startupTrace("startup/qml deferred system trigger", "systemId=" + systemId);
+            Browse.GamesModel.set_system(systemId);
+            root._deferredSystemPending = false;
+            root._completeDeferredSystemIfReady(systemId);
         }
     }
 }

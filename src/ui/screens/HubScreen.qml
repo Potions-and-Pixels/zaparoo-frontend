@@ -21,7 +21,7 @@ import Zaparoo.Browse as Browse
 //   * Top row: dynamic categories from Browse.CategoriesModel (Arcade,
 //     Computer, Console, Handheld).
 //   * Bottom row: actions — optional Resume Game, Favorites,
-//     Recently Played and Settings.
+//     Recently Played, optional Update and Settings.
 //
 // Both rows wrap left/right modulo their own count, and Up/Down flip
 // between rows in a closed loop (Up from top wraps to bottom, Down
@@ -39,7 +39,7 @@ import Zaparoo.Browse as Browse
 //
 // Pure input dispatcher: emits one of `requestAccept(payload)`,
 // `requestFavoritesScreen`, `requestRecentsScreen`,
-// `requestSettingsScreen`, or `requestQuit`.
+// `requestUpdateScreen`, `requestSettingsScreen`, or `requestQuit`.
 //
 // All cross-screen orchestration (model fills, deferred set_category,
 // cover prefetch, transition overlay, screen flip) lives in Main.qml.
@@ -50,38 +50,78 @@ Item {
 
     Component.onCompleted: console.debug("startup/qml component HubScreen completed")
 
+    // Prefer a user override cover key over the bundled default. Pure: takes
+    // the override-lookup result (empty string when none) and the fallback,
+    // so it is unit-testable without the Browse.ImageOverrides singleton.
+    // Hub overrides live under the `hub/` customization subfolder, keyed by
+    // category id (Arcade/Computer/Console/Handheld) or action id
+    // (resume/favorites/recents/update/settings); see docs/customization.md.
+    function _preferOverride(overrideKey: string, fallbackKey: string): string {
+        return (overrideKey && overrideKey.length > 0) ? overrideKey : fallbackKey;
+    }
+
+    // Resolve the cover key for a Hub item: a user override from the `hub/`
+    // namespace if present, else the bundled key. Before the deferred scan
+    // completes, return empty so first paint does no icon image work and avoids
+    // a bundled-to-custom flash.
+    function _hubCoverKey(id: string, fallbackKey: string): string {
+        if (!Browse.ImageOverrides.hub_loaded)
+            return "";
+        return hub._preferOverride(Browse.ImageOverrides.override_cover_key("hub", id), fallbackKey);
+    }
+
     readonly property var _placeholderCategories: [
         {
             id: CategoryIds.arcadeId,
             name: qsTr("Arcade"),
-            coverKey: CategoryIds.coverKey(CategoryIds.arcadeId)
+            coverKey: hub._hubCoverKey(CategoryIds.arcadeId, CategoryIds.coverKey(CategoryIds.arcadeId))
         },
         {
             id: CategoryIds.computerId,
             name: qsTr("Computers"),
-            coverKey: CategoryIds.coverKey(CategoryIds.computerId)
+            coverKey: hub._hubCoverKey(CategoryIds.computerId, CategoryIds.coverKey(CategoryIds.computerId))
         },
         {
             id: CategoryIds.consoleId,
             name: qsTr("Consoles"),
-            coverKey: CategoryIds.coverKey(CategoryIds.consoleId)
+            coverKey: hub._hubCoverKey(CategoryIds.consoleId, CategoryIds.coverKey(CategoryIds.consoleId))
         },
         {
             id: CategoryIds.handheldId,
             name: qsTr("Handhelds"),
-            coverKey: CategoryIds.coverKey(CategoryIds.handheldId)
+            coverKey: hub._hubCoverKey(CategoryIds.handheldId, CategoryIds.coverKey(CategoryIds.handheldId))
+        },
+        {
+            id: CategoryIds.otherId,
+            name: qsTr("Other"),
+            coverKey: hub._hubCoverKey(CategoryIds.otherId, CategoryIds.coverKey(CategoryIds.otherId))
         }
     ]
     readonly property var visibleCategoryEntries: {
-        if (Browse.CategoriesModel.count <= 0)
-            return hub._placeholderCategories;
+        if (!Browse.CategoriesModel.loaded || Browse.CategoriesModel.raw_count <= 0) {
+            const placeholders = [];
+            for (let i = 0; i < hub._placeholderCategories.length; i++) {
+                const entry = hub._placeholderCategories[i];
+                const hidden = Browse.HubState.is_category_hidden(entry.id);
+                if (hidden && !Browse.Settings.current_show_hidden)
+                    continue;
+                placeholders.push({
+                    id: entry.id,
+                    name: entry.name,
+                    coverKey: entry.coverKey,
+                    hidden: hidden
+                });
+            }
+            return placeholders;
+        }
         const entries = [];
         for (let i = 0; i < Browse.CategoriesModel.count; i++) {
             const name = Browse.CategoriesModel.category_at(i);
             entries.push({
                 id: name,
                 name: name,
-                coverKey: CategoryIds.coverKey(name)
+                coverKey: hub._hubCoverKey(name, CategoryIds.coverKey(name)),
+                hidden: Browse.CategoriesModel.is_hidden_at(i)
             });
         }
         return entries;
@@ -91,6 +131,25 @@ Item {
     property int currentRow: 1
     // Index within the active row. Resume is first while optimistic/history is unknown.
     property int currentIndex: 0
+    // False on the first-paint path so Hub can draw a static Resume tile
+    // without touching RecentsModel. MainLayout flips this after the
+    // first frame, then Resume can hide/update from Core history.
+    property bool resumeModelEnabled: false
+    // Incremented on each Accept so the focused tile plays its push-in
+    // animation. Forwarded to every TileLoader; only the focused+selected
+    // Tile fires its animation.
+    property int activatePulse: 0
+    // False until the user takes control of focus (first input). Combined
+    // with `_restoreDone` into `_focusReady`, which gates whether the tiles
+    // render focus at all.
+    property bool _focusArmed: false
+    // Set true once the load-time category restore has run. Combined with
+    // `_focusArmed` into `_focusReady`, which gates whether the tiles render
+    // focus at all — so the action row's default Resume selection never paints
+    // a ring during the window before `restoreFromCategoriesReset` corrects
+    // focus to the saved tile on a cold start.
+    property bool _restoreDone: false
+    readonly property bool _focusReady: hub._focusArmed || hub._restoreDone
     // Source-row index from the most recent cross. Used to make a
     // Down → Up (or Up → Down) round-trip return to the originating
     // tile, which the centered visual-nearest mapping in `_mapCrossRow`
@@ -105,10 +164,15 @@ Item {
     signal requestQuit
     signal requestFavoritesScreen
     signal requestRecentsScreen
+    signal requestUpdateScreen
     signal requestSettingsScreen
     // ArtCade-fork: Credits & Acknowledgements screen — see CreditsScreen.qml
     // and the Credits tile added to actionEntries below.
     signal requestCreditsScreen
+    // Emitted when the user opens the options menu on a category tile.
+    // `anchorRect` is the tile's bounding rect mapped to hub coordinates,
+    // used by the context menu to position itself.
+    signal requestContextMenu(index: int, anchorRect: rect)
 
     // Vertically center the (categories row + actions row + activeLabel)
     // block in the band between the HeaderBar bottom (Sizing.headerBottom)
@@ -120,8 +184,9 @@ Item {
     readonly property int _blockHeight: 2 * (categoriesRow.cellHeight + 2 * categoriesRow.verticalPadding) + (categoriesRow.spacing - categoriesRow.verticalPadding - actionsRow.verticalPadding) + Sizing.pctH(3) + Sizing.pctH(7)
     readonly property int _blockY: Math.round((Sizing.headerBottom + hub.height - Sizing.pctH(6) - hub._blockHeight) / 2)
 
-    readonly property bool resumeKnownUnavailable: !Browse.RecentsModel.resume_loading && !Browse.RecentsModel.resume_available && Browse.AppStatus.connection_state === 2
+    readonly property bool resumeKnownUnavailable: hub.resumeModelEnabled && !Browse.RecentsModel.resume_loading && !Browse.RecentsModel.resume_available && Browse.AppStatus.connection_state === 2
     readonly property bool resumeActionVisible: !hub.resumeKnownUnavailable
+    readonly property string _emptyCatalogFallbackAction: Browse.BuildInfo.update_enabled ? "update" : "settings"
 
     // Action-row data. Resume is visible by default while Core history
     // is unknown; hide it only after Recents proves there is nothing
@@ -140,32 +205,48 @@ Item {
     readonly property var actionEntries: {
         const entries = [];
         if (hub.resumeActionVisible && !Browse.Settings.current_hide_resume) {
-            const resumeName = Browse.RecentsModel.resume_name;
+            const resumeName = hub.resumeModelEnabled ? Browse.RecentsModel.resume_name : "";
             entries.push({
                 id: "resume",
-                coverKey: "icons/PlayOutline",
+                coverKey: hub._hubCoverKey("resume", "icons/PlayOutline"),
+                enabled: true,
                 text: resumeName.length > 0 ? resumeName : qsTr("Resume")
             });
         }
         if (!Browse.Settings.current_hide_favorites) {
             entries.push({
                 id: "favorites",
-                coverKey: "icons/HeartOutline",
+                coverKey: hub._hubCoverKey("favorites", "icons/HeartOutline"),
+                enabled: true,
                 text: qsTr("Favorites")
             });
         }
         if (!Browse.Settings.current_hide_recents) {
             entries.push({
                 id: "recents",
-                coverKey: "icons/History",
+                coverKey: hub._hubCoverKey("recents", "icons/History"),
+                enabled: true,
                 text: qsTr("Recently Played")
+            });
+        }
+        // ArtCade-fork: Update tile is gated by both upstream's
+        // BuildInfo.update_enabled (compile-time disable for kiosk
+        // builds) and a `hide_settings` co-gate (we treat
+        // self-update affordance as another admin-only surface).
+        if (Browse.BuildInfo.update_enabled && !Browse.Settings.current_hide_settings) {
+            entries.push({
+                id: "update",
+                coverKey: hub._hubCoverKey("update", "icons/RefreshCw"),
+                enabled: true,
+                text: qsTr("Update")
             });
         }
         if (!Browse.Settings.current_hide_settings) {
             entries.push({
                 id: "settings",
-                coverKey: "icons/Settings",
-                text: qsTr("Settings")
+                coverKey: hub._hubCoverKey("settings", "icons/Tools"),
+                enabled: true,
+                text: qsTr("Settings & Utilities")
             });
         }
         // ArtCade-fork: Credits & Acknowledgements tile. Always
@@ -179,7 +260,8 @@ Item {
         // semantic. Distinct from Favorites' HeartOutline.svg.
         entries.push({
             id: "credits",
-            coverKey: "icons/Heart",
+            coverKey: hub._hubCoverKey("credits", "icons/Heart"),
+            enabled: true,
             text: qsTr("Credits")
         });
         return entries;
@@ -223,7 +305,15 @@ Item {
     }
 
     onActionEntriesChanged: {
-        if (hub.currentRow === 1 && Browse.HubState.selected_action === "resume" && !hub.resumeActionVisible) {
+        // Only treat a vanishing Resume tile as a real removal once the user
+        // is driving focus (_focusArmed). During the cold-boot settle the
+        // resume fetch can briefly read unavailable before it resolves to the
+        // just-played game; reacting then would jump focus to Arcade and
+        // persist it, stranding the user off the (about-to-reappear) Resume
+        // tile. While !_focusArmed, fall through to _remapActionFocus, which
+        // keeps the actions row aligned to the saved "resume" intent without
+        // overwriting persisted state.
+        if (hub._focusArmed && hub.currentRow === 1 && Browse.HubState.selected_action === "resume" && !hub.resumeActionVisible) {
             hub._focusFallbackAfterResumeRemoved();
             return;
         }
@@ -239,11 +329,10 @@ Item {
         hub._crossSavedIndex = -1;
     }
 
-    // Restore the hub from the persisted `Browse.HubState`. Always
-    // cascades into `SystemsModel.set_category` because the cascade
-    // drives the next onModelReset handler that a games-screen restore
-    // depends on; the call is idempotent when the model already holds
-    // the right category.
+    // Restore the hub from the persisted `Browse.HubState`. The router
+    // decides whether this pass should cascade into
+    // `SystemsModel.set_category`; first Hub paint restores focus only,
+    // then post-frame restore/transition paths can pay for Systems.
     //
     // Called from two sites in Main.qml — the Component.onCompleted
     // early-arrival path (catalog already seeded synchronously) and the
@@ -252,7 +341,11 @@ Item {
     // re-seeded even when SystemsModel is already on the chosen
     // category — otherwise the visible focus drifts off whichever
     // screen the user is on.
-    function restoreFromCategoriesReset(): void {
+    function restoreFromCategoriesReset(cascadeSystems: bool): void {
+        // Focus is now being finalized from persisted state; let the tiles
+        // render focus from here on (snapped, since `_focusArmed` is still
+        // false until the first user input).
+        hub._restoreDone = true;
         const savedCategory = CategoryIds.canonicalize(Browse.HubState.category);
         const idx = savedCategory === "" ? -1 : Browse.CategoriesModel.index_for_category(savedCategory);
         const chosenCategoryIndex = idx >= 0 ? idx : 0;
@@ -263,8 +356,8 @@ Item {
         // treated as 0 — same belt-and-braces stance as the category
         // fallback above. When the catalog reports 0 categories the
         // top row has no tiles to focus, so we drop focus onto
-        // Settings — the only meaningful action ("Run Update media
-        // database from Settings") the empty-hub message points at.
+        // Update when it exists, otherwise Settings so the user lands
+        // on an actionable tile.
         const savedRow = Browse.HubState.selected_row;
         const savedAction = Browse.HubState.selected_action;
         if (savedRow === 1 && savedAction !== "") {
@@ -277,7 +370,7 @@ Item {
             hub.focusResumeIfVisible();
         } else if (Browse.CategoriesModel.count === 0) {
             hub.currentRow = 1;
-            hub.currentIndex = hub._actionIndexForId("settings");
+            hub.currentIndex = hub._actionIndexForId(hub._emptyCatalogFallbackAction);
         } else {
             hub.currentRow = 0;
             hub.currentIndex = chosenCategoryIndex;
@@ -288,6 +381,16 @@ Item {
         // point past the new category list).
         hub._crossSavedIndex = -1;
 
+        if (!cascadeSystems)
+            return;
+        // Cold boot before Core delivers the catalog: focus was seated above
+        // (and `_restoreDone` set, so the focus ring paints immediately
+        // instead of waiting for the connection), but the set_category
+        // cascade needs the real catalog. Defer it — this function re-runs
+        // on CategoriesModel.onModelReset once the catalog lands, and the
+        // cascade fires then.
+        if (Browse.CategoriesModel.count <= 0)
+            return;
         if (Browse.SystemsModel.current_category === chosenCategory && Browse.SystemsModel.count > 0)
             return;
         Browse.SystemsModel.set_category(chosenCategory);
@@ -403,6 +506,7 @@ Item {
     function _focusCategory(index: int): void {
         if (index < 0 || index >= hub.visibleCategoryEntries.length)
             return;
+        hub._focusArmed = true;
         hub.currentRow = 0;
         hub.currentIndex = index;
         // Mouse focus is a deliberate landing on a specific tile — any
@@ -414,14 +518,17 @@ Item {
     function _focusAction(index: int): void {
         if (index < 0 || index >= hub.actionEntries.length)
             return;
+        hub._focusArmed = true;
         hub.currentRow = 1;
         hub.currentIndex = index;
         hub._crossSavedIndex = -1;
         hub._commitActionSelection();
     }
 
-    function _activateCurrent(): void {
-        hub._commitCurrent();
+    // Emit the navigation signal for the currently selected entry.
+    // Separated from _activateCurrent so DeferredAction can call it
+    // after the push-in cue has had time to play.
+    function _emitActivate(): void {
         if (hub.currentRow === 0) {
             // During optimistic boot the visible category row is backed
             // by localized placeholder labels. Accept the stable category
@@ -431,20 +538,42 @@ Item {
             return;
         }
 
-        const id = hub.actionEntries[hub.currentIndex].id;
+        const entry = hub.actionEntries[hub.currentIndex];
+        if (!entry || entry.enabled === false)
+            return;
+
+        const id = entry.id;
         if (id === "resume")
             hub.requestAccept("resume");
         else if (id === "favorites")
             hub.requestFavoritesScreen();
         else if (id === "recents")
             hub.requestRecentsScreen();
+        else if (id === "update")
+            hub.requestUpdateScreen();
         else if (id === "settings")
             hub.requestSettingsScreen();
         else if (id === "credits")
             hub.requestCreditsScreen();
     }
 
+    function _activateCurrent(): void {
+        hub.activatePulse++;
+        hub._commitCurrent();
+        pressCommit.arm();
+    }
+
+    // Returns the bounding rect of the currently focused category cell,
+    // mapped to hub coordinates. Used to anchor the context menu.
+    function _currentCategoryCellRect(): rect {
+        const item = itemRepeater.itemAt(hub.currentIndex);
+        if (!item)
+            return Qt.rect(0, 0, 0, 0);
+        return item.mapToItem(hub, 0, 0, item.width, item.height);
+    }
+
     function handleAction(action: string): void {
+        hub._focusArmed = true;
         if (action === "left") {
             if (hub._navigate(-1))
                 hub._commitCurrent();
@@ -464,10 +593,20 @@ Item {
             // the UI doesn't advertise an unresponsive button.
             if (!Browse.Settings.current_hide_exit)
                 hub.requestQuit();
+        } else if (action === "context_menu") {
+            // Only open the context menu for real (non-placeholder) category
+            // tiles — placeholders have no category to hide or scrape.
+            if (hub.currentRow === 0 && hub.currentIndex < Browse.CategoriesModel.count)
+                hub.requestContextMenu(hub.currentIndex, hub._currentCategoryCellRect());
         }
     }
 
     // ── Visual tree ───────────────────────────────────────────────────────────
+
+    DeferredAction {
+        id: pressCommit
+        onDeferred: hub._emitActivate()
+    }
 
     Item {
         id: categoriesRow
@@ -544,18 +683,27 @@ Item {
                     isFocused: hub.currentRow === 0
                     name: cellItem.modelData.name
                     coverKey: cellItem.modelData.coverKey
+                    hidden: cellItem.modelData.hidden ?? false
+                    activatePulse: hub.activatePulse
+                    settling: !hub.visible
+                    focusReady: hub._focusReady
                 }
 
                 MouseArea {
                     anchors.fill: parent
                     hoverEnabled: true
-                    acceptedButtons: Qt.LeftButton
+                    acceptedButtons: Qt.LeftButton | Qt.RightButton
                     cursorShape: Qt.PointingHandCursor
 
                     onEntered: hub._focusCategory(cellItem.index)
-                    onClicked: {
+                    onClicked: mouse => {
                         hub._focusCategory(cellItem.index);
-                        hub._activateCurrent();
+                        if (mouse.button === Qt.RightButton) {
+                            if (cellItem.index < Browse.CategoriesModel.count)
+                                hub.requestContextMenu(cellItem.index, cellItem.mapToItem(hub, 0, 0, cellItem.width, cellItem.height));
+                        } else {
+                            hub._activateCurrent();
+                        }
                     }
                 }
             }
@@ -623,13 +771,16 @@ Item {
                     isFocused: hub.currentRow === 1
                     name: actionCellItem.modelData.text
                     coverKey: actionCellItem.modelData.coverKey
+                    activatePulse: hub.activatePulse
+                    settling: !hub.visible
+                    focusReady: hub._focusReady
                 }
 
                 MouseArea {
                     anchors.fill: parent
                     hoverEnabled: true
-                    acceptedButtons: Qt.LeftButton
-                    cursorShape: Qt.PointingHandCursor
+                    acceptedButtons: actionCellItem.modelData.enabled === false ? Qt.NoButton : Qt.LeftButton
+                    cursorShape: actionCellItem.modelData.enabled === false ? Qt.ArrowCursor : Qt.PointingHandCursor
 
                     onEntered: hub._focusAction(actionCellItem.index)
                     onClicked: {

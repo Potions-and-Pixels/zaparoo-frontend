@@ -1,7 +1,8 @@
-# Build directories
-build/
-build2/
-build-*/
+# Build directories (anchored to repo root — an unanchored `build-*/`
+# also swallows source dirs like rust/build-info/)
+/build/
+/build2/
+/build-*/
 cmake-build-*/
 artifacts/
 
@@ -46,11 +47,17 @@ CMakeUserPresets.json
 # Deployment output
 deploy/
 
+# Local MiSTer drive mirror used for ad-hoc runs
+.local_drv/
+
 # ARM32 cross-build output
 output/
 
 # pre-commit cache
 .cache/
+
+# Persistent caches mounted into the lint container (see justfile _lint)
+.docker-cache/
 
 # Qt Creator local user settings
 *.creator.user
@@ -71,3 +78,6 @@ rust/target/
 
 # cxx-qt 0.8 generates this with absolute paths for qmlls/qmllint
 rust/frontend/.qmlls.ini
+
+# Dev-run log that lands in the repo root (real log goes to ~/.local/share/zaparoo/logs/)
+/frontend.log

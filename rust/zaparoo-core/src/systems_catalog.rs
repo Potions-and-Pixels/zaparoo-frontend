@@ -17,13 +17,33 @@ pub struct CatalogData {
 }
 
 impl CatalogData {
+    /// Count of indexed (non-launchable) systems. A launchable is a
+    /// launch-only "virtual" system Core synthesizes without a media-db
+    /// index — it carries a non-empty `zap_script`. Since Core's
+    /// launchables feature, a device with no `media.db` still returns
+    /// these, so "is the catalog empty?" no longer answers "are there
+    /// indexed games?". This count does: it ignores launchables and only
+    /// tallies real, indexed systems. The first-run scan prompt gates on
+    /// it (see `Main.qml` → `_maybeOpenFirstRunIndex`).
+    pub fn indexed_count(&self) -> usize {
+        self.systems
+            .iter()
+            .filter(|s| s.zap_script.is_empty())
+            .count()
+    }
+
     pub fn systems_by_category(&self, category: &str) -> Vec<SystemInfo> {
         let is_other = category.eq_ignore_ascii_case("Other");
         self.systems
             .iter()
             .filter(|s| {
                 if is_other {
-                    s.category.is_empty()
+                    // "Other" is the catch-all bucket: it collects both
+                    // systems with no upstream category (synthesized into
+                    // "Other" by `derive_categories`) and systems Core
+                    // tags with a literal "Other" category, such as the
+                    // MiSTer launchables (`misterLaunchableCategoryOther`).
+                    s.category.is_empty() || s.category.eq_ignore_ascii_case("Other")
                 } else {
                     s.category.eq_ignore_ascii_case(category)
                 }
@@ -64,18 +84,68 @@ mod tests {
     }
 
     #[test]
-    fn systems_by_category_other_selects_uncategorised() {
+    fn systems_by_category_other_selects_uncategorised_and_literal_other() {
         let data = CatalogData {
             systems: vec![
                 sys("a", "A", ""),
                 sys("b", "B", "Consoles"),
                 sys("c", "C", ""),
+                // A launchable Core tags with a literal "Other" category.
+                sys("chess", "Chess", "Other"),
             ],
             categories: vec!["Consoles".into(), "Other".into()],
         };
         let other = data.systems_by_category("Other");
-        assert_eq!(other.len(), 2);
-        assert!(other.iter().all(|s| s.category.is_empty()));
+        assert_eq!(other.len(), 3);
+        assert!(other
+            .iter()
+            .all(|s| s.category.is_empty() || s.category.eq_ignore_ascii_case("Other")));
+        assert!(other.iter().any(|s| s.id == "chess"));
+    }
+
+    fn launchable(id: &str, name: &str, category: &str) -> SystemInfo {
+        SystemInfo {
+            id: id.into(),
+            name: name.into(),
+            category: category.into(),
+            zap_script: format!("zaparoo://launch/{id}"),
+            ..SystemInfo::default()
+        }
+    }
+
+    #[test]
+    fn indexed_count_ignores_launchables() {
+        let data = CatalogData {
+            systems: vec![
+                sys("snes", "Super Nintendo", "Consoles"),
+                sys("nes", "Nintendo", "Consoles"),
+                launchable("chess", "Chess", "Other"),
+                launchable("2048", "2048", "Other"),
+            ],
+            categories: vec!["Consoles".into(), "Other".into()],
+        };
+        assert_eq!(data.indexed_count(), 2);
+    }
+
+    #[test]
+    fn indexed_count_zero_when_only_launchables() {
+        let data = CatalogData {
+            systems: vec![
+                launchable("chess", "Chess", "Other"),
+                launchable("2048", "2048", "Other"),
+            ],
+            categories: vec!["Other".into()],
+        };
+        assert_eq!(data.indexed_count(), 0);
+    }
+
+    #[test]
+    fn indexed_count_zero_when_empty() {
+        let data = CatalogData {
+            systems: Vec::new(),
+            categories: Vec::new(),
+        };
+        assert_eq!(data.indexed_count(), 0);
     }
 
     #[test]

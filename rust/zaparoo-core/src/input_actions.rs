@@ -16,10 +16,11 @@ pub mod actions {
     pub const RIGHT: &str = "right";
     pub const ACCEPT: &str = "accept";
     pub const CANCEL: &str = "cancel";
-    pub const WRITE_CARD: &str = "write_card";
+    pub const CONTEXT_MENU: &str = "context_menu";
     pub const DETAILS: &str = "details";
     pub const PAGE_PREV: &str = "page_prev";
     pub const PAGE_NEXT: &str = "page_next";
+    pub const PAGE_MENU: &str = "page_menu";
     pub const QUIT: &str = "quit";
 }
 
@@ -65,9 +66,10 @@ pub fn default_bindings() -> HashMap<String, Vec<String>> {
         actions::CANCEL.into(),
         vec!["Escape".into(), "Backspace".into()],
     );
-    map.insert(actions::WRITE_CARD.into(), vec!["Tab".into()]);
+    map.insert(actions::CONTEXT_MENU.into(), vec!["Tab".into()]);
     map.insert(actions::PAGE_PREV.into(), vec!["PageUp".into()]);
     map.insert(actions::PAGE_NEXT.into(), vec!["PageDown".into()]);
+    map.insert(actions::PAGE_MENU.into(), vec!["Space".into()]);
     map
 }
 
@@ -139,7 +141,11 @@ mod tests {
         );
         assert_eq!(
             map.get(&qt_key_code("Tab").unwrap()).map(String::as_str),
-            Some(actions::WRITE_CARD),
+            Some(actions::CONTEXT_MENU),
+        );
+        assert_eq!(
+            map.get(&qt_key_code("Space").unwrap()).map(String::as_str),
+            Some(actions::PAGE_MENU),
         );
     }
 
