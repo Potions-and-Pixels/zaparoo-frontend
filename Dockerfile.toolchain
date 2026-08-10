@@ -94,7 +94,8 @@ RUN git clone --depth 1 --branch v${QT_VERSION} https://github.com/qt/qtbase.git
     git clone --depth 1 --branch v${QT_VERSION} https://github.com/qt/qtdeclarative.git && \
     git clone --depth 1 --branch v${QT_VERSION} https://github.com/qt/qttools.git && \
     git clone --depth 1 --branch v${QT_VERSION} https://github.com/qt/qtwebsockets.git && \
-    git clone --depth 1 --branch v${QT_VERSION} https://github.com/qt/qtsvg.git
+    git clone --depth 1 --branch v${QT_VERSION} https://github.com/qt/qtsvg.git && \
+    git clone --depth 1 --branch v${QT_VERSION} https://github.com/qt/qtimageformats.git
 
 # Stage 1: Qt6 host build (provides native tools: moc, rcc, qmllint, etc.)
 # PrintSupport is intentionally enabled here even though the frontend itself
@@ -167,6 +168,18 @@ RUN mkdir qtwebsockets-host-build && cd qtwebsockets-host-build && \
 # version so qt-configure-module's prefix probe finds matching host tools.
 RUN mkdir qtsvg-host-build && cd qtsvg-host-build && \
     /opt/qt6-host/bin/qt-configure-module ../qtsvg \
+    && cmake --build . --parallel $(nproc) \
+    && cmake --install .
+
+# qtimageformats (host build): provides a matching host module for the ARM32
+# cross-build below. Only WebP is enabled because Core can return WebP covers
+# and MiSTer does not need the other optional image codecs.
+RUN mkdir qtimageformats-host-build && cd qtimageformats-host-build && \
+    /opt/qt6-host/bin/qt-configure-module ../qtimageformats \
+        -feature-webp \
+        -no-feature-jasper \
+        -no-feature-mng \
+        -no-feature-tiff \
     && cmake --build . --parallel $(nproc) \
     && cmake --install .
 
@@ -248,6 +261,18 @@ RUN mkdir qtsvg-arm-build && cd qtsvg-arm-build && \
     && cmake --build . --parallel $(nproc) \
     && cmake --install .
 
+# qtimageformats (ARM32 cross-build): provides QWebpPlugin so Core-returned
+# WebP covers decode in the static MiSTer build. The plugin is statically
+# linked into the frontend via Qt6::QWebpPlugin in cmake/ZaparooRust.cmake.
+RUN mkdir qtimageformats-arm-build && cd qtimageformats-arm-build && \
+    /opt/qt6-arm32/bin/qt-configure-module ../qtimageformats \
+        -feature-webp \
+        -no-feature-jasper \
+        -no-feature-mng \
+        -no-feature-tiff \
+    && cmake --build . --parallel $(nproc) \
+    && cmake --install .
+
 # Rust toolchain for cross-compiling frontend-rs to ARM32.
 # Added AFTER the Qt builds so changes here don't invalidate the Qt layer cache.
 # Installs stable with minimal profile plus the ARM32 cross-compile target.
@@ -272,7 +297,7 @@ AR_armv7-unknown-linux-gnueabihf = "arm-none-linux-gnueabihf-ar"\n\
 
 # Pre-warm rustup with the exact toolchain pinned by the repo-root
 # rust-toolchain.toml
-# (1.96.0 + armv7-unknown-linux-gnueabihf target). Without this, the first
+# (1.97.0 + armv7-unknown-linux-gnueabihf target). Without this, the first
 # `cargo` invocation inside Dockerfile.arm32 has to download the pinned
 # toolchain on every build because rustup's override falls through to the
 # default `stable` channel installed above. The shipped toolchain.toml is
@@ -281,8 +306,8 @@ AR_armv7-unknown-linux-gnueabihf = "arm-none-linux-gnueabihf-ar"\n\
 # without this line, just deferred. Pre-installing here shifts that
 # work into the toolchain-image build (which is rare) instead of every
 # arm32 build (which is per-commit).
-RUN rustup toolchain install 1.96.0 --profile minimal \
-    && rustup target add --toolchain 1.96.0 armv7-unknown-linux-gnueabihf
+RUN rustup toolchain install 1.97.0 --profile minimal \
+    && rustup target add --toolchain 1.97.0 armv7-unknown-linux-gnueabihf
 
 # cargo-chef: caches the Rust dependency build as a Docker layer in
 # Dockerfile.arm32 (planner → cook → build), so per-commit ARM builds only
@@ -351,7 +376,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 #   - host Qt (qt-cmake, qmake, qmllint, qmlformat, lupdate, lrelease,
 #     LinguistTools cmake config)
 #   - ARM32 static Qt (.a libraries, plugins, lib/cmake configs)
-#   - cargo config + rustup toolchain caches (1.96.0 + armv7 target)
+#   - cargo config + rustup toolchain caches (1.97.0 + armv7 target)
 #   - the cmake toolchain file referenced from qt-cmake
 COPY --from=builder /opt/gcc-arm-10.2-2020.11-x86_64-arm-none-linux-gnueabihf \
                     /opt/gcc-arm-10.2-2020.11-x86_64-arm-none-linux-gnueabihf

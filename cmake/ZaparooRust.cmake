@@ -12,14 +12,19 @@ include_guard(GLOBAL)
 
 include(FetchContent)
 
-# When cross-compiling for MiSTer ARM32, tell Corrosion the Rust target triple explicitly.
-# Corrosion's mapping from CMAKE_SYSTEM_PROCESSOR="arm" is ambiguous; MiSTer is ARMv7 hard-float
-# (armv7-unknown-linux-gnueabihf).
-if(CMAKE_CROSSCOMPILING AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm")
-    if(NOT Rust_CARGO_TARGET)
+# Tell Corrosion the Rust target triple explicitly for cross-builds. CMake's
+# processor names are not enough for Rust target selection: MiSTer is ARMv7
+# hard-float, while ARM64 builds use aarch64 Linux.
+if(CMAKE_CROSSCOMPILING AND NOT Rust_CARGO_TARGET)
+    if(CMAKE_SYSTEM_PROCESSOR STREQUAL "arm")
         set(Rust_CARGO_TARGET
             "armv7-unknown-linux-gnueabihf"
             CACHE STRING "Cargo target triple for ARM32 cross-build" FORCE
+        )
+    elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+        set(Rust_CARGO_TARGET
+            "aarch64-unknown-linux-gnu"
+            CACHE STRING "Cargo target triple for arm64 cross-build" FORCE
         )
     endif()
 endif()
@@ -43,17 +48,29 @@ if(ZAPAROO_WITH_UPDATE)
 endif()
 
 # ── Environment variables for cxx_qt_build's build.rs ─────────────────────── QMAKE: cxx_qt_build
-# (via qt-build-utils) uses qmake to locate Qt headers and libraries. For ARM32 cross-builds the
-# system qmake points to x86_64 Qt; override with the cross-compiled qmake.
+# (via qt-build-utils) uses qmake to locate Qt headers and libraries. For static
+# cross-builds the system qmake points to x86_64 Qt; override with the target qmake.
 get_target_property(_rs_qt6_core_type Qt6::Core TYPE)
 if(_rs_qt6_core_type STREQUAL "STATIC_LIBRARY")
-    set(_rs_qmake "/opt/qt6-arm32/bin/qmake6")
+    if(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+        set(_rs_qmake "/opt/qt6-arm64/bin/qmake6")
+    else()
+        set(_rs_qmake "/opt/qt6-arm32/bin/qmake6")
+    endif()
+    if(NOT EXISTS "${_rs_qmake}")
+        message(
+            FATAL_ERROR
+                "Target qmake not found at ${_rs_qmake}. "
+                "Expected /opt/qt6-arm64/bin/qmake6 or /opt/qt6-arm32/bin/qmake6 "
+                "in static Qt cross-build images."
+        )
+    endif()
 else()
     find_program(_rs_qmake NAMES qmake6 qmake REQUIRED)
 endif()
 
 corrosion_set_env_vars(zaparoo_frontend_rs "QMAKE=${_rs_qmake}")
-if(_rs_qt6_core_type STREQUAL "STATIC_LIBRARY")
+if(_rs_qt6_core_type STREQUAL "STATIC_LIBRARY" AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm")
     corrosion_set_env_vars(zaparoo_frontend_rs "ZAPAROO_RUNTIME=mister")
 endif()
 if(ZAPAROO_DEV)
@@ -104,6 +121,9 @@ if(_rs_qt6_core_type STREQUAL "STATIC_LIBRARY")
         include("${_rs_config}" OPTIONAL)
     endforeach()
     include("${_rs_qt_prefix}/lib/cmake/Qt6Gui/Qt6QLinuxFbIntegrationPluginConfig.cmake" OPTIONAL)
+    include("${_rs_qt_prefix}/lib/cmake/Qt6Gui/Qt6QEglFSIntegrationPluginConfig.cmake" OPTIONAL)
+    include("${_rs_qt_prefix}/lib/cmake/Qt6Gui/Qt6QEglFSKmsGbmIntegrationPluginConfig.cmake" OPTIONAL)
+    include("${_rs_qt_prefix}/lib/cmake/Qt6Gui/Qt6QWebpPluginConfig.cmake" OPTIONAL)
     foreach(_rs_qml_plugin IN ITEMS qtquickcontrols2plugin qtquickcontrols2basicstyleplugin
                                     qtquickcontrols2implplugin qtquicktemplates2plugin quickwindow
     )
@@ -145,17 +165,33 @@ qt_import_qml_plugins(frontend)
 
 # For static Qt (ARM32): the Controls chain _init OBJECT targets carry the Q_IMPORT_QML_PLUGIN
 # static-init factories. Not propagated automatically from a cross-compiled Qt toolchain, so link
-# them explicitly. The QSvgPlugin entry registers the SVG image format with QImageReader so `Image {
-# source: "...svg" }` works in the static build (the shared desktop build picks the plugin up
-# automatically from the Qt install).
+# them explicitly. The image-format plugin entries register SVG/WebP with QImageReader so `Image`
+# sources and Core-returned WebP covers work in the static build (the shared desktop build picks
+# plugins up automatically from the Qt install).
 if(_rs_qt6_core_type STREQUAL "STATIC_LIBRARY")
     if(TARGET Qt6::QLinuxFbIntegrationPlugin)
         target_link_libraries(
             frontend PRIVATE Qt6::QLinuxFbIntegrationPlugin Qt6::QLinuxFbIntegrationPlugin_init
         )
     endif()
+    if(TARGET Qt6::QEglFSIntegrationPlugin)
+        target_link_libraries(
+            frontend PRIVATE Qt6::QEglFSIntegrationPlugin Qt6::QEglFSIntegrationPlugin_init
+        )
+        target_compile_definitions(frontend PRIVATE ZAPAROO_STATIC_EGLFS_PLUGIN)
+    endif()
+    if(TARGET Qt6::QEglFSKmsGbmIntegrationPlugin)
+        target_link_libraries(
+            frontend PRIVATE Qt6::QEglFSKmsGbmIntegrationPlugin
+                             Qt6::QEglFSKmsGbmIntegrationPlugin_init
+        )
+        target_compile_definitions(frontend PRIVATE ZAPAROO_STATIC_EGLFS_KMS_GBM_PLUGIN)
+    endif()
     if(TARGET Qt6::QSvgPlugin)
         target_link_libraries(frontend PRIVATE Qt6::QSvgPlugin Qt6::QSvgPlugin_init)
+    endif()
+    if(TARGET Qt6::QWebpPlugin)
+        target_link_libraries(frontend PRIVATE Qt6::QWebpPlugin Qt6::QWebpPlugin_init)
     endif()
     foreach(_rs_qml_plugin IN ITEMS qtquickcontrols2plugin qtquickcontrols2basicstyleplugin
                                     qtquickcontrols2implplugin qtquicktemplates2plugin quickwindow
@@ -198,6 +234,7 @@ qt_add_translations(
     "${CMAKE_SOURCE_DIR}/src/ui/translations/frontend_he.ts"
     "${CMAKE_SOURCE_DIR}/src/ui/translations/frontend_ar.ts"
     "${CMAKE_SOURCE_DIR}/src/ui/translations/frontend_hi.ts"
+    "${CMAKE_SOURCE_DIR}/src/ui/translations/frontend_fr.ts"
     RESOURCE_PREFIX
     "/i18n"
     IMMEDIATE_CALL

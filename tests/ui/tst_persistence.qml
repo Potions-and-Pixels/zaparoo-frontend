@@ -168,6 +168,16 @@ TestCase {
         compare(CategoryIds.canonicalize("Handhelds"), CategoryIds.handheldId);
     }
 
+    function test_category_display_names_map_core_ids(): void {
+        compare(CategoryIds.displayName(CategoryIds.arcadeId), "Arcade");
+        compare(CategoryIds.displayName(CategoryIds.computerId), "Computers");
+        compare(CategoryIds.displayName(CategoryIds.consoleId), "Consoles");
+        compare(CategoryIds.displayName(CategoryIds.handheldId), "Handhelds");
+        compare(CategoryIds.displayName(CategoryIds.otherId), "Other");
+        compare(CategoryIds.displayName("Computers"), "Computers");
+        compare(CategoryIds.displayName("Custom"), "Custom");
+    }
+
     function test_enter_on_optimistic_recents_writes_hub_state(): void {
         Browse.HubState.selected_row = 0;
         Browse.HubState.selected_action = "settings";
@@ -192,5 +202,19 @@ TestCase {
         main.handleKey(Qt.Key_Return);
         const sels = Browse.GamesState.selected_at_level;
         compare(sels[sels.length - 1], "persistence-probe-path", "Enter on an empty games grid must not overwrite GamesState selection");
+    }
+
+    // Restoring Hub focus before the catalog arrives (count == 0 in this
+    // harness) must not overwrite the saved category-row intent with the
+    // Resume action. Otherwise a process restart into a category — or an
+    // in-session catalog refresh — strands the user on Resume when they
+    // back out to the Hub.
+    function test_restore_with_empty_catalog_preserves_saved_category_row(): void {
+        Browse.HubState.category = "Console";
+        Browse.HubState.selected_row = 0;
+        Browse.HubState.selected_action = "";
+        main.hubScreen.restoreFromCategoriesReset(false);
+        compare(Browse.HubState.selected_row, 0, "An empty-catalog restore must not overwrite the saved category row with the Resume action");
+        compare(Browse.HubState.selected_action, "", "An empty-catalog restore must not persist a Resume fallback action");
     }
 }
