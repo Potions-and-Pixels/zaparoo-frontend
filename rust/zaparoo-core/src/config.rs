@@ -97,6 +97,28 @@ pub struct SettingsConfig {
     /// `None`/`false` keeps the existing behavior; the installer
     /// flips it on as part of the kiosk-lockdown `frontend.toml`.
     pub hide_exit: Option<bool>,
+    /// Auto-hide category tiles on the Hub that would show zero
+    /// systems on the SystemsScreen after the SystemsModel filter
+    /// (`hidden_system_ids` + `show_hidden`) is applied. `None` /
+    /// `Some(false)` preserves upstream behavior (every category Core
+    /// reports is rendered, even if empty for this cabinet).
+    /// `Some(true)` drops categories with no visible systems.
+    ///
+    /// Only takes effect when `show_hidden = false` — with
+    /// `show_hidden = true` the user has explicitly asked to see
+    /// hidden tiles, so an "all hidden" category is not effectively
+    /// empty from their POV.
+    ///
+    /// Rationale: Zaparoo Core's category list is derived from its
+    /// systemdefs — a category appears in `data.categories` if any
+    /// system (indexed OR launchable) belongs to it, regardless of
+    /// whether *this* cabinet has any launchers for those systems.
+    /// Kiosk deployments with a curated small game set surface tiles
+    /// like "Computer" / "Software" that go nowhere when clicked.
+    /// This flag makes the CategoriesModel apply the same filter
+    /// SystemsModel would use to render tiles, and drops categories
+    /// where the count is zero.
+    pub hide_empty_categories: Option<bool>,
 }
 
 #[allow(
@@ -223,6 +245,7 @@ struct RawSettings {
     hide_recents: Option<bool>,
     hide_resume: Option<bool>,
     hide_exit: Option<bool>,
+    hide_empty_categories: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -365,6 +388,7 @@ fn settings_config_from_raw(raw: RawSettings) -> SettingsConfig {
         hide_recents: raw.hide_recents,
         hide_resume: raw.hide_resume,
         hide_exit: raw.hide_exit,
+        hide_empty_categories: raw.hide_empty_categories,
     }
 }
 
@@ -794,6 +818,30 @@ mod tests {
         let f = write_tmp("[settings]\nregion = \"jp\"\n");
         let cfg = load_config(f.path());
         assert_eq!(cfg.settings.region.as_deref(), Some("jp"));
+    }
+
+    #[test]
+    fn hide_empty_categories_round_trips() {
+        let f = write_tmp("[settings]\nhide_empty_categories = true\n");
+        let cfg = load_config(f.path());
+        assert_eq!(cfg.settings.hide_empty_categories, Some(true));
+    }
+
+    #[test]
+    fn hide_empty_categories_absent_is_none() {
+        let f = write_tmp("[settings]\nbutton_layout = \"b\"\n");
+        let cfg = load_config(f.path());
+        assert_eq!(cfg.settings.hide_empty_categories, None);
+    }
+
+    #[test]
+    fn hide_empty_categories_explicit_false_round_trips() {
+        // Distinguish an explicit opt-out from "unset": both behave the
+        // same at read time (`unwrap_or(false)`), but preserving Some(false)
+        // matters if we ever expose a settings-mirror write path.
+        let f = write_tmp("[settings]\nhide_empty_categories = false\n");
+        let cfg = load_config(f.path());
+        assert_eq!(cfg.settings.hide_empty_categories, Some(false));
     }
 
     #[test]

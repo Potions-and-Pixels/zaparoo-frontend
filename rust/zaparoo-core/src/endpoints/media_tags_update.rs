@@ -6,8 +6,8 @@
 
 use crate::client::{Client, ClientError};
 use crate::endpoints::{
-    media_browse::MediaBrowseEndpoint, media_favorites::MediaFavoritesEndpoint,
-    media_search::MediaSearchEndpoint,
+    media_browse::MediaBrowseEndpoint, media_categories::MediaCategoriesEndpoint,
+    media_favorites::MediaFavoritesEndpoint, media_search::MediaSearchEndpoint,
 };
 use crate::media_types::{MediaTagsUpdateParams, MediaTagsUpdateResult};
 use crate::store::{Endpoint, Mutation, Tag};
@@ -31,6 +31,7 @@ impl Mutation for MediaTagsUpdateMutation {
     fn invalidates(_args: &Self::Args, _result: &Self::Output) -> Vec<Tag> {
         vec![
             Tag::any(MediaBrowseEndpoint::NAME),
+            Tag::any(MediaCategoriesEndpoint::NAME),
             Tag::any(MediaFavoritesEndpoint::NAME),
             Tag::any(MediaSearchEndpoint::NAME),
         ]

@@ -220,6 +220,7 @@ pub struct SettingsRust {
     current_hide_recents: bool,
     current_hide_resume: bool,
     current_hide_exit: bool,
+    current_hide_empty_categories: bool,
 }
 
 #[cxx_qt::bridge]
@@ -269,6 +270,7 @@ pub mod ffi {
         #[qproperty(bool, current_hide_recents, READ, CONSTANT)]
         #[qproperty(bool, current_hide_resume, READ, CONSTANT)]
         #[qproperty(bool, current_hide_exit, READ, CONSTANT)]
+        #[qproperty(bool, current_hide_empty_categories, READ, CONSTANT)]
         type Settings = super::SettingsRust;
 
         #[qinvokable]
@@ -386,6 +388,8 @@ impl Initialize for ffi::Settings {
             config.settings.hide_recents.unwrap_or(false);
         self.as_mut().rust_mut().current_hide_resume = config.settings.hide_resume.unwrap_or(false);
         self.as_mut().rust_mut().current_hide_exit = config.settings.hide_exit.unwrap_or(false);
+        self.as_mut().rust_mut().current_hide_empty_categories =
+            config.settings.hide_empty_categories.unwrap_or(false);
         // Keep the startup trace as the LAST line of initialize() so
         // its duration measurement covers every field init above it.
         crate::startup_trace(format!(

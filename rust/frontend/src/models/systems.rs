@@ -3,20 +3,23 @@
 // SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0
 
 use crate::models::{
-    global_handle, global_store, with_hidden_browse_prefs_read, with_persist_read,
+    global_handle, global_store, hide_empty_categories_flag, with_hidden_browse_prefs_read,
+    with_persist_read,
 };
 use crate::system_region::Region;
 use crate::{image_overrides, system_logos, system_name_overrides, system_names, system_region};
-use cxx_qt::{CxxQtType, Threading};
+use cxx_qt::{CxxQtType, Initialize, Threading};
 use cxx_qt_lib::{
     QByteArray, QHash, QHashPair_i32_QByteArray, QModelIndex, QString, QStringList, QVariant,
 };
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tracing::{debug, trace, warn};
 use zaparoo_core::endpoints::catalog::CatalogEndpoint;
+use zaparoo_core::endpoints::media_categories::{MediaPresence, MediaPresenceEndpoint};
 use zaparoo_core::endpoints::readers_write::ReadersWriteMutation;
 use zaparoo_core::endpoints::run::RunMutation;
 use zaparoo_core::media_types::{ReadersWriteParams, RunParams};
@@ -86,6 +89,14 @@ pub struct SystemsModelRust {
     card_write_pending: bool,
     card_write_error: QString,
     card_write_seq: Arc<AtomicU64>,
+    /// System IDs that have at least one indexed media entry on THIS
+    /// cabinet, from `MediaPresenceEndpoint`. Fork-only:
+    /// `hide_empty_categories` uses this to drop system tiles that
+    /// would open an empty GamesScreen — same posture as the Hub-level
+    /// filter in `CategoriesModel`. Case-preserved as Core reports;
+    /// `rows_for_category` compares case-sensitively against
+    /// `SystemInfo.id` (matches the artwork qrc lookup contract).
+    media_system_ids: HashSet<String>,
     // Last-known-good catalog. Updated by `apply_state` on every
     // `Ready`; never cleared on `Loading`/`Errored`. Lets
     // `set_category` keep populating rows during a transient refetch
@@ -220,12 +231,60 @@ pub mod ffi {
     impl cxx_qt::Initialize for SystemsModel {}
 }
 
-crate::bind_to_endpoint! {
-    for ffi::SystemsModel,
-    endpoint = CatalogEndpoint,
-    args = (),
-    select = project,
-    apply = apply_state,
+/// Hand-written `Initialize` — replaces the `bind_to_endpoint!` macro
+/// so this model can subscribe to TWO endpoints (Catalog + fork-only
+/// MediaPresence) instead of the macro's one. Same sync-seed + Qt-thread
+/// dispatch contract; see `bind.rs` for the invariants.
+///
+/// Two separate tokio watchers so each endpoint's changes are applied
+/// independently: a catalog update won't stall waiting for MediaPresence
+/// and vice versa. Both apply paths eventually re-run the category
+/// filter so the visible-systems list reflects the freshest of both
+/// streams (`apply_media_state` calls the same `reproject_inner`
+/// logic that a hidden-set change would).
+impl Initialize for ffi::SystemsModel {
+    fn initialize(mut self: Pin<&mut Self>) {
+        let started = std::time::Instant::now();
+        crate::startup_trace("rust:model SystemsModel init start");
+
+        let mut rx_catalog = global_store()
+            .subscribe::<CatalogEndpoint>(())
+            .subscribe();
+        let projected = project(&*rx_catalog.borrow_and_update());
+        apply_state(self.as_mut(), projected);
+
+        let mut rx_media = global_store()
+            .subscribe::<MediaPresenceEndpoint>(())
+            .subscribe();
+        let media_snap = project_media(&*rx_media.borrow_and_update());
+        apply_media_state(self.as_mut(), media_snap);
+
+        crate::startup_trace(format!(
+            "rust:model SystemsModel init seeded dur_ms={}",
+            started.elapsed().as_millis()
+        ));
+
+        let qt_thread_catalog = self.qt_thread();
+        let qt_thread_media = self.qt_thread();
+
+        global_handle().spawn(async move {
+            while rx_catalog.changed().await.is_ok() {
+                let projected = project(&*rx_catalog.borrow_and_update());
+                let _ = qt_thread_catalog.queue(move |m| apply_state(m, projected));
+            }
+        });
+        global_handle().spawn(async move {
+            while rx_media.changed().await.is_ok() {
+                let snap = project_media(&*rx_media.borrow_and_update());
+                let _ = qt_thread_media.queue(move |m| apply_media_state(m, snap));
+            }
+        });
+
+        crate::startup_trace(format!(
+            "rust:model SystemsModel init end dur_ms={}",
+            started.elapsed().as_millis()
+        ));
+    }
 }
 
 /// Pull the two pieces this model cares about out of the unified
@@ -236,6 +295,19 @@ fn project(status: &ResourceStatus<CatalogData>) -> (Option<CatalogData>, String
         ResourceStatus::Ready(data) => (Some(data.clone()), String::new()),
         ResourceStatus::Errored { message, .. } => (None, message.clone()),
         ResourceStatus::Idle | ResourceStatus::Loading => (None, String::new()),
+    }
+}
+
+/// Pull the `system_ids`-with-media set out of `MediaPresenceEndpoint`'s
+/// resource status (we only need `.system_ids` here — `CategoriesModel`
+/// consumes `.categories` from the same shared endpoint). Errored /
+/// Loading collapse to `None` so a transient backend failure doesn't
+/// silently drop every system tile — `apply_media_state` skips the
+/// update in that case, leaving the last known set in place.
+fn project_media(status: &ResourceStatus<MediaPresence>) -> Option<HashSet<String>> {
+    match status {
+        ResourceStatus::Ready(presence) => Some(presence.system_ids.clone()),
+        _ => None,
     }
 }
 
@@ -266,6 +338,16 @@ fn position_of_system_id(systems: &[SystemInfo], needle: &str) -> i32 {
 /// When true, they are included with `hidden = true` so the tile renders
 /// dimmed with a "Hidden" badge.
 ///
+/// `media_system_ids` is the set of system IDs that have at least one
+/// indexed media entry on THIS cabinet (from `MediaPresenceEndpoint`).
+/// When `hide_empty` is true AND `show_hidden` is false, systems NOT
+/// in that set are dropped entirely — same posture as the Hub-level
+/// `hide_empty_categories` filter in `CategoriesModel`. If the set is
+/// empty (fetch hasn't resolved yet), the filter is a no-op so the
+/// grid doesn't briefly flash empty. Launch-only systems (`zap_script`
+/// non-empty) are always exempt from the emptiness check — they have
+/// nothing indexable but launch immediately on click.
+///
 /// `region` drives both the localized display name (via `system_names`) and
 /// the logo artwork stem (via `system_logos`). Resolve it once before calling
 /// this function and pass it in so the caller controls the snapshot.
@@ -274,14 +356,27 @@ fn rows_for_category(
     cat: &str,
     hidden_ids: &[String],
     show_hidden: bool,
+    media_system_ids: &HashSet<String>,
+    hide_empty: bool,
     region: Region,
 ) -> Vec<SystemInfo> {
+    let apply_empty_filter = hide_empty && !show_hidden && !media_system_ids.is_empty();
     catalog.map_or_else(Vec::new, |c| {
         c.systems_by_category(cat)
             .into_iter()
             .filter_map(|s| {
                 let is_hidden = hidden_ids.contains(&s.id);
                 if is_hidden && !show_hidden {
+                    return None;
+                }
+                // Media-presence filter: only apply to indexable systems.
+                // Launch-only virtual systems carry a non-empty
+                // `zap_script`, have no media, and should render so the
+                // user can still trigger them.
+                if apply_empty_filter
+                    && s.zap_script.trim().is_empty()
+                    && !media_system_ids.contains(&s.id)
+                {
                     return None;
                 }
                 // Display name priority: user `[system_names]` override, then
@@ -327,7 +422,17 @@ fn apply_state(mut model: Pin<&mut ffi::SystemsModel>, (data, err): (Option<Cata
             let hidden_ids = with_hidden_browse_prefs_read(|p| p.hidden_system_ids.clone());
             let show_hidden = with_persist_read(|s| s.settings.show_hidden);
             let region = system_region::current_region();
-            let rows = rows_for_category(Some(&data), &cat, &hidden_ids, show_hidden, region);
+            let media_system_ids = model.rust().media_system_ids.clone();
+            let hide_empty = hide_empty_categories_flag();
+            let rows = rows_for_category(
+                Some(&data),
+                &cat,
+                &hidden_ids,
+                show_hidden,
+                &media_system_ids,
+                hide_empty,
+                region,
+            );
             let count = rows.len() as i32;
             let ids: Vec<&str> = rows.iter().map(|s| s.id.as_str()).collect();
             debug!(
@@ -364,6 +469,33 @@ fn apply_state(mut model: Pin<&mut ffi::SystemsModel>, (data, err): (Option<Cata
     // `(None, "")`, so leave `loading` alone there.
     if !err.is_empty() && model.loading {
         model.as_mut().set_loading(false);
+    }
+}
+
+/// Companion to `apply_state` — handles the `MediaPresenceEndpoint`
+/// side. `None` (fetch still Loading / Errored) is a no-op so the last
+/// known good set survives while a refetch is in-flight; on success,
+/// stashes the set and re-runs the current category filter so the
+/// visible tiles pick up the new presence data.
+fn apply_media_state(
+    mut model: Pin<&mut ffi::SystemsModel>,
+    snap: Option<HashSet<String>>,
+) {
+    let Some(new) = snap else { return };
+    if new == model.rust().media_system_ids {
+        return;
+    }
+    debug!(
+        count = new.len(),
+        "systems: media_system_ids update"
+    );
+    model.as_mut().rust_mut().media_system_ids = new;
+    // Re-run the current category filter with the new presence set.
+    // No-op when `current_category` is empty (initial boot, before any
+    // Hub tile is clicked), so the presence set can update silently
+    // until the user actually navigates in.
+    if !model.rust().current_category.to_string().is_empty() {
+        model.as_mut().reproject();
     }
 }
 
@@ -478,13 +610,23 @@ impl ffi::SystemsModel {
         let catalog = self.rust().last_ready.clone();
         let hidden_ids = with_hidden_browse_prefs_read(|p| p.hidden_system_ids.clone());
         let show_hidden = with_persist_read(|s| s.settings.show_hidden);
+        let media_system_ids = self.rust().media_system_ids.clone();
+        let hide_empty = hide_empty_categories_flag();
         // Resolve region on the Qt thread so the async worker captures a
         // snapshot rather than reading global state from a tokio thread.
         let region = system_region::current_region();
 
         let qt_thread = self.qt_thread();
         let handle = global_handle().spawn(async move {
-            let rows = rows_for_category(catalog.as_ref(), &cat, &hidden_ids, show_hidden, region);
+            let rows = rows_for_category(
+                catalog.as_ref(),
+                &cat,
+                &hidden_ids,
+                show_hidden,
+                &media_system_ids,
+                hide_empty,
+                region,
+            );
             let count = rows.len() as i32;
             let cat_for_log = cat.clone();
             let ids_for_log: Vec<String> = rows.iter().map(|s| s.id.clone()).collect();
@@ -681,13 +823,23 @@ impl ffi::SystemsModel {
         }
         let hidden_ids = with_hidden_browse_prefs_read(|p| p.hidden_system_ids.clone());
         let show_hidden = with_persist_read(|s| s.settings.show_hidden);
+        let media_system_ids = self.rust().media_system_ids.clone();
+        let hide_empty = hide_empty_categories_flag();
         let region = system_region::current_region();
         // Bump seq to invalidate any in-flight set_category workers; their
         // stale result would undo the reproject if they ran after us.
         let seq = self.rust().seq.clone();
         seq.fetch_add(1, Ordering::SeqCst);
         let catalog = self.rust().last_ready.clone();
-        let rows = rows_for_category(catalog.as_ref(), &cat, &hidden_ids, show_hidden, region);
+        let rows = rows_for_category(
+            catalog.as_ref(),
+            &cat,
+            &hidden_ids,
+            show_hidden,
+            &media_system_ids,
+            hide_empty,
+            region,
+        );
         let count = rows.len() as i32;
         debug!(category = %cat, count, "systems: reproject");
         self.as_mut().begin_reset_model();
@@ -772,6 +924,7 @@ mod tests {
         position_of_system_id, project, rows_for_category, SystemInfo,
     };
     use crate::system_region::Region;
+    use std::collections::HashSet;
     use zaparoo_core::media_types::SystemInfo as MediaSystemInfo;
     use zaparoo_core::remote_resource::ResourceStatus;
     use zaparoo_core::systems_catalog::CatalogData;
@@ -783,6 +936,32 @@ mod tests {
             category: category.into(),
             ..MediaSystemInfo::default()
         }
+    }
+
+    // Existing tests predate the media-presence filter; keep passing
+    // the pre-flag args unchanged (empty presence set + hide_empty=false)
+    // by routing through this shorthand so the older assertions stay
+    // untouched. New tests below exercise the media-presence path directly.
+    fn rfc(
+        catalog: Option<&CatalogData>,
+        cat: &str,
+        hidden_ids: &[String],
+        show_hidden: bool,
+        region: Region,
+    ) -> Vec<SystemInfo> {
+        rows_for_category(
+            catalog,
+            cat,
+            hidden_ids,
+            show_hidden,
+            &HashSet::new(),
+            false,
+            region,
+        )
+    }
+
+    fn media_ids(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|s| (*s).to_string()).collect()
     }
 
     fn catalog_with(systems: Vec<MediaSystemInfo>) -> CatalogData {
@@ -839,7 +1018,7 @@ mod tests {
 
     #[test]
     fn rows_for_category_none_returns_empty() {
-        let rows = rows_for_category(None, "Arcade", &[], false, Region::Us);
+        let rows = rfc(None, "Arcade", &[], false, Region::Us);
         assert!(rows.is_empty());
     }
 
@@ -850,7 +1029,7 @@ mod tests {
             sys("snk", "SNK Heroes", "Arcade"),
             sys("zelda", "Zelda", "Consoles"),
         ]);
-        let rows = rows_for_category(Some(&catalog), "Consoles", &[], false, Region::Us);
+        let rows = rfc(Some(&catalog), "Consoles", &[], false, Region::Us);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].id, "smb");
         assert_eq!(rows[0].name, "Super Mario Bros");
@@ -865,7 +1044,7 @@ mod tests {
         nes.release_date = Some("1983".into());
         nes.manufacturer = Some("Nintendo".into());
         let catalog = catalog_with(vec![nes]);
-        let rows = rows_for_category(Some(&catalog), "Consoles", &[], false, Region::Us);
+        let rows = rfc(Some(&catalog), "Consoles", &[], false, Region::Us);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].release_date.as_deref(), Some("1983"));
         assert_eq!(rows[0].manufacturer.as_deref(), Some("Nintendo"));
@@ -878,7 +1057,7 @@ mod tests {
             sys("snes", "SNES", "Consoles"),
         ]);
         let hidden = vec!["snes".to_string()];
-        let rows = rows_for_category(Some(&catalog), "Consoles", &hidden, false, Region::Us);
+        let rows = rfc(Some(&catalog), "Consoles", &hidden, false, Region::Us);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, "nes");
     }
@@ -890,7 +1069,7 @@ mod tests {
             sys("snes", "SNES", "Consoles"),
         ]);
         let hidden = vec!["snes".to_string()];
-        let rows = rows_for_category(Some(&catalog), "Consoles", &hidden, true, Region::Us);
+        let rows = rfc(Some(&catalog), "Consoles", &hidden, true, Region::Us);
         assert_eq!(rows.len(), 2);
         assert!(!rows[0].hidden);
         assert!(rows[1].hidden);
@@ -900,8 +1079,8 @@ mod tests {
     #[test]
     fn rows_for_category_empty_hidden_ids_no_change() {
         let catalog = catalog_with(vec![sys("nes", "NES", "Consoles")]);
-        let rows_off = rows_for_category(Some(&catalog), "Consoles", &[], false, Region::Us);
-        let rows_on = rows_for_category(Some(&catalog), "Consoles", &[], true, Region::Us);
+        let rows_off = rfc(Some(&catalog), "Consoles", &[], false, Region::Us);
+        let rows_on = rfc(Some(&catalog), "Consoles", &[], true, Region::Us);
         assert_eq!(rows_off.len(), 1);
         assert_eq!(rows_on.len(), 1);
         assert!(!rows_off[0].hidden);
@@ -922,7 +1101,141 @@ mod tests {
     #[test]
     fn rows_for_category_unknown_returns_empty() {
         let catalog = catalog_with(vec![sys("smb", "SMB", "Consoles")]);
-        let rows = rows_for_category(Some(&catalog), "DoesNotExist", &[], false, Region::Us);
+        let rows = rfc(Some(&catalog), "DoesNotExist", &[], false, Region::Us);
+        assert!(rows.is_empty());
+    }
+
+    // ----- media-presence filter (hide_empty_categories one level down) -----
+
+    #[test]
+    fn rows_for_category_drops_systems_not_in_media_presence_when_hide_empty() {
+        // The dev-zap-63 SystemsScreen scenario: Core reports 4 Console
+        // systems Core knows about, but only 2 actually have media on
+        // this cabinet — Genesis + SNES. hide_empty must drop NES + N64.
+        let catalog = catalog_with(vec![
+            sys("Genesis", "Genesis", "Console"),
+            sys("SNES", "SNES", "Console"),
+            sys("NES", "NES", "Console"),
+            sys("N64", "N64", "Console"),
+        ]);
+        let media = media_ids(&["Genesis", "SNES"]);
+        let rows = rows_for_category(
+            Some(&catalog),
+            "Console",
+            &[],
+            false, // show_hidden
+            &media,
+            true, // hide_empty
+            Region::Us,
+        );
+        let ids: Vec<String> = rows.iter().map(|s| s.id.clone()).collect();
+        assert_eq!(ids, vec!["Genesis", "SNES"]);
+    }
+
+    #[test]
+    fn rows_for_category_keeps_all_systems_when_hide_empty_false() {
+        // Default posture — upstream behavior — unchanged.
+        let catalog = catalog_with(vec![
+            sys("Genesis", "Genesis", "Console"),
+            sys("NES", "NES", "Console"),
+        ]);
+        let media = media_ids(&["Genesis"]);
+        let rows = rows_for_category(
+            Some(&catalog),
+            "Console",
+            &[],
+            false,
+            &media,
+            false, // hide_empty
+            Region::Us,
+        );
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn rows_for_category_keeps_all_systems_when_show_hidden_true_even_with_hide_empty() {
+        // Same carve-out as CategoriesModel: show_hidden means the user
+        // asked to see everything, so hide_empty is a no-op.
+        let catalog = catalog_with(vec![
+            sys("Genesis", "Genesis", "Console"),
+            sys("NES", "NES", "Console"),
+        ]);
+        let media = media_ids(&["Genesis"]);
+        let rows = rows_for_category(
+            Some(&catalog),
+            "Console",
+            &[],
+            true, // show_hidden
+            &media,
+            true, // hide_empty
+            Region::Us,
+        );
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn rows_for_category_empty_media_presence_is_no_op_when_hide_empty() {
+        // Startup race: MediaPresenceEndpoint hasn't resolved yet.
+        // Dropping every system would flash an empty grid until the
+        // fetch lands. Skip the filter entirely when the set is empty.
+        let catalog = catalog_with(vec![
+            sys("Genesis", "Genesis", "Console"),
+            sys("NES", "NES", "Console"),
+        ]);
+        let rows = rows_for_category(
+            Some(&catalog),
+            "Console",
+            &[],
+            false,
+            &HashSet::new(),
+            true, // hide_empty
+            Region::Us,
+        );
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn rows_for_category_hide_empty_never_drops_launch_only_systems() {
+        // Launch-only systems (zap_script non-empty) have no indexed
+        // media by design; they launch immediately on click. The filter
+        // must exempt them so the "Chess"/"2048"-style launchables
+        // don't disappear from the Hub under kiosk.
+        let mut chess = sys("chess", "Chess", "Other");
+        chess.zap_script = "zaparoo://launch/chess".into();
+        let catalog = catalog_with(vec![chess, sys("SNES", "SNES", "Other")]);
+        let media = media_ids(&["SNES"]);
+        let rows = rows_for_category(
+            Some(&catalog),
+            "Other",
+            &[],
+            false,
+            &media,
+            true, // hide_empty
+            Region::Us,
+        );
+        let ids: Vec<String> = rows.iter().map(|s| s.id.clone()).collect();
+        assert_eq!(ids, vec!["chess", "SNES"]);
+    }
+
+    #[test]
+    fn rows_for_category_hide_empty_and_user_hidden_stack() {
+        // "Genesis" has media but is user-hidden; "NES" has no media.
+        // With hide_empty + show_hidden=false, both drop.
+        let catalog = catalog_with(vec![
+            sys("Genesis", "Genesis", "Console"),
+            sys("NES", "NES", "Console"),
+        ]);
+        let media = media_ids(&["Genesis"]);
+        let hidden = vec!["Genesis".to_string()];
+        let rows = rows_for_category(
+            Some(&catalog),
+            "Console",
+            &hidden,
+            false,
+            &media,
+            true,
+            Region::Us,
+        );
         assert!(rows.is_empty());
     }
 
@@ -1017,7 +1330,7 @@ mod tests {
         let mut chess = sys("chess", "Chess", "");
         chess.zap_script = "zaparoo://abc/Chess".into();
         let catalog = catalog_with(vec![chess]);
-        let rows = rows_for_category(Some(&catalog), "Other", &[], false, Region::Us);
+        let rows = rfc(Some(&catalog), "Other", &[], false, Region::Us);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].zap_script, "zaparoo://abc/Chess");
         assert!(is_launchable(&rows[0]));

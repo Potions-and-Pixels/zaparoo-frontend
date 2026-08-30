@@ -9,6 +9,7 @@
 pub mod catalog;
 pub mod launchers;
 pub mod media_browse;
+pub mod media_categories;
 pub mod media_favorites;
 pub mod media_history;
 pub mod media_search;

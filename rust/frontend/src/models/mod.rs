@@ -64,9 +64,28 @@ use std::time::Duration;
 use tokio::runtime::{Handle, Runtime};
 use tracing::{error, warn};
 use zaparoo_core::{
-    config::save_hidden_browse_prefs, persist::PersistedState, platform_paths::config_file_path,
+    config::{load_config, save_hidden_browse_prefs},
+    persist::PersistedState,
+    platform_paths::config_file_path,
     store::Store,
 };
+
+/// Fork-only kiosk flag `[settings] hide_empty_categories` in
+/// `frontend.toml`. Loaded once from disk on first access and cached
+/// forever — the flag is documented as CONSTANT (installer-set at
+/// provision time, not runtime-mutable), matching `SettingsRust`'s
+/// treatment of the other `hide_*` flags. Both `CategoriesModel` and
+/// `SystemsModel` read this to gate their media-presence filter.
+static HIDE_EMPTY_CATEGORIES: OnceLock<bool> = OnceLock::new();
+
+pub fn hide_empty_categories_flag() -> bool {
+    *HIDE_EMPTY_CATEGORIES.get_or_init(|| {
+        load_config(&config_file_path())
+            .settings
+            .hide_empty_categories
+            .unwrap_or(false)
+    })
+}
 
 // `RUNTIME_OWNER` holds the actual `Runtime` and is the only thing that
 // can call `shutdown_timeout`. `HANDLE` is what callers spawn through —
