@@ -6,18 +6,20 @@ pragma ComponentBehavior: Bound
 import QtQuick
 import Zaparoo.Theme
 
-// `entries` is a `var` array of plain JS objects (`{ id, label }`). The
-// AOT compiler can't infer the shape of `var`, so reads of
-// `entries.length` and `modelData.label` fall back to the JS interpreter
-// and trip the compiler category. Suppress file-wide.
+// `entries` is a `var` array of plain JS objects (`{ id, label }`); see
+// PickerList.qml for why the compiler category is suppressed file-wide.
 // qmllint disable compiler
 
 // Software-rendering safe centered list-picker modal. Wraps the shared
 // `Modal` shell in `kind: "shell"` so it inherits the standard chrome
-// (scrim, panel fill, corner radius, title) used by every other modal.
+// (scrim, panel fill, corner radius, title) used by every other modal, and
+// hosts a `PickerList` for the rows themselves.
 //
-// Use this for "pick one of these" prompts that are not anchored to a
-// tile. Anchored selectors should use `ContextMenu.qml` instead.
+// Use this for "pick one of these" prompts opened from a screen and not
+// anchored to a tile. Anchored selectors should use `ContextMenu.qml`; a
+// modal that needs a choice on one of its own rows hosts `PickerList` on a
+// page of its own panel instead of opening this on top of itself (see
+// docs/style.md -> "Modal depth").
 //
 // Pure presentation. Routing - mounting and dispatching `handleAction` -
 // belongs to whichever consumer plumbs the modal into `Main.qml`'s modal
@@ -28,124 +30,72 @@ Item {
 
     property bool open: false
     property string title: ""
-    // Each entry is `{ id: string, label: string }`. `id` is the dispatch
-    // key emitted by `accepted`; `label` is the localized display text.
-    // Position-keyed dispatch is a footgun - dynamic entry sets silently
-    // re-shuffle the index/action map.
-    property var entries: []
-    // Optional. When `open` flips true, sets `currentIndex` to the entry
-    // whose id matches. Empty string or no match falls back to 0.
-    property string initialId: ""
-    property int currentIndex: 0
-
-    // Push-in scale for the activated row, mirroring the tile push-in.
-    property real _pressScale: 1.0
-    property string _pendingId: ""
+    property alias entries: list.entries
+    property alias initialId: list.initialId
+    property alias currentIndex: list.currentIndex
+    property alias locked: list.locked
 
     signal accepted(string id)
     signal closeRequested
 
-    readonly property int _rowHeight: Sizing.pctH(7)
-    readonly property int _rowSpacing: Sizing.pctH(1)
-    // Cap the picker viewport at a portion of the screen height so it
-    // never grows past what the modal shell can reasonably contain.
-    // Visible row count falls out of this - `floor((max + spacing) /
-    // (rowHeight + spacing))` gives the row count whose viewport fits
-    // inside `_maxViewportHeight`, with at least 1 row.
-    readonly property int _maxViewportHeight: Sizing.pctH(60)
-    readonly property int _visibleRows: Math.max(1, Math.min(entries.length, Math.floor((_maxViewportHeight + _rowSpacing) / (_rowHeight + _rowSpacing))))
-    readonly property int _viewportHeight: _visibleRows * _rowHeight + Math.max(0, _visibleRows - 1) * _rowSpacing
-    readonly property int _contentHeight: Math.max(1, entries.length) * _rowHeight + Math.max(0, entries.length - 1) * _rowSpacing
-    readonly property bool _scrollable: entries.length > _visibleRows
-    readonly property int _scrollArrowSize: Sizing.pctH(3)
-    readonly property int _scrollArrowGap: Sizing.pctH(0.5)
-    readonly property int _scrollIndicatorBand: _scrollable ? _scrollArrowSize + _scrollArrowGap : 0
-    readonly property int _viewportSlotHeight: _viewportHeight + 2 * _scrollIndicatorBand
-    readonly property bool _hasContentAbove: viewport.contentY > 1
-    readonly property bool _hasContentBelow: viewport.contentY + viewport.height < viewport.contentHeight - 1
+    // List geometry, forwarded so consumers (and the sizing tests) keep
+    // reading it off the modal.
+    readonly property int _rowHeight: list._rowHeight
+    readonly property int _rowSpacing: list._rowSpacing
+    readonly property int _maxViewportHeight: list._maxViewportHeight
+    readonly property int _visibleRows: list._visibleRows
+    readonly property int _viewportHeight: list._viewportHeight
+    readonly property int _contentHeight: list._contentHeight
+    readonly property int _rowHorizontalPadding: list._rowHorizontalPadding
+    readonly property int _widestEntryLabelWidth: list._widestEntryLabelWidth
+    readonly property bool _hasSwatchPreview: list._hasSwatchPreview
+    readonly property int _swatchBandWidth: list._swatchBandWidth
+
+    // Content-driven panel width: the list's own measured content, the
+    // title, the shell's horizontal margins, and breathing room -- see
+    // docs/style.md -> "Content-driven modal width".
+    readonly property int _contentHorizontalMargin: Sizing.pctW(4)
+    readonly property int _titleWidth: modal.title !== "" ? modal._measureLabelWidth(_titleLabelMetrics, modal.title, Sizing.fontTitle, Theme.fontUi, Font.Normal) : 0
+    // Breathing room between the widest row's text box and the width the row
+    // actually has, deliberately generous rather than a pixel-exact fit.
+    //
+    // `_widestEntryLabelWidth` and the row's own `_textWidth` apply the
+    // *same* `Sizing.stroke(2)` hinting allowance, so they cancel: without a
+    // term here the widest entry is handed exactly its measured width and not
+    // one pixel more, and `Text` elides it wherever the hinted integer glyph
+    // advances paint wider than `advanceWidth()`'s fractional, unhinted total.
+    // Chasing that difference exactly is a losing game -- it varies by font
+    // build, weight synthesis and hinting, so a panel tuned until one label
+    // fits just truncates the next label someone adds. An em and a half of
+    // slack scales with the text being measured (the error scales with glyph
+    // size, not with the screen) and costs a slightly wider panel, which is
+    // the cheap side of this trade: a picker is a list of names, and a name
+    // that reads in full matters more than a snug panel.
+    readonly property int _labelClearance: Sizing.px(Sizing.fontBody * 1.5)
+    readonly property int _desiredPanelWidth: Math.max(list.desiredContentWidth, modal._titleWidth) + 2 * modal._contentHorizontalMargin + modal._labelClearance
+    // Degenerate-case floor only, matching Modal.qml's own floor.
+    readonly property int _minPanelWidth: Sizing.pctW(30)
 
     visible: modal.open
     anchors.fill: parent
     z: 300
 
-    onOpenChanged: {
-        if (!modal.open) {
-            // Disarm a pending accept so a press-then-close inside the deferred
-            // window cannot apply a selection after the modal is dismissed.
-            acceptCommit.stop();
-            return;
-        }
-        let next = 0;
-        if (modal.initialId !== "") {
-            for (let i = 0; i < modal.entries.length; ++i) {
-                if (modal.entries[i].id === modal.initialId) {
-                    next = i;
-                    break;
-                }
-            }
-        }
-        viewport.contentY = 0;
-        modal.currentIndex = next;
-        modal._scrollCurrentIntoView();
-        modal._pressScale = 1.0;
-        pressAnim.stop();
-        modal._pendingId = "";
-    }
-
-    function _scrollCurrentIntoView(): void {
-        const stride = modal._rowHeight + modal._rowSpacing;
-        const top = modal.currentIndex * stride;
-        const bottom = top + modal._rowHeight;
-        if (top < viewport.contentY) {
-            viewport.contentY = top;
-        } else if (bottom > viewport.contentY + viewport.height) {
-            viewport.contentY = bottom - viewport.height;
-        }
+    function _measureLabelWidth(metrics: FontMetrics, label: string, fontSize: int, fontFamily: string, fontWeight: int): int {
+        return list._measureLabelWidth(metrics, label, fontSize, fontFamily, fontWeight);
     }
 
     function move(delta: int): void {
-        if (modal.entries.length <= 0)
-            return;
-        const len = modal.entries.length;
-        modal.currentIndex = ((modal.currentIndex + delta) % len + len) % len;
+        list.move(delta);
     }
 
     function handleAction(action: string): void {
-        if (action === "up") {
-            modal.move(-1);
-        } else if (action === "down") {
-            modal.move(1);
-        } else if (action === "accept") {
-            if (modal.currentIndex >= 0 && modal.currentIndex < modal.entries.length)
-                modal._commitAccept(modal.entries[modal.currentIndex].id);
-        } else if (action === "cancel") {
-            modal.closeRequested();
-        }
+        list.handleAction(action);
     }
 
-    function _commitAccept(id: string): void {
-        modal._pendingId = id;
-        pressAnim.restart();
-        acceptCommit.arm();
-    }
-
-    NumberAnimation {
-        id: pressAnim
-        target: modal
-        property: "_pressScale"
-        to: Motion.rowPressScale
-        duration: Motion.dur(Motion.pressMs)
-        easing.type: Easing.OutQuad
-    }
-
-    DeferredAction {
-        id: acceptCommit
-        onDeferred: {
-            const id = modal._pendingId;
-            modal._pendingId = "";
-            if (id !== "")
-                modal.accepted(id);
-        }
+    FontMetrics {
+        id: _titleLabelMetrics
+        font.family: Theme.fontUi
+        font.pixelSize: Sizing.fontTitle
     }
 
     Modal {
@@ -154,113 +104,16 @@ Item {
         open: modal.open
         kind: "shell"
         title: modal.title
+        panelMaxWidth: Math.max(modal._minPanelWidth, modal._desiredPanelWidth)
+        contentSized: true
 
-        Item {
-            id: viewportSlot
+        PickerList {
+            id: list
 
             width: parent.width
-            height: modal._viewportSlotHeight
-
-            Flickable {
-                id: viewport
-
-                anchors.fill: parent
-                anchors.topMargin: modal._scrollIndicatorBand
-                anchors.bottomMargin: modal._scrollIndicatorBand
-                contentWidth: width
-                contentHeight: modal._contentHeight
-                clip: true
-                // Key navigation drives contentY; we don't want kinetic
-                // dragging fighting with the focus tracker.
-                interactive: false
-                boundsBehavior: Flickable.StopAtBounds
-
-                Column {
-                    id: rowColumn
-
-                    width: viewport.width
-                    spacing: modal._rowSpacing
-
-                    Repeater {
-                        model: modal.entries
-
-                        Rectangle {
-                            id: row
-
-                            required property int index
-                            required property var modelData
-
-                            width: rowColumn.width
-                            height: modal._rowHeight
-                            color: Theme.surfaceCard
-                            border.width: row.index === modal.currentIndex ? Sizing.stroke(2) : Sizing.stroke(1)
-                            border.color: row.index === modal.currentIndex ? Theme.accent : Theme.borderMid
-                            radius: Sizing.cornerRadius
-                            transformOrigin: Item.Center
-                            scale: row.index === modal.currentIndex ? modal._pressScale : 1.0
-
-                            Text {
-                                anchors.left: parent.left
-                                anchors.right: parent.right
-                                anchors.verticalCenter: parent.verticalCenter
-                                anchors.leftMargin: Sizing.pctW(2)
-                                anchors.rightMargin: Sizing.pctW(2)
-                                text: row.modelData.label
-                                color: Theme.textPrimary
-                                font.family: Theme.fontUi
-                                font.pixelSize: Sizing.fontSize(2.6)
-                                horizontalAlignment: Text.AlignHCenter
-                                elide: Text.ElideRight
-                                renderType: Text.NativeRendering
-                            }
-
-                            MouseArea {
-                                anchors.fill: parent
-                                hoverEnabled: true
-                                acceptedButtons: Qt.LeftButton
-                                cursorShape: Qt.PointingHandCursor
-                                onEntered: modal.currentIndex = row.index
-                                onClicked: modal._commitAccept(row.modelData.id)
-                            }
-                        }
-                    }
-                }
-            }
-
-            Image {
-                source: Resources.iconUrl("ScrollUp")
-                width: modal._scrollArrowSize
-                height: width
-                anchors.bottom: viewport.top
-                anchors.bottomMargin: modal._scrollArrowGap
-                anchors.horizontalCenter: viewport.horizontalCenter
-                fillMode: Image.PreserveAspectFit
-                smooth: true
-                visible: modal._hasContentAbove
-            }
-
-            Image {
-                source: Resources.iconUrl("ScrollDown")
-                width: modal._scrollArrowSize
-                height: width
-                anchors.top: viewport.bottom
-                anchors.topMargin: modal._scrollArrowGap
-                anchors.horizontalCenter: viewport.horizontalCenter
-                fillMode: Image.PreserveAspectFit
-                smooth: true
-                visible: modal._hasContentBelow
-            }
-        }
-    }
-
-    // Keep the focused row in view. When the current index moves above
-    // or below the visible band we slide contentY just enough to bring
-    // it back into view, no animation - software renderer pays per-frame
-    // for any motion under translucent content.
-    Connections {
-        target: modal
-        function onCurrentIndexChanged(): void {
-            modal._scrollCurrentIntoView();
+            active: modal.open
+            onAccepted: id => modal.accepted(id)
+            onCloseRequested: modal.closeRequested()
         }
     }
 }

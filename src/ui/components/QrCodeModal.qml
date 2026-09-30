@@ -5,92 +5,76 @@ pragma ComponentBehavior: Bound
 
 import QtQuick
 import Zaparoo.Theme
-import Zaparoo.Browse as Browse
+import Zaparoo.Ui
 
-// cxx-qt 0.8 patches `isFinal: true` on singleton properties but the
-// qmltypes schema has no `isFinal` slot, so every read trips qmllint's
-// "Member can be shadowed" check. Until the schema grows the slot,
-// suppress the compiler category file-wide.
-// qmllint disable compiler
-
+// Generic "scan this code" surface. The caller owns the payload (it must
+// call `Browse.QrCode.generate()` and check `size > 0` before opening,
+// since that singleton is a single shared slot) and supplies the wording,
+// so the same chrome serves both writing a token and pointing at the
+// documentation. Defaults reproduce the original token-write copy.
 Item {
     id: root
 
     property bool open: false
-    property int quietZone: 4
-
-    readonly property int matrixSize: Browse.QrCode.size
-    readonly property int maxQrPixels: Math.min(Sizing.pctW(42), Sizing.pctH(68))
-    readonly property int moduleSize: matrixSize > 0 ? Math.max(1, Math.floor(maxQrPixels / (matrixSize + quietZone * 2))) : 1
-    readonly property int qrPixels: moduleSize * (matrixSize + quietZone * 2)
+    property string title: qsTr("Write with App")
+    property string instructionText: qsTr("Scan this code with the Zaparoo App to write this game to a Zaparoo token.")
+    // Optional plain-text URL under the matrix. A QR is unscannable at
+    // 240p over composite, so anywhere the destination is a web page the
+    // readable URL is the real affordance and the code is the shortcut.
+    property string urlText: ""
 
     visible: root.open
     z: 300
 
-    // Full-screen scrim. Joins QrCodeModal to the modal family for now
-    // (full panel chrome — title, padding, close affordance — is a
-    // future round). The MouseArea below eats clicks/hover so the
-    // dimmed screens beneath don't track focus under the modal.
-    Rectangle {
-        anchors.fill: parent
-        color: Theme.scrim
+    Modal {
+        id: shell
 
-        MouseArea {
-            anchors.fill: parent
-            hoverEnabled: true
-            acceptedButtons: Qt.AllButtons
-        }
-    }
+        open: root.open
+        kind: "shell"
+        title: root.title
+        panelMaxWidth: Sizing.pctH(105)
 
-    Rectangle {
-        x: Sizing.center(parent.width, width)
-        y: Sizing.center(parent.height, height)
-        width: root.qrPixels
-        height: root.qrPixels
-        color: "white"
-        border.width: Sizing.stroke(root.moduleSize * 0.18)
-        border.color: Theme.borderSubtle
+        Column {
+            width: parent.width
+            spacing: Sizing.pctH(2)
 
-        Item {
-            id: matrix
+            TextMetrics {
+                id: instructionsMetrics
 
-            x: Sizing.center(parent.width, width)
-            y: Sizing.center(parent.height, height)
-            width: root.moduleSize * root.matrixSize
-            height: root.moduleSize * root.matrixSize
-            visible: root.matrixSize > 0
+                font.family: Theme.fontUi
+                font.pixelSize: Sizing.fontCaption
+                text: instructions.text
+            }
 
-            Repeater {
-                model: root.matrixSize
+            Text {
+                id: instructions
 
-                delegate: Item {
-                    id: rowDelegate
+                x: Sizing.center(parent.width, width)
+                width: Math.min(parent.width, Sizing.px(instructionsMetrics.advanceWidth))
+                text: root.instructionText
+                font.family: Theme.fontUi
+                font.pixelSize: Sizing.fontCaption
+                color: Theme.textPrimary
+                horizontalAlignment: Text.AlignLeft
+                wrapMode: Text.WordWrap
+                renderType: Text.NativeRendering
+            }
 
-                    required property int index
+            QrMatrix {
+                anchors.horizontalCenter: parent.horizontalCenter
+                maxQrPixels: Math.min(Sizing.pctW(36), Sizing.pctH(48))
+            }
 
-                    readonly property int row: index
-                    readonly property string bits: Browse.QrCode.row_at(row)
-
-                    x: 0
-                    y: row * root.moduleSize
-                    width: matrix.width
-                    height: root.moduleSize
-
-                    Repeater {
-                        model: root.matrixSize
-
-                        delegate: Rectangle {
-                            required property int index
-
-                            x: index * root.moduleSize
-                            y: 0
-                            width: root.moduleSize
-                            height: root.moduleSize
-                            color: "black"
-                            visible: rowDelegate.bits.charAt(index) === "1"
-                        }
-                    }
-                }
+            Text {
+                width: parent.width
+                visible: root.urlText !== ""
+                text: root.urlText
+                font.family: Theme.fontUi
+                font.pixelSize: Sizing.fontSmall
+                color: Theme.textLabel
+                horizontalAlignment: Text.AlignHCenter
+                wrapMode: Text.WrapAnywhere
+                renderType: Text.NativeRendering
             }
         }
     }

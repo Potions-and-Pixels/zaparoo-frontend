@@ -44,14 +44,14 @@ for the details.
 Copyright 2026 Wizzo Pty Ltd and the Zaparoo Project contributors.
 Source available under the [PolyForm Noncommercial License 1.0.0](COPYING).
 Non-commercial use only. For commercial licensing, contact
-[legal@zaparoo.org](mailto:legal@zaparoo.org).
+[legal@zaparoo.com](mailto:legal@zaparoo.com).
 
 Third-party components:
 
 - **Qt framework**: LGPLv3. Dynamically linked on desktop builds; statically
   linked on MiSTer ARM32. Object files for re-linking against a modified Qt
   are available on request at
-  [legal@zaparoo.org](mailto:legal@zaparoo.org).
+  [legal@zaparoo.com](mailto:legal@zaparoo.com).
   See [`src/LICENSES/Qt-LGPL-NOTICE.txt`](src/LICENSES/Qt-LGPL-NOTICE.txt)
   and [`src/LICENSES/LGPLv3.txt`](src/LICENSES/LGPLv3.txt).
 - **zaparoo-update**: optional third-party update integration, separately owned
@@ -75,8 +75,9 @@ Third-party components:
 - **Streamline** Core line icon (Handheld category): © Webalys LLC, used
   under the Streamline Free License — <https://streamlinehq.com>. See
   [`src/LICENSES/Streamline-ATTRIBUTION.txt`](src/LICENSES/Streamline-ATTRIBUTION.txt).
-- **Controller Input Icons** by ElDuderino, released into the public domain.
-  See [`src/LICENSES/controller-icons-ATTRIBUTION.txt`](src/LICENSES/controller-icons-ATTRIBUTION.txt).
+- **Input Prompts** by Kenney, CC0 1.0 (help-bar button and D-pad glyphs) —
+  <https://kenney.nl/assets/input-prompts>. See
+  [`src/LICENSES/Kenney-ATTRIBUTION.txt`](src/LICENSES/Kenney-ATTRIBUTION.txt).
 - **Console logos** redrawn by Dan Patrick (MIT-licensed compilation; platform
   marks remain trademarks of their respective owners). See
   [`src/LICENSES/console-logos-ATTRIBUTION.txt`](src/LICENSES/console-logos-ATTRIBUTION.txt).

@@ -8,16 +8,19 @@
 // Two paths into the model:
 //
 //   * `set_system(id)` — entry from SystemsScreen accept. Issues
-//     `media.browse({systems: [id]})` (system-scoped roots). When the
-//     scoped roots collapse to a single folder entry, we auto-navigate
-//     into that folder so the user never sees a 1-item list — most
-//     systems have one root and showing it standalone would be empty
-//     ceremony.
+//     `media.browse({systems: [id]})`, which Core answers with a merged,
+//     one-level view of the system's launcher routes (`rootView:
+//     "contents"`, see `merged_root_view`) rather than a route to pick.
+//     The one remaining single-entry case worth auto-navigating past is a
+//     lone `root` row: either a virtual-only system Core never merges
+//     (MiSTer Arcade's single `mame-arcade://` route), or an older Core
+//     still returning its pre-merge routes list. See `decide_initial`.
 //
 //   * `set_path(path)` — entry from a folder accept inside the games
 //     screen. Issues `media.browse({path, systems: [current_system]})`.
 //     No auto-navigation; explicit folder navigation is treated as
-//     intent.
+//     intent (MiSTer's single-child-folder flatten aside, see
+//     `decide_initial`).
 //
 // `fetch_more()` advances pagination without resetting the model:
 // `begin_insert_rows` appends entries from the next cursor onto the
@@ -31,9 +34,14 @@
 // when the user spams direction-arrow + Accept across a model swap.
 
 use crate::media_image_cache::{global_media_image_cache, MediaImageCache, MediaKey};
+use crate::media_meta_cache::{
+    fetch_media_meta_with_path_fallback, global_media_meta_cache, MetaLookup,
+};
+use crate::models::action_error::report_action_error;
 use crate::models::nav_timing::NavTiming;
 use crate::models::tag_utils::{
-    disambiguating_tag_labels, sibling_disambiguation_displays, tag_display_value,
+    disambiguating_tag_labels, favorite_tags_after_toggle, is_favorite_tag,
+    sibling_disambiguation_displays, tag_display_value,
 };
 use crate::models::{global_handle, global_store};
 use cxx_qt::{CxxQtType, Threading};
@@ -54,8 +62,9 @@ use zaparoo_core::endpoints::media_tags_update::MediaTagsUpdateMutation;
 use zaparoo_core::endpoints::readers_write::ReadersWriteMutation;
 use zaparoo_core::endpoints::run::RunMutation;
 use zaparoo_core::media_types::{
-    BrowseEntry, MediaBrowseIndexParams, MediaBrowseParams, MediaBrowseResult, MediaMeta,
-    MediaMetaParams, MediaTagsUpdateParams, ReadersWriteParams, RunParams, TagInfo,
+    merged_root_view, BrowseEntry, MediaBrowseIndexParams, MediaBrowseParams, MediaBrowseResult,
+    MediaMeta, MediaMetaParams, MediaTagsUpdateParams, ReadersWriteParams, RunParams, TagInfo,
+    CORE_SERVEABLE_IMAGE_TYPES,
 };
 use zaparoo_core::platform::{self, Platform};
 use zaparoo_core::remote_resource::ResourceStatus;
@@ -83,56 +92,39 @@ const HIDDEN_ROLE: i32 = 256 + 11;
 // keeps the QVariant simple and is robust under MiSTer's AOT QML; the
 // delegate splits on newlines.
 const DISAMBIGUATING_TAGS_ROLE: i32 = 256 + 12;
-
-// Image types that Core's `media.image` endpoint can serve (per the API
-// docs). The carousel tail is filtered to this set so left/right never
-// lands on a type that would always return "no image".
-const CORE_SERVEABLE_IMAGE_TYPES: &[&str] = &[
-    "image",
-    "boxart",
-    "screenshot",
-    "wheel",
-    "titleshot",
-    "map",
-    "marquee",
-    "fanart",
-];
+// Every real row is a real entry, never a structural placeholder; the role
+// exists only so PagedGrid's `isEmpty` delegate contract (round 6 follow-up
+// — see PagedGrid.qml) is satisfied by direct QAbstractListModel callers.
+const IS_EMPTY_ROLE: i32 = 256 + 13;
+// No Games row is ever "disabled" (Hub-only concept — a live precondition
+// not currently met, e.g. Resume with no history). The role exists only so
+// PagedGrid's `cellItem.disabled` delegate contract (round 11 follow-up —
+// see PagedGrid.qml) is satisfied by direct QAbstractListModel callers.
+const DISABLED_ROLE: i32 = 256 + 14;
 
 // Default API page size before QML binds the model's `page_size` to the
 // grid's `pageSize`. 15 = 5 columns × 3 rows, the desktop default. The
 // test harness sees this until it overrides explicitly. Server cap is
 // 1000; grid page sizes top out at ~30 so we stay well inside bounds.
 const DEFAULT_PAGE_SIZE: i32 = 15;
-// `media.browse` `max_results` for cursor follow-ups. Held separate
-// from `page_size` (which dictates grid layout, scroll-thumb sizing,
-// and the initial-page cover gate) so wire chunks can be larger than a
-// single visual page without changing the grid math. Sized for the
-// MiSTer main-thread cost of `apply_append_page`: each chunk runs
-// `transform_entries` and a `begin_insert_rows`/`end_insert_rows`
-// pair on the Qt thread, which stalls input until it returns. 500 was Core's wire-cost optimum but
-// produced a multi-second stall on ARM32 with the indicator showing
-// the whole time; 100 keeps the per-chunk stall short enough to be
-// invisible while still cutting an 805-entry Arcade to ~8 round-trips.
-// Server caps `max_results` at 1000; 100 stays well inside that. The
-// initial browse keeps the smaller `page_size` so the cover gate
-// doesn't have to wait on a big first decode. Cover prefetch is no
-// longer driven by metadata page size — `prefetch_around` warms only
-// the visible and next pages, so a large `FETCH_MORE_CHUNK_SIZE` no
-// longer floods the cover queue.
-const FETCH_MORE_CHUNK_SIZE: i32 = 100;
+// Ordinary cursor follow-ups fetch one current visual page (`page_size`). Large
+// chunks are reserved for explicit rapid scrolling and jump-to-letter paths;
+// growing a ten-row model by 100 rows for one shoulder press inflated delegate
+// work and made folder Back require expensive large-to-small resets.
 const FETCH_MORE_RAPID_CHUNK_SIZE: i32 = 300;
 // Ceiling for a jump-to-letter fetch (Core's `max_results` cap). A position
 // jump must load every row up to the target before
-// `PagedGrid._commitPendingTarget` can land on it; doing that as the 12-row
-// frame-gapped trickle (`apply_append_page`) takes seconds on a far jump. The
-// jump path instead inserts the whole chunk in one shot (`bulk` append) — the
-// loading overlay is up and the appended rows sit far from `currentPage`, so
-// their Tile delegates stay unmaterialised (the per-cell Loader is
-// retention-gated), making the bulk insert cheap. `fetch_more_jump` sizes each
-// request to the gap remaining to the target (rounded up to whole `page_size`
-// pages, plus one page of margin) rather than always pulling the full
-// remainder, so a near/mid-folder jump transfers far less; a gap larger than
-// this ceiling chains another bulk call.
+// `PagedGrid._commitPendingTarget` can land on it. A jump chunk this large
+// still goes through `apply_append_page`'s ordinary 12-row frame-gapped
+// trickle (`bulk` append no longer special-cases a single-shot insert — see
+// the comment above `chunk_for_subbatching`'s call site for why: the outer
+// per-row `cellItem` construction cost is paid regardless of whether the
+// inner Tile delegate materialises, so a single 1000-row insert blocked the
+// Qt thread for tens of seconds). `fetch_more_jump` sizes each request to
+// the gap remaining to the target (rounded up to whole `page_size` pages,
+// plus one page of margin) rather than always pulling the full remainder, so
+// a near/mid-folder jump transfers far less; a gap larger than this ceiling
+// chains another bulk call.
 const JUMP_FETCH_CHUNK_SIZE: i32 = 1000;
 // Stay within Core's `max_results` ceiling, and never smaller than the rapid
 // scroll chunk (a jump must not load slower than ordinary scrolling).
@@ -147,12 +139,6 @@ const COVER_PREFETCH_PREVIOUS_PAGES: i32 = 1;
 // at the front of the queue when the user moves.
 const COVER_PREFETCH_CURSOR_NEXT: i32 = 4;
 const COVER_PREFETCH_CURSOR_PREV: i32 = 2;
-// Bound how long navigation waits for cold visible covers. After this,
-// the page becomes interactive and any remaining covers pop in via the
-// normal update path. Keeps cold pages from waiting on the slowest
-// `media.image` request while preserving no-pop-in for warm/cache-hit pages.
-const COVER_GATE_TIMEOUT_MS: u64 = 300;
-
 // `apply_append_page` sub-batches the model insert into chunks of this
 // many rows so the Repeater's per-delegate `createObject` cost (the
 // dominant Qt-thread stall on MiSTer at ~7-8 ms per Tile) is spread
@@ -182,6 +168,9 @@ const SUB_BATCH_FRAME_GAP_MS: u64 = 33;
 )]
 pub struct GamesModelRust {
     entries: Vec<BrowseEntry>,
+    // When true every browse and browse-index request carries
+    // `tags: ["user:favorite"]`; Core keeps directories navigable.
+    favorites_only: bool,
     // Parallel to `entries`: the sibling-diffed disambiguation display string
     // per row (what tiles/list rows show as the inline token suffix). Recomputed
     // whenever `entries` or `show_original_filenames` changes. See
@@ -232,6 +221,9 @@ pub struct GamesModelRust {
     detail_prefetch_row: Option<i32>,
     cover_key_roles_enabled: bool,
     cover_requests_paused: bool,
+    // Bumped when a same-sized browse result replaces rows in place instead of
+    // emitting modelReset. Main.qml uses this edge to restore saved selection.
+    rows_revision: i32,
     // When true, the `name` role and `name_at()` return the original filename
     // (without extension) instead of Core's cleaned display name. Bound from
     // QML to the `Show original filenames` setting; flipping it re-emits
@@ -269,36 +261,13 @@ pub struct GamesModelRust {
     // `start_initial_browse` so the model singleton owns exactly one
     // subscriber for the whole process lifetime.
     cover_subscription: Option<JoinHandle<()>>,
-    // Keys whose first-paint we're still waiting on. While non-empty we
-    // hold `loading = true` so the screen-flip overlay covers the gap
-    // between "page rendered with glyphs" and "covers cached". Drained
-    // by `notify_cover_update` as each cover lands; force-cleared by
-    // the gate timer or a subsequent `start_initial_browse`.
-    pending_first_paint_keys: HashSet<MediaKey>,
-    // Safety timer that force-releases the cover gate after a bounded
-    // delay, so a stalled bulk RPC can't park the user on `Loading…`
-    // forever.
-    cover_gate_timer: Option<JoinHandle<()>>,
-    // Bumped on every cover-gate arm and on every `start_initial_browse`.
-    // The timer's queued closure compares against the current value and
-    // bails on a mismatch — necessary because aborting the JoinHandle
-    // doesn't cancel a callback that was already queued onto the Qt
-    // thread between sleep-completion and abort.
-    cover_gate_seq: Arc<AtomicU64>,
     description_seq: Arc<AtomicU64>,
     // Tagging ticket for in-flight append sub-batches scheduled by
     // `apply_append_page`. Bumped on every `start_initial_browse` so a
     // deferred batch from a stale dataset detects that the model has
     // moved on and bails before splicing rows from the old chain onto
-    // the new one. Same race shape as `cover_gate_seq`, just for the
-    // sub-batch fan-out.
+    // the new one.
     append_seq: Arc<AtomicU64>,
-    // True when `apply_initial_page` wants to start the metadata
-    // look-ahead `fetch_more` after the visible page is interactive.
-    // Starting it before the cover gate releases can splice rows and
-    // create delegates during a screen transition, which is exactly
-    // the UI-thread stall the loading overlay is trying to hide.
-    pending_initial_lookahead: bool,
     // First visible row in the grid. Bound from QML to
     // `gamesGrid.currentPage * gamesGrid.pageSize` so the model knows
     // which entries are on screen and can warm the next page's covers
@@ -330,12 +299,27 @@ pub struct GamesModelRust {
     letter_index_json: QString,
     letter_index_scheme: QString,
     letter_index_seq: Arc<AtomicU64>,
+    // Latest Core `launch.random` failure. Sequence rejects stale failures when
+    // user requests another pick before prior RPC settles.
+    random_error: QString,
+    random_seq: Arc<AtomicU64>,
+    // "Add to Hub" on a single-game folder resolves the folder's child file
+    // off the Qt thread (`resolve_hub_target_at`) and publishes it here.
+    // `hub_target_sequence` is written last so QML adds the item on that
+    // edge; `hub_target_seq` drops a resolution overtaken by a newer press.
+    hub_target_system: QString,
+    hub_target_path: QString,
+    hub_target_script: QString,
+    hub_target_name: QString,
+    hub_target_sequence: i32,
+    hub_target_seq: Arc<AtomicU64>,
 }
 
 impl Default for GamesModelRust {
     fn default() -> Self {
         Self {
             entries: Vec::new(),
+            favorites_only: false,
             disambig_displays: Vec::new(),
             count: 0,
             loading: false,
@@ -363,6 +347,7 @@ impl Default for GamesModelRust {
             detail_prefetch_row: None,
             cover_key_roles_enabled: true,
             cover_requests_paused: false,
+            rows_revision: 0,
             show_original_filenames: false,
             detail_image_keys: Vec::new(),
             watcher: None,
@@ -371,12 +356,8 @@ impl Default for GamesModelRust {
             is_seeded: false,
             card_write_seq: Arc::new(AtomicU64::new(0)),
             cover_subscription: None,
-            pending_first_paint_keys: HashSet::new(),
-            cover_gate_timer: None,
-            cover_gate_seq: Arc::new(AtomicU64::new(0)),
             description_seq: Arc::new(AtomicU64::new(0)),
             append_seq: Arc::new(AtomicU64::new(0)),
-            pending_initial_lookahead: false,
             visible_first_row: 0,
             cover_max_size: 0,
             detail_cover_max_size: 0,
@@ -385,6 +366,14 @@ impl Default for GamesModelRust {
             letter_index_json: QString::default(),
             letter_index_scheme: QString::default(),
             letter_index_seq: Arc::new(AtomicU64::new(0)),
+            random_error: QString::default(),
+            random_seq: Arc::new(AtomicU64::new(0)),
+            hub_target_system: QString::default(),
+            hub_target_path: QString::default(),
+            hub_target_script: QString::default(),
+            hub_target_name: QString::default(),
+            hub_target_sequence: 0,
+            hub_target_seq: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -415,6 +404,7 @@ pub mod ffi {
         #[qproperty(bool, loading_more)]
         #[qproperty(QString, error_message)]
         #[qproperty(bool, has_next_page)]
+        #[qproperty(bool, favorites_only)]
         #[qproperty(i32, total_files)]
         #[qproperty(i32, total_dirs)]
         #[qproperty(i32, page_size)]
@@ -434,12 +424,19 @@ pub mod ffi {
         #[qproperty(QString, detail_prefetch_key_prev)]
         #[qproperty(bool, cover_key_roles_enabled)]
         #[qproperty(bool, cover_requests_paused)]
+        #[qproperty(i32, rows_revision)]
         #[qproperty(bool, show_original_filenames, READ, WRITE = set_show_original_filenames, NOTIFY)]
         #[qproperty(i32, visible_first_row)]
         #[qproperty(i32, cover_max_size, READ, WRITE = set_cover_max_size, NOTIFY)]
         #[qproperty(i32, detail_cover_max_size, READ, WRITE = set_detail_cover_max_size, NOTIFY)]
         #[qproperty(QString, letter_index_json)]
         #[qproperty(QString, letter_index_scheme)]
+        #[qproperty(QString, random_error)]
+        #[qproperty(QString, hub_target_system)]
+        #[qproperty(QString, hub_target_path)]
+        #[qproperty(QString, hub_target_script)]
+        #[qproperty(QString, hub_target_name)]
+        #[qproperty(i32, hub_target_sequence)]
         type GamesModel = super::GamesModelRust;
 
         #[qinvokable]
@@ -464,6 +461,9 @@ pub mod ffi {
         fn fetch_more_rapid(self: Pin<&mut GamesModel>);
 
         #[qinvokable]
+        fn fetch_more_restore(self: Pin<&mut GamesModel>);
+
+        #[qinvokable]
         fn fetch_more_jump(self: Pin<&mut GamesModel>, target_index: i32);
 
         #[qinvokable]
@@ -482,7 +482,19 @@ pub mod ffi {
         fn launch_at(self: Pin<&mut GamesModel>, index: i32);
 
         #[qinvokable]
+        fn resolve_hub_target_at(self: Pin<&mut GamesModel>, index: i32);
+
+        #[qinvokable]
         fn launch_text_at(self: &GamesModel, index: i32) -> QString;
+
+        #[qinvokable]
+        fn apply_favorites_filter(self: Pin<&mut GamesModel>, enabled: bool);
+
+        #[qinvokable]
+        fn launch_random(self: Pin<&mut GamesModel>);
+
+        #[qinvokable]
+        fn clear_random_error(self: Pin<&mut GamesModel>);
 
         #[qinvokable]
         fn write_card_at(self: Pin<&mut GamesModel>, index: i32);
@@ -529,8 +541,20 @@ pub mod ffi {
         #[qinvokable]
         fn entry_type_at(self: &GamesModel, index: i32) -> QString;
 
+        /// Index-based sibling to the `fileCount` role -- see `file_count_at`.
+        #[qinvokable]
+        fn file_count_at(self: &GamesModel, index: i32) -> i32;
+
         #[qinvokable]
         fn is_media_capable_at(self: &GamesModel, index: i32) -> bool;
+
+        /// True when the row at `index` is a `root` addressing a real
+        /// filesystem folder, as opposed to a virtual-scheme route. Gates the
+        /// games context menu's "Add to Hub" on root rows — see
+        /// `is_filesystem_root_entry` for why roots were refused outright
+        /// before, and why scheme routes still are.
+        #[qinvokable]
+        fn is_filesystem_root_at(self: &GamesModel, index: i32) -> bool;
 
         #[qinvokable]
         fn index_for_game_path(self: &GamesModel, path: &QString) -> i32;
@@ -555,6 +579,19 @@ pub mod ffi {
         #[inherit]
         #[cxx_name = "endInsertRows"]
         fn end_insert_rows(self: Pin<&mut GamesModel>);
+
+        #[inherit]
+        #[cxx_name = "beginRemoveRows"]
+        fn begin_remove_rows(
+            self: Pin<&mut GamesModel>,
+            parent: &QModelIndex,
+            first: i32,
+            last: i32,
+        );
+
+        #[inherit]
+        #[cxx_name = "endRemoveRows"]
+        fn end_remove_rows(self: Pin<&mut GamesModel>);
 
         // Qt signal bound as a callable so the cover-cache bridge can
         // invoke it directly from the Qt thread when an async cover
@@ -618,13 +655,25 @@ impl ffi::GamesModel {
                 .as_str(),
             )),
             ENTRY_TYPE_ROLE => QVariant::from(&QString::from(entry.entry_type.as_str())),
-            FILE_COUNT_ROLE => QVariant::from(&i32::try_from(entry.file_count).unwrap_or(i32::MAX)),
+            // 0 for a media-capable directory (Core already resolved it to
+            // a single playable item -- `media_id` set, or a direct
+            // `zap_script`; see `is_media_capable_entry`) so
+            // `Format.folderCountSuffix`'s existing `fileCount <= 0`
+            // early-out suppresses the count everywhere it renders (grid,
+            // list, active label) from this one source instead of each
+            // caller re-deriving the same collapse. A tile the cover-art
+            // path already renders as the game itself showing a stray "1"
+            // beside it read as a bug, not a folder count.
+            FILE_COUNT_ROLE => QVariant::from(&if is_media_capable_entry(entry) {
+                0
+            } else {
+                i32::try_from(entry.file_count).unwrap_or(i32::MAX)
+            }),
             FAVORITE_ROLE => QVariant::from(&favorite_role_value(&entry.tags)),
             DESCRIPTION_ROLE => QVariant::from(&QString::from(entry.description.as_str())),
             FILE_STEM_ROLE => {
                 QVariant::from(&QString::from(file_stem_or_name(&entry.path, &entry.name)))
             }
-            HIDDEN_ROLE => QVariant::from(&false),
             // Sibling-diffed display string (common-affix trimmed against
             // same-named neighbors); precomputed in `disambig_displays`.
             DISAMBIGUATING_TAGS_ROLE => QVariant::from(&QString::from(
@@ -632,6 +681,7 @@ impl ffi::GamesModel {
                     .get(index.row() as usize)
                     .map_or("", String::as_str),
             )),
+            HIDDEN_ROLE | IS_EMPTY_ROLE | DISABLED_ROLE => QVariant::from(&false),
             _ => QVariant::default(),
         }
     }
@@ -653,6 +703,8 @@ impl ffi::GamesModel {
             DISAMBIGUATING_TAGS_ROLE,
             QByteArray::from("disambiguatingTags"),
         );
+        h.insert(IS_EMPTY_ROLE, QByteArray::from("isEmpty"));
+        h.insert(DISABLED_ROLE, QByteArray::from("disabled"));
         h
     }
 
@@ -717,15 +769,24 @@ impl ffi::GamesModel {
             path.to_string(),
             systems,
             max_results,
+            favorites_tags(self.favorites_only),
         ))
     }
 
     fn fetch_more(self: Pin<&mut Self>) {
-        self.fetch_more_with_limit(FETCH_MORE_CHUNK_SIZE, false);
+        let limit = self.page_size.max(1);
+        self.fetch_more_with_limit(limit, false);
     }
 
     fn fetch_more_rapid(self: Pin<&mut Self>) {
         self.fetch_more_with_limit(FETCH_MORE_RAPID_CHUNK_SIZE, false);
+    }
+
+    fn fetch_more_restore(self: Pin<&mut Self>) {
+        // Restoration is hidden behind the loading gate. Use one bulk insert
+        // and pause covers for the request so the 300-row response cannot be
+        // split into per-frame sub-batches that each restart cover prefetch.
+        self.fetch_more_with_limit(FETCH_MORE_RAPID_CHUNK_SIZE, true);
     }
 
     fn fetch_more_jump(self: Pin<&mut Self>, target_index: i32) {
@@ -765,6 +826,7 @@ impl ffi::GamesModel {
         } else {
             vec![sid]
         };
+        let tags = favorites_tags(self.favorites_only);
         // Read the active ticket WITHOUT bumping it. `fetch_more`
         // continues the same path's load — only `set_system` /
         // `set_path` invalidate the prior cursor sequence.
@@ -793,6 +855,7 @@ impl ffi::GamesModel {
         // append no longer belongs to the current page chain and
         // would corrupt the freshly-reset entries.
         let expected_prev_cursor = cursor.clone();
+        let root_view = merged_root_view(&path, &systems);
         global_handle().spawn(async move {
             let result = store
                 .client()
@@ -801,8 +864,10 @@ impl ffi::GamesModel {
                     systems,
                     max_results: Some(max_results),
                     cursor,
+                    tags,
                     letter: None,
                     sort: None,
+                    root_view,
                 })
                 .await;
             let _ = qt_thread.queue(move |model| {
@@ -821,18 +886,23 @@ impl ffi::GamesModel {
     /// user picks "Jump to letter".
     fn load_letter_index(mut self: Pin<&mut Self>) {
         let path = self.current_path.to_string();
-        // A root listing has no meaningful first-character rail.
-        if path.is_empty() {
-            self.as_mut().set_letter_index_json(QString::from("[]"));
-            self.as_mut().set_letter_index_scheme(QString::from("none"));
-            return;
-        }
         let sid = self.current_system_id.to_string();
         let systems = if sid.is_empty() {
             Vec::new()
         } else {
             vec![sid]
         };
+        let root_view = merged_root_view(&path, &systems);
+        // A pathless, systemless listing (the unscoped root) has no
+        // meaningful first-character rail. A merged system root
+        // (`root_view` is `Some`, see `merged_root_view`) is an ordinary
+        // media list and gets a rail like any folder.
+        if path.is_empty() && root_view.is_none() {
+            self.as_mut().set_letter_index_json(QString::from("[]"));
+            self.as_mut().set_letter_index_scheme(QString::from("none"));
+            return;
+        }
+        let tags = favorites_tags(self.favorites_only);
         // Clear any facet from a prior scope to the loading state (empty groups,
         // empty scheme) so the rail shows "loading" rather than the previous
         // folder's buckets until the fresh fetch lands.
@@ -850,7 +920,9 @@ impl ffi::GamesModel {
                 .media_browse_index(MediaBrowseIndexParams {
                     path,
                     systems,
+                    tags,
                     sort: None,
+                    root_view,
                 })
                 .await;
             let _ = qt_thread.queue(move |mut model| {
@@ -939,11 +1011,84 @@ impl ffi::GamesModel {
             };
             let Some(text) = text else {
                 warn!("media-capable directory launch fallback unavailable for {name}; not launching container path");
+                report_action_error("launch", name);
                 return;
             };
             if let Err(e) = store.run_mutation::<RunMutation>(RunParams { text }).await {
                 warn!("run failed for {name}: {}", e.message);
+                report_action_error("launch", name);
             }
+        });
+    }
+
+    /// "Add to Hub" on a single-game folder (a media-capable directory).
+    /// The Hub tile must carry the child file, not the container: a
+    /// `zapscript` item launches `script` verbatim and resolves its cover
+    /// by `(system, path)`, and `launch_at` already refuses to run a
+    /// container path. The child is resolved exactly as a launch resolves
+    /// it, off the Qt thread, then published through `hub_target_*` with
+    /// `hub_target_sequence` written last so QML adds the item on that edge
+    /// (`Main.qml`'s `onHub_target_sequenceChanged`). Plain media rows never
+    /// come here; QML pins those synchronously from `launch_text_at`.
+    ///
+    /// No container-path fallback, unlike `launch_at`: a launch that falls
+    /// back fails loudly once, but a Hub tile is persisted, so pinning the
+    /// folder path would bake in a shortcut that can never launch.
+    fn resolve_hub_target_at(self: Pin<&mut Self>, index: i32) {
+        if index < 0 || index >= self.count {
+            return;
+        }
+        let entry = self.entries[index as usize].clone();
+        if !media_capable_directory_needs_child_resolution(&entry) {
+            return;
+        }
+        let params = singleton_directory_needs_launch_resolution(&entry)
+            .then(|| meta_params_for_entry(&entry))
+            .flatten();
+        let browse_params = media_capable_directory_browse_params(&entry);
+        let name = entry.name.clone();
+        let system_id = hub_target_system_id(&entry, &self.current_system_id.to_string());
+        // A second press before the first resolves must not pin the tile
+        // twice. A scope change in between is fine: the child belongs to
+        // the folder the user chose, wherever they have browsed to since.
+        let seq = self.rust().hub_target_seq.clone();
+        let ticket = seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let qt_thread = self.qt_thread();
+        let store = global_store();
+        global_handle().spawn(async move {
+            let client = store.client();
+            let resolved = resolve_media_capable_directory_run_text(
+                client.as_ref(),
+                &entry,
+                params,
+                browse_params,
+                None,
+            )
+            .await;
+            let Some(child) = resolved else {
+                warn!("no launchable child resolved for {name}; not adding the container path to the Hub");
+                report_action_error("add_to_hub", name);
+                return;
+            };
+            let _ = qt_thread.queue(move |mut model| {
+                if seq.load(Ordering::SeqCst) != ticket {
+                    return;
+                }
+                model
+                    .as_mut()
+                    .set_hub_target_system(QString::from(system_id.as_str()));
+                model
+                    .as_mut()
+                    .set_hub_target_path(QString::from(child.as_str()));
+                model
+                    .as_mut()
+                    .set_hub_target_script(QString::from(child.as_str()));
+                model
+                    .as_mut()
+                    .set_hub_target_name(QString::from(name.as_str()));
+                let next = model.hub_target_sequence.wrapping_add(1);
+                model.as_mut().set_hub_target_sequence(next);
+            });
         });
     }
 
@@ -952,6 +1097,70 @@ impl ffi::GamesModel {
             return QString::default();
         }
         QString::from(portable_text_for_entry(&self.entries[index as usize]).as_str())
+    }
+
+    /// Toggle Core-backed favorites scope and reload current browse target.
+    fn apply_favorites_filter(mut self: Pin<&mut Self>, enabled: bool) {
+        if self.favorites_only == enabled {
+            return;
+        }
+        self.as_mut().set_favorites_only(enabled);
+        self.letter_index_seq.fetch_add(1, Ordering::SeqCst);
+        let path = self.current_path.to_string();
+        let system_id = self.current_system_id.to_string();
+        // Before first system selection, only seed preference. First browse
+        // will include correct tag scope without issuing an unscoped root RPC.
+        if path.is_empty() && system_id.is_empty() {
+            return;
+        }
+        let systems = if system_id.is_empty() {
+            Vec::new()
+        } else {
+            vec![system_id]
+        };
+        let eligible_for_auto_nav = path.is_empty();
+        self.start_initial_browse(path, systems, eligible_for_auto_nav);
+    }
+
+    /// Ask Core to choose uniformly from current recursive path/system scope.
+    /// Active Favorites mode is repeated as a `ZapScript` tag filter.
+    fn launch_random(mut self: Pin<&mut Self>) {
+        let Some(text) = games_random_launch_text(
+            &self.current_path.to_string(),
+            &self.current_system_id.to_string(),
+            self.favorites_only,
+        ) else {
+            self.as_mut()
+                .set_random_error(QString::from("missing random launch scope"));
+            return;
+        };
+        if !self.random_error.is_empty() {
+            self.as_mut().set_random_error(QString::default());
+        }
+        let seq = self.rust().random_seq.clone();
+        let ticket = seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let qt_thread = self.qt_thread();
+        let store = global_store();
+        global_handle().spawn(async move {
+            let result = store.run_mutation::<RunMutation>(RunParams { text }).await;
+            let _ = qt_thread.queue(move |mut model| {
+                if seq.load(Ordering::SeqCst) != ticket {
+                    return;
+                }
+                if let Err(error) = result {
+                    warn!("Core random launch failed: {}", error.message);
+                    model
+                        .as_mut()
+                        .set_random_error(QString::from(error.message.as_str()));
+                }
+            });
+        });
+    }
+
+    fn clear_random_error(mut self: Pin<&mut Self>) {
+        if !self.random_error.is_empty() {
+            self.as_mut().set_random_error(QString::default());
+        }
     }
 
     fn write_card_at(mut self: Pin<&mut Self>, index: i32) {
@@ -997,7 +1206,7 @@ impl ffi::GamesModel {
         });
     }
 
-    fn toggle_favorite_at(self: Pin<&mut Self>, index: i32) {
+    fn toggle_favorite_at(mut self: Pin<&mut Self>, index: i32) {
         if index < 0 || index >= self.count {
             return;
         }
@@ -1005,17 +1214,41 @@ impl ffi::GamesModel {
         if !is_media_capable_entry(entry) {
             return;
         }
-        let Some(params) = favorite_params_for_entry(entry, !has_favorite_tag(&entry.tags)) else {
+        let want_favorite = !has_favorite_tag(&entry.tags);
+        let Some(params) = favorite_params_for_entry(entry, want_favorite) else {
             warn!(
                 "favorite update skipped: missing media identity for {}",
                 entry.name
             );
+            report_action_error("favorite", entry.name.clone());
             return;
         };
         let name = entry.name.clone();
         let media_id = entry.media_id;
         let system_id = entry_system_id(entry);
         let path = entry.path.clone();
+        let previous_tags = entry.tags.clone();
+
+        // Paint the heart now, reconcile with Core's answer later.
+        //
+        // A favorite toggle is a one-bit local edit the user has already
+        // decided on; making them watch a WebSocket round-trip (plus Core's
+        // own DB write) before the tile changes is what made this read as
+        // sluggish. `apply_favorite_tags` is reused verbatim so the
+        // optimistic write goes through the same identity re-check and the
+        // same `dataChanged(FAVORITE_ROLE)` emit as the authoritative one.
+        //
+        // Deliberately skipped when the flip would REMOVE the row (see
+        // `apply_favorite_tags`'s `favorites_only` branch): reverting a
+        // removal needs a re-insert at the original index, and a wrong
+        // optimistic removal is worse than a slow correct one. That path
+        // keeps waiting for Core.
+        let optimistic = !self.favorites_only || want_favorite;
+        if optimistic {
+            let next_tags = favorite_tags_after_toggle(&previous_tags, want_favorite);
+            apply_favorite_tags(self.as_mut(), index, media_id, &system_id, &path, next_tags);
+        }
+
         let store = global_store();
         let qt_thread = self.qt_thread();
         global_handle().spawn(async move {
@@ -1032,7 +1265,24 @@ impl ffi::GamesModel {
                         );
                     });
                 }
-                Err(e) => warn!("favorite update failed for {name}: {}", e.message),
+                Err(e) => {
+                    warn!("favorite update failed for {name}: {}", e.message);
+                    if optimistic {
+                        // Put the row back the way the user found it. The
+                        // action-error alert below explains why.
+                        let _ = qt_thread.queue(move |mut model| {
+                            apply_favorite_tags(
+                                model.as_mut(),
+                                index,
+                                media_id,
+                                &system_id,
+                                &path,
+                                previous_tags,
+                            );
+                        });
+                    }
+                    report_action_error("favorite", name);
+                }
             }
         });
     }
@@ -1116,9 +1366,9 @@ impl ffi::GamesModel {
     // Immediate, non-debounced sibling of `load_description_at`. Called the
     // moment the focused row changes so the detail pane reflects THIS row's
     // local metadata (description + entry tags) at once, instead of holding the
-    // previous row's values through the load debounce. The debounced
-    // `load_description_at` then enriches it from media.meta. Games entries
-    // carry their own tags, so this needs no metadata cache.
+    // previous row's values through the load debounce. A warm neighbor paints
+    // richer cached metadata immediately; a cold row keeps BrowseEntry values
+    // visible until debounced `load_description_at` performs its single fetch.
     fn peek_description_at(mut self: Pin<&mut Self>, index: i32) {
         self.as_mut()
             .rust_mut()
@@ -1133,6 +1383,7 @@ impl ffi::GamesModel {
         }
         self.as_mut().rust_mut().detail_prefetch_row = Some(index);
         prefetch_cursor_window(&self, index);
+        enqueue_meta_prefetch(&self.entries, self.count, index);
 
         let entry = &self.entries[index as usize];
         if !is_media_capable_entry(entry) {
@@ -1145,14 +1396,41 @@ impl ffi::GamesModel {
 
         let description = entry.description.clone();
         let detail_tags = detail_tags_from_entry(entry);
-        // Local tags paint immediately, so mark loading without blanking: the
-        // detail pane shows this row's values while the richer media.meta fetch
-        // is still pending.
-        self.as_mut().set_current_detail_loading(true);
-        self.as_mut()
-            .set_current_description(QString::from(description.as_str()));
-        self.as_mut()
-            .set_current_detail_tags(QString::from(detail_tags.as_str()));
+        let meta_key = meta_cache_key_for_entry(entry);
+        let lookup = meta_key.as_ref().map_or(MetaLookup::Miss, |key| {
+            global_media_meta_cache().lookup(key)
+        });
+        match lookup {
+            MetaLookup::Hit(meta) => {
+                let rich_description = description_from_meta(&meta);
+                let visible_description = if rich_description.is_empty() {
+                    description
+                } else {
+                    rich_description
+                };
+                self.as_mut()
+                    .set_current_description(QString::from(visible_description.as_str()));
+                self.as_mut()
+                    .set_current_detail_tags(QString::from(detail_tags_from_meta(&meta).as_str()));
+                self.as_mut().set_current_detail_loading(false);
+            }
+            MetaLookup::Negative => {
+                self.as_mut()
+                    .set_current_description(QString::from(description.as_str()));
+                self.as_mut()
+                    .set_current_detail_tags(QString::from(detail_tags.as_str()));
+                self.as_mut().set_current_detail_loading(false);
+            }
+            MetaLookup::Miss => {
+                // Preserve BrowseEntry metadata while the debounced focused
+                // request remains cold.
+                self.as_mut()
+                    .set_current_description(QString::from(description.as_str()));
+                self.as_mut()
+                    .set_current_detail_tags(QString::from(detail_tags.as_str()));
+                self.as_mut().set_current_detail_loading(true);
+            }
+        }
         // Deliberately do NOT switch the visible cover here. The cover has its
         // own grace-window hold (BrowseDetailPane coverHold) and is settled by
         // the debounced `load_description_at`. Re-pointing the 512px cover Image
@@ -1204,10 +1482,13 @@ impl ffi::GamesModel {
 
         let description = entry.description.clone();
         let detail_tags = detail_tags_from_entry(entry);
+        let fallback_system = entry_system_id(entry);
+        let fallback_path = entry.path.clone();
         // Use the cover-preference key as the synchronous primary so the detail
         // pane requests the same cache entry that `prefetch_around` already
         // warmed for the focused row — instant paint with no hourglass.
-        let detail_image_key = media_key_for(entry).map(MediaKey::with_current_cover_preference);
+        let detail_image_key = detail_cover_key_for_entry(entry);
+        let meta_key = meta_cache_key_for_entry(entry);
         let Some(params) = meta_params_for_entry(entry) else {
             self.as_mut().set_current_detail_loading(false);
             self.as_mut()
@@ -1227,76 +1508,35 @@ impl ffi::GamesModel {
         set_single_detail_image_key(self.as_mut(), detail_image_key);
         refresh_adjacent_cover_prefetch(self.as_mut());
 
+        if let Some(key) = meta_key.as_ref() {
+            match global_media_meta_cache().lookup(key) {
+                MetaLookup::Hit(meta) => {
+                    apply_games_detail_meta(self.as_mut(), index, &meta);
+                    self.as_mut().set_current_detail_loading(false);
+                    return;
+                }
+                MetaLookup::Negative => {
+                    self.as_mut().set_current_detail_loading(false);
+                    return;
+                }
+                MetaLookup::Miss => {}
+            }
+        }
+
         let seq = self.rust().description_seq.clone();
         let qt_thread = self.qt_thread();
-        let store = global_store();
         global_handle().spawn(async move {
-            let result = store.client().media_meta(params).await;
+            let result =
+                fetch_media_meta_with_path_fallback(params, fallback_system, fallback_path).await;
+            if let Some(key) = meta_key {
+                global_media_meta_cache().store_fetch_result(key, &result);
+            }
             let _ = qt_thread.queue(move |mut model| {
                 if seq.load(Ordering::SeqCst) != ticket {
                     return;
                 }
                 match result {
-                    Ok(result) => {
-                        let meta = result.media;
-                        let description = description_from_meta(&meta);
-                        if !description.is_empty() {
-                            model
-                                .as_mut()
-                                .set_current_description(QString::from(description.as_str()));
-                        }
-                        model.as_mut().set_current_detail_tags(QString::from(
-                            detail_tags_from_meta(&meta).as_str(),
-                        ));
-                        let cover_key = media_key_for(&model.entries[index as usize])
-                            .map(MediaKey::with_current_cover_preference);
-                        let type_keys = detail_image_keys_from_meta(
-                            &meta,
-                            meta.title.system.id.as_str(),
-                            meta.path.as_str(),
-                        );
-                        if type_keys.is_empty() {
-                            // No alternate images — just the cover; clear any
-                            // stale pending carousel from a previous selection.
-                            model.as_mut().rust_mut().pending_carousel_keys = None;
-                            let detail_keys = cover_key.into_iter().collect();
-                            set_detail_image_keys(model.as_mut(), detail_keys);
-                        } else if MediaImageCache::current_cover_preference_type().is_none() {
-                            // Auto preference: we need Core's resolved type_tag
-                            // for index-0 to drop its twin from the carousel tail.
-                            // Check the cache; if the cover is already warm the
-                            // type is known and we can dedup now. If not, stash
-                            // the candidate keys and let notify_cover_update finish
-                            // once the cover lands.
-                            let cache = global_media_image_cache();
-                            let resolved = cover_key
-                                .as_ref()
-                                .and_then(|k| cache.resolved_image_type(k));
-                            if resolved.is_some() || cover_key.is_none() {
-                                // Cover already fetched — dedup immediately.
-                                model.as_mut().rust_mut().pending_carousel_keys = None;
-                                let detail_keys = ordered_detail_image_keys(
-                                    cover_key,
-                                    type_keys,
-                                    resolved.as_deref(),
-                                );
-                                set_detail_image_keys(model.as_mut(), detail_keys);
-                            } else {
-                                // Cover still in-flight. Publish a single-image
-                                // carousel now (no arrows) and stash the candidates
-                                // so notify_cover_update can finalize once the type
-                                // is known.
-                                model.as_mut().rust_mut().pending_carousel_keys = Some(type_keys);
-                                let detail_keys = cover_key.into_iter().collect();
-                                set_detail_image_keys(model.as_mut(), detail_keys);
-                            }
-                        } else {
-                            // Explicit preference — existing dedup path.
-                            model.as_mut().rust_mut().pending_carousel_keys = None;
-                            let detail_keys = ordered_detail_image_keys(cover_key, type_keys, None);
-                            set_detail_image_keys(model.as_mut(), detail_keys);
-                        }
-                    }
+                    Ok(result) => apply_games_detail_meta(model.as_mut(), index, &result.media),
                     Err(e) => warn!("games detail fetch failed: {}", e.message),
                 }
                 model.as_mut().set_current_detail_loading(false);
@@ -1348,11 +1588,34 @@ impl ffi::GamesModel {
         QString::from(self.entries[index as usize].entry_type.as_str())
     }
 
+    /// Round 11: index-based sibling to the `fileCount` role, for the one
+    /// caller that reads by index rather than through a delegate (the
+    /// footer `ActiveLabel`'s tags provider -- see MediaListScreen.qml).
+    fn file_count_at(&self, index: i32) -> i32 {
+        if index < 0 || index >= self.count {
+            return 0;
+        }
+        let entry = &self.entries[index as usize];
+        // See FILE_COUNT_ROLE's data-arm comment: 0 for a media-capable
+        // directory suppresses the folder-count suffix at the source.
+        if is_media_capable_entry(entry) {
+            return 0;
+        }
+        i32::try_from(entry.file_count).unwrap_or(i32::MAX)
+    }
+
     fn is_media_capable_at(&self, index: i32) -> bool {
         if index < 0 || index >= self.count {
             return false;
         }
         is_media_capable_entry(&self.entries[index as usize])
+    }
+
+    fn is_filesystem_root_at(&self, index: i32) -> bool {
+        if index < 0 || index >= self.count {
+            return false;
+        }
+        is_filesystem_root_entry(&self.entries[index as usize])
     }
 
     fn index_for_game_path(&self, path: &QString) -> i32 {
@@ -1391,15 +1654,15 @@ impl ffi::GamesModel {
     }
 
     /// Issue a fresh `media.browse` for `(path, systems)`. Bumps `seq`,
-    /// aborts the prior watcher, clears entries via `beginResetModel`,
+    /// aborts the prior watcher, retains hidden rows for efficient replacement,
     /// subscribes to `MediaBrowseEndpoint`, and spawns a watcher whose
     /// queued callbacks bail unless the ticket still matches.
     ///
     /// `eligible_for_auto_nav` is set when this load came from
-    /// `set_system`. The single-root auto-nav case in
-    /// `apply_initial_page` consumes the flag to decide whether to skip
-    /// rendering the 1-item roots list and dive straight into that
-    /// root.
+    /// `set_system`. `decide_initial` consumes the flag to decide whether
+    /// to skip rendering a lone leftover `root` entry (a virtual-only
+    /// system, or an older Core's pre-merge routes list) and dive straight
+    /// into it.
     fn start_initial_browse(
         mut self: Pin<&mut Self>,
         path: String,
@@ -1414,6 +1677,11 @@ impl ffi::GamesModel {
             "games: start_initial_browse",
         );
         self.as_mut().rust_mut().nav_timing = Some(NavTiming::new("network"));
+        // Navigation owns the fetch budget. Drop queued covers from the
+        // previous folder before model/cache work begins so stale image RPCs
+        // cannot delay a cached parent restore or the destination's first frame.
+        // Already in-flight requests finish normally.
+        global_media_image_cache().clear_pending_requests();
         self.as_mut().ensure_cover_subscription();
         self.as_mut().set_current_path(QString::from(path.as_str()));
         self.as_mut().set_loading(true);
@@ -1445,10 +1713,6 @@ impl ffi::GamesModel {
         // reset and preserve appended pages + selection.
         self.as_mut().rust_mut().is_seeded = false;
         self.as_mut().rust_mut().next_cursor = None;
-        // Drop any held initial-look-ahead gate from the prior browse —
-        // its append (if it lands at all) will be ticket-rejected and
-        // can't re-arm the gate for this new target.
-        self.as_mut().rust_mut().pending_initial_lookahead = false;
         // Invalidate any in-flight sub-batch posts from the prior
         // browse: each posted closure compares against the snapshotted
         // ticket and bails if the model has moved on. Otherwise a
@@ -1458,15 +1722,11 @@ impl ffi::GamesModel {
             .rust_mut()
             .append_seq
             .fetch_add(1, Ordering::SeqCst);
-        if !self.entries.is_empty() {
-            self.as_mut().begin_reset_model();
-            self.as_mut().rust_mut().entries.clear();
-            self.as_mut().rust_mut().disambig_displays.clear();
-            self.as_mut().rust_mut().count = 0;
-            self.as_mut().end_reset_model();
-            self.as_mut().count_changed();
-        }
-        // Total-files counter resets too — the previous path's
+        // Keep prior rows mounted while Loading hides the grid. Clearing here
+        // would tear down delegates now, then rebuild them when destination
+        // rows arrive. Retaining them enables same-sized results to update in
+        // place and avoids two model resets for every folder navigation.
+        // Total-files counter resets — the previous path's
         // denominator would be misleading until the new fetch lands.
         self.as_mut().set_total_files(0);
         // Total-dirs counter is the other denominator term; reset it for
@@ -1476,12 +1736,6 @@ impl ffi::GamesModel {
         if let Some(handle) = self.as_mut().rust_mut().watcher.take() {
             handle.abort();
         }
-        // Tear down any cover gate left from the prior path. See
-        // `reset_cover_gate` for the rationale; without this teardown
-        // a stale timer callback could fire after the new path's
-        // `set_loading(true)` and prematurely release its gate.
-        reset_cover_gate(self.as_mut());
-
         let seq = self.rust().seq.clone();
         let ticket = seq.fetch_add(1, Ordering::SeqCst) + 1;
 
@@ -1490,6 +1744,7 @@ impl ffi::GamesModel {
             path,
             systems,
             max_results,
+            favorites_tags(self.favorites_only),
         ));
         let mut status_rx = resource.subscribe();
 
@@ -1541,10 +1796,85 @@ fn entry_system_id(entry: &BrowseEntry) -> String {
     entry.system_ids.first().cloned().unwrap_or_default()
 }
 
+/// System hint for a Hub tile pinned from a games row: the row's own system
+/// when Core reported one, else the system being browsed (what the
+/// synchronous "Add to Hub" branches in `Main.qml` use). A `zapscript` tile
+/// with no system can only fall back to a generic icon.
+fn hub_target_system_id(entry: &BrowseEntry, current_system_id: &str) -> String {
+    let own = entry_system_id(entry);
+    if !own.trim().is_empty() {
+        return own;
+    }
+    current_system_id.to_string()
+}
+
+/// A `root` row that addresses a real filesystem folder — one of a system's
+/// configured game directories, the shape Core returns when it hasn't merged
+/// them (`rootView: "contents"` needs a Core new enough, an empty path, and
+/// exactly one system; see `merged_root_view`).
+///
+/// Exists so the games context menu can offer "Add to Hub" on those rows. It
+/// used to refuse every `root`, on the stated grounds that they were a
+/// `..`/scope pseudo-entry — but nothing synthesizes such a row; Back is the
+/// cancel button, not a list entry. Every `root` here is a real, browsable
+/// Core route, and refusing them is why a system with several game folders
+/// could not have those folders pinned.
+///
+/// Virtual-scheme routes are deliberately excluded. Core never merges them
+/// (`MiSTer` Arcade's `mame-arcade://` is the in-tree example) and they are
+/// still prepended to merged listings, but a Hub `folder` tile is addressed
+/// by filesystem path — pointing one at a scheme URL is untried, and the
+/// reported gap was about real directories.
+fn is_filesystem_root_entry(entry: &BrowseEntry) -> bool {
+    entry.entry_type == "root" && !entry.path.is_empty() && !entry.path.contains("://")
+}
+
 fn is_media_capable_entry(entry: &BrowseEntry) -> bool {
     entry.entry_type == "media"
         || (entry.entry_type == "directory"
             && (entry.media_id.is_some() || !entry.zap_script.is_empty()))
+}
+
+fn favorites_tags(enabled: bool) -> Vec<String> {
+    if enabled {
+        vec!["user:favorite".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Build Core-backed random command. Path form is recursive and includes
+/// virtual descendants; system form covers whole selected system.
+fn games_random_launch_text(
+    current_path: &str,
+    current_system_id: &str,
+    favorites_only: bool,
+) -> Option<String> {
+    let scope = if !current_path.is_empty() {
+        escape_zapscript_arg(current_path)
+    } else if !current_system_id.is_empty() {
+        escape_zapscript_arg(current_system_id)
+    } else {
+        return None;
+    };
+    let tags = if favorites_only {
+        "?tags=user:favorite"
+    } else {
+        ""
+    };
+    Some(format!("**launch.random:{scope}{tags}"))
+}
+
+/// Escape `ZapScript` separators while leaving path/system text readable.
+fn escape_zapscript_arg(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '^' | '?' | ',' | '&' | '|') {
+            escaped.push('^');
+        }
+        escaped.push(ch);
+    }
+    escaped
 }
 
 fn run_text_for_entry(entry: &BrowseEntry) -> Option<String> {
@@ -1688,6 +2018,42 @@ fn meta_params_for_entry(entry: &BrowseEntry) -> Option<MediaMetaParams> {
     Some(MediaMetaParams::for_media(system_id, entry.path.clone()))
 }
 
+fn meta_cache_key_for_entry(entry: &BrowseEntry) -> Option<MediaKey> {
+    if !is_media_capable_entry(entry) {
+        return None;
+    }
+    let system_id = entry_system_id(entry);
+    if system_id.trim().is_empty() || entry.path.trim().is_empty() {
+        return None;
+    }
+    Some(MediaKey::new(system_id, entry.path.clone()))
+}
+
+/// Warm only two rows either side of cursor. Cache identity remains canonical
+/// `(systemId, path)` while request refs prefer Core's ephemeral media ID.
+fn enqueue_meta_prefetch(entries: &[BrowseEntry], count: i32, row: i32) {
+    let mut requests = Vec::new();
+    for delta in [-2_i32, -1, 1, 2] {
+        let index = row + delta;
+        if index < 0 || index >= count {
+            continue;
+        }
+        let Some(entry) = usize::try_from(index).ok().and_then(|i| entries.get(i)) else {
+            continue;
+        };
+        let (Some(key), Some(params)) = (
+            meta_cache_key_for_entry(entry),
+            meta_params_for_entry(entry),
+        ) else {
+            continue;
+        };
+        requests.push((key, params));
+    }
+    if !requests.is_empty() {
+        global_media_meta_cache().prefetch(requests);
+    }
+}
+
 fn singleton_directory_needs_launch_resolution(entry: &BrowseEntry) -> bool {
     entry.entry_type == "directory" && entry.media_id.is_some()
 }
@@ -1771,6 +2137,53 @@ fn detail_image_keys_from_meta(meta: &MediaMeta, system: &str, path: &str) -> Ve
 /// `resolved_type` is Core's reported `type_tag` for the index-0 cover (the
 /// concrete type Core actually served). Pass `None` when it isn't known yet;
 /// the caller will call again once the cover fetch completes.
+fn apply_games_detail_meta(mut model: Pin<&mut ffi::GamesModel>, index: i32, meta: &MediaMeta) {
+    let description = description_from_meta(meta);
+    if !description.is_empty() {
+        model
+            .as_mut()
+            .set_current_description(QString::from(description.as_str()));
+    }
+    model
+        .as_mut()
+        .set_current_detail_tags(QString::from(detail_tags_from_meta(meta).as_str()));
+
+    let entry = usize::try_from(index)
+        .ok()
+        .and_then(|index| model.entries.get(index));
+    if !entry.is_some_and(|entry| entry.has_cover) {
+        model.as_mut().rust_mut().pending_carousel_keys = None;
+        set_detail_image_keys(model, Vec::new());
+        return;
+    }
+    let cover_key = entry.and_then(detail_cover_key_for_entry);
+    let type_keys =
+        detail_image_keys_from_meta(meta, meta.title.system.id.as_str(), meta.path.as_str());
+    if type_keys.is_empty() {
+        model.as_mut().rust_mut().pending_carousel_keys = None;
+        set_detail_image_keys(model, cover_key.into_iter().collect());
+        return;
+    }
+    if MediaImageCache::current_cover_preference_type().is_some() {
+        model.as_mut().rust_mut().pending_carousel_keys = None;
+        let detail_keys = ordered_detail_image_keys(cover_key, type_keys, None);
+        set_detail_image_keys(model, detail_keys);
+        return;
+    }
+
+    let resolved = cover_key
+        .as_ref()
+        .and_then(|key| global_media_image_cache().resolved_image_type(key));
+    if resolved.is_some() || cover_key.is_none() {
+        model.as_mut().rust_mut().pending_carousel_keys = None;
+        let detail_keys = ordered_detail_image_keys(cover_key, type_keys, resolved.as_deref());
+        set_detail_image_keys(model, detail_keys);
+    } else {
+        model.as_mut().rust_mut().pending_carousel_keys = Some(type_keys);
+        set_detail_image_keys(model, cover_key.into_iter().collect());
+    }
+}
+
 fn ordered_detail_image_keys(
     cover_key: Option<MediaKey>,
     type_keys: Vec<MediaKey>,
@@ -2162,11 +2575,18 @@ fn cover_key_for(entry: &BrowseEntry, page_size: u32, requests_enabled: bool) ->
             cache.enqueue_with_media_id(k.clone(), entry.media_id, page_size);
         }
     }
+    // `!requests_enabled` (covers paused for a bulk/jump append) is
+    // deliberately NOT folded in here — that means "haven't asked yet,"
+    // not "confirmed absent." Folding it in used to show the chip
+    // placeholder for every game while paused, including ones that do
+    // have art, instead of staying blank like an in-flight fetch. Only a
+    // genuine negative memo, soft-no-image, or Core's own `has_cover:
+    // false` earns the chip; see `cover_key_for_with`'s doc comment.
     cover_key_for_with(
         entry,
         media_key.as_ref(),
         effective_cached,
-        negative || soft_no_image || no_cover || !requests_enabled,
+        negative || soft_no_image || no_cover,
     )
 }
 
@@ -2208,6 +2628,13 @@ fn media_key_for(entry: &BrowseEntry) -> Option<MediaKey> {
         )),
         None => Some(MediaKey::new(system_id, entry.path.clone())),
     }
+}
+
+fn detail_cover_key_for_entry(entry: &BrowseEntry) -> Option<MediaKey> {
+    entry
+        .has_cover
+        .then(|| media_key_for(entry).map(MediaKey::with_current_cover_preference))
+        .flatten()
 }
 
 /// Pure ordering helper for `prefetch_around`. Returns
@@ -2315,8 +2742,7 @@ fn prefetch_cursor_window(model: &ffi::GamesModel, index: i32) {
 }
 
 fn has_favorite_tag(tags: &[TagInfo]) -> bool {
-    tags.iter()
-        .any(|tag| tag.tag_type == "user" && tag.tag == "favorite")
+    tags.iter().any(is_favorite_tag)
 }
 
 fn favorite_role_value(tags: &[TagInfo]) -> i32 {
@@ -2365,6 +2791,29 @@ fn apply_favorite_tags(
         return;
     }
     model.as_mut().rust_mut().entries[index as usize].tags = tags;
+    // Unfavoriting under Core-backed Favorites scope removes row immediately;
+    // endpoint invalidation then reconciles authoritative paged result.
+    let entry = &model.entries[index as usize];
+    if model.favorites_only && !entry.is_folder() && !has_favorite_tag(&entry.tags) {
+        let parent = QModelIndex::default();
+        model.as_mut().begin_remove_rows(&parent, index, index);
+        model.as_mut().rust_mut().entries.remove(index as usize);
+        let count = model.count.saturating_sub(1);
+        model.as_mut().rust_mut().count = count;
+        let displays = compute_disambig_displays(&model.entries, model.show_original_filenames);
+        model.as_mut().rust_mut().disambig_displays = displays;
+        model.as_mut().end_remove_rows();
+        model.as_mut().count_changed();
+        // Sibling groups above the removal may trim differently now.
+        if count > 0 {
+            let mut roles = QList::<i32>::default();
+            roles.append(DISAMBIGUATING_TAGS_ROLE);
+            let first = model.index(0, 0, &parent);
+            let last = model.index(count - 1, 0, &parent);
+            model.as_mut().data_changed(&first, &last, &roles);
+        }
+        return;
+    }
     let mut roles = QList::<i32>::default();
     roles.append(FAVORITE_ROLE);
     let parent = QModelIndex::default();
@@ -2377,23 +2826,28 @@ fn apply_favorite_tags(
 /// without spinning up the global cover cache and its tokio runtime.
 ///
 /// `icons/Loading` is the in-flight cue: an entry that has a media key
-/// but no cached bytes and no negative memo is one we're actively
-/// fetching (or about to). Tile.qml's cover Image renders that
-/// hourglass at full size until the cache update broadcast lands and
-/// `dataChanged(COVER_KEY_ROLE)` flips this to either `media-image/...`
-/// (success) or `icons/File` (negative memo).
+/// but no cached bytes and isn't confirmed absent is one we're actively
+/// fetching, about to fetch, or simply paused on (bulk/jump append in
+/// flight) -- all three render the same blank placeholder. Tile.qml's
+/// cover Image renders that hourglass at full size until the cache
+/// update broadcast lands and `dataChanged(COVER_KEY_ROLE)` flips this to
+/// either `media-image/...` (success) or `icons/File` (confirmed
+/// absent). `confirmed_absent` must only be true for a real negative
+/// memo, soft-no-image, or Core's own `has_cover: false` -- never for
+/// "requests are merely paused right now," which looks identical to an
+/// in-flight fetch to the user and must stay blank, not show the chip.
 fn cover_key_for_with(
     entry: &BrowseEntry,
     key: Option<&MediaKey>,
     cached: bool,
-    unavailable: bool,
+    confirmed_absent: bool,
 ) -> String {
     if !is_media_capable_entry(entry) && entry.is_folder() {
         return "icons/Folder".to_string();
     }
     match key {
         Some(k) if cached => MediaImageCache::image_key_for(k),
-        Some(_) if !unavailable => "icons/Loading".to_string(),
+        Some(_) if !confirmed_absent => "icons/Loading".to_string(),
         _ => "icons/File".to_string(),
     }
 }
@@ -2425,10 +2879,6 @@ fn mark_nav_request_done(mut model: Pin<&mut ffi::GamesModel>) {
 /// `entries` vec — pages top out at a few hundred rows after look-
 /// ahead, and the bridge runs only when the cover-cache fetch driver
 /// delivers a result.
-///
-/// Also drains `pending_first_paint_keys`: each cover landing during
-/// the gate's hold ticks the set down, and emptying the set releases
-/// the gate so the screen-flip overlay clears.
 fn notify_cover_update(mut model: Pin<&mut ffi::GamesModel>, key: &MediaKey) {
     let rows: Vec<i32> = model
         .entries
@@ -2480,26 +2930,6 @@ fn notify_cover_update(mut model: Pin<&mut ffi::GamesModel>, key: &MediaKey) {
         let detail_keys = ordered_detail_image_keys(cover_key, type_keys, resolved.as_deref());
         set_detail_image_keys(model.as_mut(), detail_keys);
     }
-    // Tick the gate's pending set down. `remove` returns false if the
-    // key wasn't gated (broadcast events fire for every cache update,
-    // including miss-recovery enqueues from `cover_key_for`); we only
-    // try to release when a gated key was actually drained.
-    let was_pending = model
-        .as_mut()
-        .rust_mut()
-        .pending_first_paint_keys
-        .remove(key);
-    if was_pending && model.pending_first_paint_keys.is_empty() && model.loading {
-        if let Some(handle) = model.as_mut().rust_mut().cover_gate_timer.take() {
-            handle.abort();
-        }
-        if model.loading {
-            info!("games: cover gate released after visible covers cached");
-            model.as_mut().set_loading(false);
-            finish_nav_timing(model.as_mut(), "covers-ready", 0);
-            maybe_start_initial_lookahead(model.as_mut());
-        }
-    }
     // Re-check the adjacent preload keys: a neighbor's bytes may have
     // just landed, which can flip its key from `icons/Loading` to
     // `media-image/...` and trigger the hidden Image's decode while the
@@ -2507,11 +2937,8 @@ fn notify_cover_update(mut model: Pin<&mut ffi::GamesModel>, key: &MediaKey) {
     refresh_adjacent_cover_prefetch(model);
 }
 
-/// Compute the set of media keys on the current page whose covers we
-/// must wait on before releasing the cover gate. Folders, unattributed
-/// entries, already-cached keys, and negatively-memoised keys are all
-/// excluded. Pure helper so the gate's binning logic is unit-testable
-/// without spinning up the global cache + tokio runtime.
+/// Compute unresolved visible-cover keys for navigation telemetry. Folders,
+/// unattributed entries, cached keys, and negatively memoized keys are excluded.
 fn compute_unresolved_keys<F, G>(
     entries: &[BrowseEntry],
     is_cached: F,
@@ -2532,48 +2959,15 @@ where
         .collect()
 }
 
-/// Abort any in-flight cover-gate timer, drop the waiting-keys set,
-/// and bump `cover_gate_seq` so a callback that already queued onto
-/// the Qt thread before the abort took effect sees a stale ticket and
-/// bails. Used on every browse status edge that doesn't go on to call
-/// `arm_cover_gate` itself (Pending, Errored, and the
-/// `start_initial_browse` reset).
-fn reset_cover_gate(mut model: Pin<&mut ffi::GamesModel>) {
-    if let Some(handle) = model.as_mut().rust_mut().cover_gate_timer.take() {
-        handle.abort();
-    }
-    model.as_mut().rust_mut().pending_first_paint_keys.clear();
-    model.rust().cover_gate_seq.fetch_add(1, Ordering::SeqCst);
-}
-
-/// Decide whether to hold `loading=true` until the page's covers are
-/// cached, or release immediately. Called once per `apply_initial_page`.
-///
-/// - If every media entry is already cached or negatively-memoised
-///   (folder-only page, or revisit), set loading=false right now —
-///   there's nothing to wait on, the screen-flip overlay clears.
-/// - Otherwise, store the unresolved set on the model, arm a short
-///   safety timer, and leave loading=true. `notify_cover_update` will
-///   drain the set as covers land; whichever happens first (set empties
-///   or timer fires) releases the gate.
-///
-/// The timeout is the fall-through: if visible cover fetches are cold,
-/// the user sees `Loading…` only briefly before the existing "list with
-/// placeholders → covers pop in" behavior resumes.
-fn arm_cover_gate(mut model: Pin<&mut ffi::GamesModel>) {
-    if let Some(handle) = model.as_mut().rust_mut().cover_gate_timer.take() {
-        handle.abort();
-    }
+/// Release the model as soon as rows are installed. Cover statistics remain in
+/// navigation telemetry, but raster readiness is deliberately not a navigation
+/// gate: QML paints one stable card/text frame, then enables cover sources from
+/// the following frame callback.
+fn release_model_before_covers(mut model: Pin<&mut ffi::GamesModel>) {
     let cache = global_media_image_cache();
-    // Scope the waiting set to the visible page only, not all loaded
-    // entries. The prefetcher queues only ~3 pages' worth; computing
-    // over all entries means the set can never drain on a large folder
-    // (e.g. 411 PSX dirs) and the gate always rides the full timeout.
-    // Using the visible page (page_size rows starting at visible_first_row)
-    // lets the set drain as soon as the on-screen covers land.
     let page_size = model.page_size.max(1) as usize;
-    let first = model.rust().visible_first_row.max(0) as usize;
-    let window_end = (first + page_size).min(model.entries.len());
+    let first = (model.rust().visible_first_row.max(0) as usize).min(model.entries.len());
+    let window_end = first.saturating_add(page_size).min(model.entries.len());
     let visible_entries = &model.entries[first..window_end];
     let cover_keys = visible_entries
         .iter()
@@ -2590,73 +2984,9 @@ fn arm_cover_gate(mut model: Pin<&mut ffi::GamesModel>) {
     if let Some(timing) = model.as_mut().rust_mut().nav_timing.as_mut() {
         timing.start_gate(cover_total, cover_cache_hits, unresolved.len());
     }
-    if unresolved.is_empty() {
-        model.as_mut().rust_mut().pending_first_paint_keys.clear();
-        if model.loading {
-            model.as_mut().set_loading(false);
-            finish_nav_timing(model.as_mut(), "covers-ready", 0);
-            maybe_start_initial_lookahead(model.as_mut());
-        }
-        return;
-    }
-    info!(
-        pending = unresolved.len(),
-        "games: arm cover gate (holding loading until covers cached)"
-    );
-    model.as_mut().rust_mut().pending_first_paint_keys = unresolved;
-    arm_cover_gate_timeout(model);
-}
-
-fn arm_cover_gate_timeout(mut model: Pin<&mut ffi::GamesModel>) {
-    let seq = model.rust().cover_gate_seq.clone();
-    let ticket = seq.fetch_add(1, Ordering::SeqCst) + 1;
-    let qt_thread = model.qt_thread();
-    let handle = global_handle().spawn(async move {
-        tokio::time::sleep(Duration::from_millis(COVER_GATE_TIMEOUT_MS)).await;
-        let _ = qt_thread.queue(move |mut model: Pin<&mut ffi::GamesModel>| {
-            if seq.load(Ordering::SeqCst) != ticket {
-                return;
-            }
-            if model.loading && !model.pending_first_paint_keys.is_empty() {
-                release_cover_gate_after_timeout(model);
-            } else {
-                model.as_mut().rust_mut().cover_gate_timer = None;
-            }
-        });
-    });
-    model.as_mut().rust_mut().cover_gate_timer = Some(handle);
-}
-
-fn maybe_start_initial_lookahead(mut model: Pin<&mut ffi::GamesModel>) {
-    if !model.pending_initial_lookahead
-        || model.loading
-        || model.loading_more
-        || !model.has_next_page
-    {
-        return;
-    }
-    model.as_mut().rust_mut().pending_initial_lookahead = false;
-    model.as_mut().fetch_more();
-}
-
-/// Clear stale look-ahead state after the background prefetch lands or fails.
-fn release_initial_lookahead_gate(mut model: Pin<&mut ffi::GamesModel>) {
-    model.as_mut().rust_mut().pending_initial_lookahead = false;
-}
-
-/// Force-release the cover gate from the safety timer. Called only via
-/// the timer's queued callback after a seq-match check; the
-/// notify-driven release path lives inline in `notify_cover_update`.
-fn release_cover_gate_after_timeout(mut model: Pin<&mut ffi::GamesModel>) {
-    let pending = model.pending_first_paint_keys.len();
-    info!(pending, "games: cover gate timed out, releasing");
-    model.as_mut().rust_mut().pending_first_paint_keys.clear();
-    model.as_mut().rust_mut().cover_gate_timer = None;
-    // Safety timer is the hard upper bound for visible covers.
     if model.loading {
         model.as_mut().set_loading(false);
-        finish_nav_timing(model.as_mut(), "timeout", pending);
-        maybe_start_initial_lookahead(model.as_mut());
+        finish_nav_timing(model.as_mut(), "model-ready", 0);
     }
 }
 
@@ -2714,17 +3044,36 @@ fn decide_initial(
     platform: Option<&Platform>,
     current_path: &str,
 ) -> InitialAction {
-    // On MiSTer, single-folder loads also flatten on `set_path`. MiSTer
-    // collections often unzip into nested single-child folders; the
-    // recursion in `apply_status` calls `start_initial_browse(... false)`
-    // on the auto-nav target, so a chain of single-child folders
-    // collapses all the way down on each navigation step.
-    let mister_set_path_flatten = matches!(platform, Some(Platform::Mister));
-    let single_entry_flatten = eligible_after_set_system || mister_set_path_flatten;
-    if !single_entry_flatten || result.entries.len() != 1 {
+    if result.entries.len() != 1 {
         return InitialAction::Apply;
     }
     let entry = &result.entries[0];
+    if current_path.is_empty() {
+        // At the top of a system, Core's merged root (`rootView: "contents"`,
+        // see `merged_root_view`) can legitimately render as one directory --
+        // that's just a system with one subfolder of games, not a route to
+        // skip past. Only a lone `root` entry is a route: either an older
+        // Core still returning the unmerged routes list, or a virtual-only
+        // system (e.g. MiSTer Arcade's single `mame-arcade://` route) that
+        // Core never merges. Diving into anything else here would be a trap:
+        // `Main.qml`'s `_navigateOutOfFolder` refuses to pop below the top
+        // of the path stack, so the user could never get back to this level.
+        if !eligible_after_set_system || entry.entry_type != "root" {
+            return InitialAction::Apply;
+        }
+    } else {
+        // On MiSTer, single-folder loads also flatten on `set_path`. MiSTer
+        // collections often unzip into nested single-child folders; the
+        // recursion in `apply_status` calls `start_initial_browse(... false)`
+        // on the auto-nav target, so a chain of single-child folders
+        // collapses all the way down on each navigation step. This only
+        // applies below the system root -- see the empty-`current_path`
+        // branch above for the root-level rule.
+        let mister_set_path_flatten = matches!(platform, Some(Platform::Mister));
+        if !eligible_after_set_system && !mister_set_path_flatten {
+            return InitialAction::Apply;
+        }
+    }
     // Cycle guard: refuse to auto-nav into the path we're already on.
     // Prevents stack overflow if Core erroneously returns a folder
     // whose path equals the parent.
@@ -2779,11 +3128,14 @@ fn display_name<'a>(raw: &'a str, platform: Option<&Platform>) -> std::borrow::C
 }
 
 /// Drop any root-type entry whose path is a strict ancestor of another
-/// root entry's path. Defends against Core occasionally surfacing the
-/// shared parent dir (e.g. `/media/fat/games`) as a system root alongside
-/// the actual per-system roots beneath it; the parent appears as a
-/// phantom option in the frontend's roots screen, and selecting it
-/// browses into a directory that contains every other system.
+/// root entry's path. A Core new enough to merge system roots
+/// (`merged_root_view`) never sends this shape; this now only defends the
+/// pre-merge routes list an older Core still returns, where the shared
+/// parent dir (e.g. `/media/fat/games`) can occasionally surface as a
+/// system root alongside the actual per-system roots beneath it. Left in
+/// place unchanged: the parent would otherwise appear as a phantom option
+/// in that fallback list, and selecting it browses into a directory that
+/// contains every other system.
 ///
 /// Only `root`-type entries participate. `directory` and `media` entries
 /// pass through unchanged — a normal directory listing where a folder
@@ -2817,16 +3169,61 @@ fn is_strict_ancestor_path(parent: &str, child: &str) -> bool {
         .is_some_and(|rest| rest.starts_with('/'))
 }
 
+/// Round 11's "which root do I pick" fix, kept as the fallback for a Core
+/// older than the merged-root view (`merged_root_view`): a system with
+/// multiple configured folders shows one identically-named `root` row per
+/// folder, with nothing distinguishing them; find the first path component
+/// where the page's root entries disagree and return that component per
+/// entry ("fat" vs "usb0", "games" vs "games2"). A Core new enough to merge
+/// system roots resolves this server-side and never sends the shape this
+/// function looks for. Returned `Vec` is the same length and order as
+/// `entries`; non-root entries and any root that never needed
+/// disambiguating (fewer than two roots on the page, or one identical to
+/// every sibling up to where paths run out) get `""`.
+///
+/// Assumes `dedup_roots_drop_ancestors` already ran -- a root path being a
+/// strict prefix of a sibling's (the case that function exists to drop)
+/// is not itself guarded against here.
+fn root_distinguishers(entries: &[BrowseEntry]) -> Vec<String> {
+    let root_indices: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.entry_type == "root" && !e.path.is_empty())
+        .map(|(i, _)| i)
+        .collect();
+    let mut result = vec![String::new(); entries.len()];
+    if root_indices.len() < 2 {
+        return result;
+    }
+    let components: Vec<Vec<&str>> = root_indices
+        .iter()
+        .map(|&i| {
+            entries[i]
+                .path
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .collect();
+    let max_len = components.iter().map(Vec::len).max().unwrap_or(0);
+    let Some(diverge_at) = (0..max_len).find(|&idx| {
+        let first = components[0].get(idx);
+        components.iter().any(|c| c.get(idx) != first)
+    }) else {
+        return result;
+    };
+    for (&entry_idx, comps) in root_indices.iter().zip(components.iter()) {
+        if let Some(part) = comps.get(diverge_at) {
+            result[entry_idx] = (*part).to_string();
+        }
+    }
+    result
+}
+
 fn apply_status(mut model: Pin<&mut ffi::GamesModel>, status: ResourceStatus<MediaBrowseResult>) {
     match project_status(status) {
         Projection::Pending => {
             mark_nav_source(model.as_mut(), "network");
-            // A new browse round started (or a Ready→Pending refetch
-            // is in flight). Abort any cover gate left from the
-            // previous Ready so its safety-timer callback can't race
-            // with the loading=true we're about to set and clear it
-            // mid-load.
-            reset_cover_gate(model.as_mut());
             if !model.loading {
                 model.as_mut().set_loading(true);
             }
@@ -2922,10 +3319,13 @@ fn apply_status(mut model: Pin<&mut ffi::GamesModel>, status: ResourceStatus<Med
         }
         Projection::Errored { message } => {
             warn!("media.browse errored: {message}");
-            // Errored takes us out of Ready without going through
-            // `arm_cover_gate`, so any timer left armed by the prior
-            // Ready needs to be torn down explicitly.
-            reset_cover_gate(model.as_mut());
+            // Prior-target rows stay mounted only while a replacement is
+            // pending. On failure, remove them so the error state cannot paint
+            // stale content beneath ScreenStateOverlay. Seeded refetch errors
+            // retain current rows because they still represent active scope.
+            if !model.is_seeded {
+                clear_visible_entries(model.as_mut());
+            }
             let qstr = QString::from(message.as_str());
             if model.error_message != qstr {
                 model.as_mut().set_error_message(qstr);
@@ -2958,7 +3358,23 @@ fn result_total_dirs(result: &MediaBrowseResult) -> i32 {
                 .filter(|entry| entry.is_folder())
                 .count()
         },
-        |total_dirs| usize::try_from(total_dirs).unwrap_or(usize::MAX),
+        |total_dirs| {
+            // Core's merged-root `totalDirs` counts only the merged
+            // physical directories; it excludes the virtual-scheme
+            // `root` entries the same response prepends ahead of them
+            // (`rootView: "contents"`, see `merged_root_view`). Every
+            // frontend consumer of `total_dirs` treats it as "rows
+            // before the first media row", so fold those roots in here
+            // rather than patching each call site. Outside the merged
+            // root, `entries` never carries a `root` type alongside a
+            // present `totalDirs`, so this is a no-op there.
+            let leading_roots = result
+                .entries
+                .iter()
+                .filter(|entry| entry.entry_type == "root")
+                .count();
+            usize::try_from(total_dirs).unwrap_or(usize::MAX) + leading_roots
+        },
     );
     i32::try_from(total_dirs).unwrap_or(i32::MAX)
 }
@@ -3014,6 +3430,90 @@ fn apply_seeded_refetch(mut model: Pin<&mut ffi::GamesModel>, result: &MediaBrow
     finish_nav_timing(model.as_mut(), "already-seeded", 0);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitialRowReplacement {
+    InPlace,
+    TruncateInPlace,
+    Reset,
+}
+
+fn initial_row_replacement(current_count: i32, next_count: i32) -> InitialRowReplacement {
+    if current_count > 0 && current_count == next_count {
+        InitialRowReplacement::InPlace
+    } else if next_count > 0 && current_count > next_count {
+        InitialRowReplacement::TruncateInPlace
+    } else {
+        InitialRowReplacement::Reset
+    }
+}
+
+fn clear_visible_entries(mut model: Pin<&mut ffi::GamesModel>) {
+    if model.entries.is_empty() {
+        return;
+    }
+    model.as_mut().begin_reset_model();
+    model.as_mut().rust_mut().entries.clear();
+    model.as_mut().rust_mut().disambig_displays.clear();
+    model.as_mut().rust_mut().count = 0;
+    model.as_mut().end_reset_model();
+    model.as_mut().count_changed();
+}
+
+fn replace_initial_rows(
+    mut model: Pin<&mut ffi::GamesModel>,
+    entries: Vec<BrowseEntry>,
+    displays: Vec<String>,
+) -> &'static str {
+    let count = i32::try_from(entries.len()).unwrap_or(i32::MAX);
+    let replacement = initial_row_replacement(model.count, count);
+    if replacement == InitialRowReplacement::TruncateInPlace {
+        let old_count = model.count;
+        // Remove only surplus tail rows. Prefix delegates survive, so paged
+        // folder Back does not destroy and reconstruct destination's first page.
+        // QML has already reset selection/pending targets on loading=true.
+        let parent = QModelIndex::default();
+        model
+            .as_mut()
+            .begin_remove_rows(&parent, count, old_count - 1);
+        {
+            let mut rust = model.as_mut().rust_mut();
+            rust.entries = entries;
+            rust.disambig_displays = displays;
+            rust.count = count;
+        }
+        model.as_mut().end_remove_rows();
+        model.as_mut().count_changed();
+    } else if replacement == InitialRowReplacement::InPlace {
+        model.as_mut().rust_mut().entries = entries;
+        model.as_mut().rust_mut().disambig_displays = displays;
+    } else {
+        model.as_mut().begin_reset_model();
+        model.as_mut().rust_mut().entries = entries;
+        model.as_mut().rust_mut().disambig_displays = displays;
+        model.as_mut().rust_mut().count = count;
+        model.as_mut().end_reset_model();
+        model.as_mut().count_changed();
+        return "reset";
+    }
+
+    let parent = QModelIndex::default();
+    let top_left = model.as_mut().index(0, 0, &parent);
+    let bottom_right = model.as_mut().index(count - 1, 0, &parent);
+    // Prefix delegates survive both in-place paths, but rows may belong to a
+    // different folder. Empty roles invalidates every exposed value so path,
+    // launch, identity, and metadata cannot remain bound to the old row.
+    let roles = QList::<i32>::default();
+    model
+        .as_mut()
+        .data_changed(&top_left, &bottom_right, &roles);
+    let revision = model.rows_revision.wrapping_add(1);
+    model.as_mut().set_rows_revision(revision);
+    if replacement == InitialRowReplacement::TruncateInPlace {
+        return "truncate-in-place";
+    }
+    "in-place"
+}
+
 fn apply_initial_page(mut model: Pin<&mut ffi::GamesModel>, result: MediaBrowseResult) {
     let apply_started = Instant::now();
     if model.is_seeded {
@@ -3034,30 +3534,25 @@ fn apply_initial_page(mut model: Pin<&mut ffi::GamesModel>, result: MediaBrowseR
         total, total_dirs, has_next_page, "games: apply_initial_page"
     );
     let reset_started = Instant::now();
-    let displays = compute_disambig_displays(&entries, model.show_original_filenames);
-    model.as_mut().begin_reset_model();
-    model.as_mut().rust_mut().entries = entries;
-    model.as_mut().rust_mut().disambig_displays = displays;
-    model.as_mut().rust_mut().count = count;
+    let mut displays = compute_disambig_displays(&entries, model.show_original_filenames);
+    // Round 11: overlay the roots-screen distinguisher (see
+    // `root_distinguishers`'s doc comment) onto the same channel the tag
+    // table already uses for a sibling-diffed dim suffix -- root entries
+    // never carry Core tags, so `displays` is otherwise always blank for
+    // them, and QML's folder-count suffix composes `<distinguisher> · <N
+    // items>` from whatever lands here.
+    for (i, distinguisher) in root_distinguishers(&entries).into_iter().enumerate() {
+        if !distinguisher.is_empty() {
+            displays[i] = distinguisher;
+        }
+    }
     model.as_mut().rust_mut().next_cursor = next_cursor;
-    // Property setters run BEFORE `end_reset_model` so Main.qml's
-    // `onModelReset` handler observes the post-load state. In
-    // particular, the deep-page restore branch reads `has_next_page`
-    // to decide whether to chase the saved entry across pages; if
-    // we set it after `end_reset_model`, that handler sees the
-    // stale `false` left by `start_initial_browse` and abandons the
-    // restore (currentIndex snaps to 0). The order in
-    // `apply_append_page` is the opposite (set has_next_page AFTER
-    // the last insert) for a different reason: that path needs
-    // PagedGrid's pending-target watchdog to read a fresh itemCount
-    // when the flag flips false on the terminal chunk. A fresh
-    // model reset has no pending-target watchdog to mislead, so
-    // setting the flag early here is safe.
+    // Pagination properties must be current before either modelReset or
+    // rowsRevision asks Main.qml to restore a saved deep-page selection.
     model.as_mut().set_total_files(total);
     model.as_mut().set_total_dirs(total_dirs);
     model.as_mut().set_has_next_page(has_next_page);
-    model.as_mut().end_reset_model();
-    model.as_mut().count_changed();
+    let replacement_mode = replace_initial_rows(model.as_mut(), entries, displays);
     let reset_ms = reset_started.elapsed().as_millis();
     // Seed the cover queue from the visible row outwards instead of
     // bulk-enqueuing every entry. The grid resets to row 0 on a fresh
@@ -3067,11 +3562,9 @@ fn apply_initial_page(mut model: Pin<&mut ffi::GamesModel>, result: MediaBrowseR
     let prefetch_started = Instant::now();
     model.as_mut().prefetch_around(0);
     let prefetch_ms = prefetch_started.elapsed().as_millis();
-    // Seed the detail key for row 0 so the stale key from the previous
-    // folder cannot paint the instant the cover gate releases. The gate
-    // waits on the same warm cover key, so by the time `loading` flips
-    // false the cache-update handler has already promoted the key to its
-    // `media-image/...` form (or left it as the new folder/file chip).
+    // Seed detail key for row 0 so stale key from previous folder cannot
+    // paint when the row model appears. Cache-update handler later promotes
+    // it to `media-image/...` form (or leaves new folder/file chip).
     // The `is_seeded` early-return above skips this for invalidation
     // refetches; they share the same browse target and row 0 is already
     // correct.
@@ -3107,35 +3600,27 @@ fn apply_initial_page(mut model: Pin<&mut ffi::GamesModel>, result: MediaBrowseR
         apply_ms = apply_started.elapsed().as_millis(),
         "games: apply_initial_page timing",
     );
-    // Metadata look-ahead starts only after the visible page is
-    // interactive. Otherwise the follow-up append can create delegates
-    // during the transition and extend the perceived navigation stall.
-    let will_lookahead = has_next_page && !model.loading_more;
-    if will_lookahead {
-        model.as_mut().rust_mut().pending_initial_lookahead = true;
-    }
-    // Decide whether to release `loading` immediately or hold it until
-    // visible-page covers are cached. Background metadata look-ahead
-    // does not participate in this gate.
-    let gate_arm_started = Instant::now();
-    arm_cover_gate(model.as_mut());
-    let gate_arm_ms = gate_arm_started.elapsed().as_millis();
+    // Release `loading` as soon as rows are installed. Cover statistics are
+    // recorded, but QML reveals those images after the first model frame.
+    let reveal_release_started = Instant::now();
+    release_model_before_covers(model.as_mut());
+    let reveal_release_ms = reveal_release_started.elapsed().as_millis();
     debug!(
         count,
+        replacement_mode,
         transform_ms,
         reset_ms,
         prefetch_ms,
-        gate_arm_ms,
+        reveal_release_ms,
         total_ms = apply_started.elapsed().as_millis(),
         "games: apply_initial_page detail timing",
     );
     if !model.error_message.is_empty() {
         model.as_mut().set_error_message(QString::default());
     }
-    // If the visible page released synchronously (all covers cached or
-    // no media covers), start look-ahead now. Otherwise the release path
-    // calls `maybe_start_initial_lookahead` after loading flips false.
-    maybe_start_initial_lookahead(model.as_mut());
+    // Keep only initial visible page mounted. PagedGrid requests follow-up
+    // rows on demand; automatic 100-row look-ahead made parent/child model
+    // shapes differ and forced expensive delegate resets on every Back.
     // Mark seeded last so any early-return from this function leaves
     // the flag in its previous state. Subsequent Ready transitions
     // on the same browse target now skip the reset above.
@@ -3246,14 +3731,11 @@ fn apply_append_page(
             let total = i32::try_from(result.total_files).unwrap_or(i32::MAX);
             // Order matters for the pending-target chain in PagedGrid:
             //
-            // 1. `next_cursor` and `loading_more=false` MUST happen
-            //    before the FIRST sub-batch's `end_insert_rows`. The
-            //    Repeater reacts synchronously to `rowsInserted`;
-            //    PagedGrid's `onItemCountChanged` runs
-            //    `_commitPendingTarget`, which can re-fire
-            //    `loadMoreRequested` -> `fetch_more`. If `loading_more`
-            //    is still true at that moment the `fetch_more` guard
-            //    early-returns and the chain stalls after one append.
+            // 1. Keep `loading_more=true` until the LAST sub-batch lands. The
+            //    grid suppresses another cursor request while this flag is set,
+            //    preventing a later page from interleaving with this page's
+            //    frame-gapped tail. Its `onLoadingMoreChanged` handler resumes
+            //    any still-pending target once finalization clears the flag.
             //
             // 2. `has_next_page` MUST happen after the LAST sub-batch's
             //    `end_insert_rows`. On the final chunk the value flips
@@ -3270,51 +3752,44 @@ fn apply_append_page(
             // Sub-batching note: the rest of the chunk is posted from
             // `global_handle()` one frame apart so the Repeater's
             // per-delegate `createObject` cost (the dominant Qt-thread
-            // stall on MiSTer) is spread across frames. Stale batches
-            // self-disarm via the `append_seq` ticket if a new
+            // stall on MiSTer, paid per row for the outer cellItem even
+            // when the inner Tile stays retention-gated unmaterialised) is
+            // spread across frames instead of one multi-second block. Stale
+            // batches self-disarm via the `append_seq` ticket if a new
             // `start_initial_browse` lands during the trickle window.
+            //
+            // A bulk jump (`bulk: bool`) chunks exactly like an ordinary
+            // append now -- it used to insert its whole fetched chunk in one
+            // shot on the theory that off-page rows are cheap because their
+            // Tile delegates stay unmaterialised, but the outer per-row
+            // cellItem construction cost is paid regardless of Tile
+            // materialisation, and a `JUMP_FETCH_CHUNK_SIZE`-sized (1000-row)
+            // chunk blocked the Qt thread for tens of seconds. What bulk
+            // still needs, and non-bulk doesn't: `fetch_more_with_limit`
+            // paused cover requests for the whole jump, and that pause --
+            // plus the prefetch that re-arms once it lifts -- must stay held
+            // across every sub-batch and only resolve after the LAST one,
+            // once `_commitPendingTarget` has actually moved
+            // `visible_first_row` to the landing page. Resolving it
+            // per-batch like non-bulk does would warm covers for a page the
+            // cursor hasn't reached yet.
             model.as_mut().rust_mut().next_cursor = next_cursor;
-            model.as_mut().set_loading_more(false);
-            // Jump path: insert the whole chunk in one shot, no frame-gapped
-            // trickle. The appended rows sit far from `currentPage`, so their
-            // Tile delegates stay unmaterialised (per-cell Loader is
-            // retention-gated) and the bulk insert is cheap; the loading
-            // overlay is up so a single brief stall is invisible, and it lets
-            // `_commitPendingTarget` see the target as loaded in one step
-            // instead of creeping toward it over dozens of frames.
-            if bulk {
-                let had_entries = !entries.is_empty();
-                if had_entries {
-                    insert_sub_batch(model.as_mut(), entries);
-                }
-                // Resume covers (paused by `fetch_more_with_limit` for the jump
-                // request) BEFORE prefetching: the insert above drives
-                // `_commitPendingTarget` synchronously, which moves
-                // `visible_first_row` to the landing page, so prefetching now —
-                // with covers re-enabled — warms exactly that page. Resuming
-                // unconditionally (even on an empty page) guarantees the pause
-                // never sticks past the request that set it.
-                model.as_mut().set_cover_requests_paused(false);
-                if had_entries {
-                    let visible = model.visible_first_row;
-                    model.as_mut().prefetch_around(visible);
-                }
-                model.as_mut().set_has_next_page(has_next_page);
-                if model.total_files != total {
-                    model.as_mut().set_total_files(total);
-                }
-                release_initial_lookahead_gate(model.as_mut());
-                return;
-            }
             let mut batches = chunk_for_subbatching(entries, APPEND_SUB_BATCH_SIZE);
             if batches.is_empty() {
-                // No new rows landed (empty page). Finalise immediately
-                // — there's nothing to defer.
+                // No new rows landed (empty page). Finalise immediately —
+                // there's nothing to defer. A bulk fetch still resumes covers
+                // unconditionally here, even though nothing landed: the pause
+                // must never stick past the request that set it, and
+                // `loading_more` forbids a second concurrent bulk fetch, so
+                // nothing else is relying on it staying up.
+                if bulk {
+                    model.as_mut().set_cover_requests_paused(false);
+                }
                 model.as_mut().set_has_next_page(has_next_page);
                 if model.total_files != total {
                     model.as_mut().set_total_files(total);
                 }
-                release_initial_lookahead_gate(model.as_mut());
+                model.as_mut().set_loading_more(false);
                 return;
             }
             // First batch runs synchronously inside the existing
@@ -3322,34 +3797,41 @@ fn apply_append_page(
             // resolves within ~200 ms of the user's press.
             let first_batch = batches.remove(0);
             insert_sub_batch(model.as_mut(), first_batch);
-            // Re-arm prefetch around the user's current visible row.
-            // The freshly-appended rows may now occupy the
-            // "current" or "next" page window; this is the only
-            // hook that gets covers warmed for them without a bulk
-            // enqueue.
-            let visible = model.visible_first_row;
-            model.as_mut().prefetch_around(visible);
+            // Non-bulk re-arms prefetch around the user's current visible
+            // row after every batch, including this first one — the
+            // freshly-appended rows may now occupy the "current" or "next"
+            // page window, and this is the only hook that gets covers warmed
+            // for them without a bulk enqueue. A bulk jump leaves covers
+            // paused and prefetch untouched until the LAST batch (below) —
+            // see the comment above `chunk_for_subbatching` for why.
+            if !bulk {
+                let visible = model.visible_first_row;
+                model.as_mut().prefetch_around(visible);
+            }
             if batches.is_empty() {
                 // Single-batch chunk (<= APPEND_SUB_BATCH_SIZE rows).
                 // Finalise now without scheduling deferred work.
+                if bulk {
+                    model.as_mut().set_cover_requests_paused(false);
+                    let visible = model.visible_first_row;
+                    model.as_mut().prefetch_around(visible);
+                }
                 model.as_mut().set_has_next_page(has_next_page);
                 if model.total_files != total {
                     model.as_mut().set_total_files(total);
                 }
-                release_initial_lookahead_gate(model.as_mut());
+                model.as_mut().set_loading_more(false);
                 return;
             }
             // Remaining batches: post one frame apart on the Qt
-            // thread, with the LAST one carrying the finaliser
-            // (has_next_page, total_files, look-ahead gate release).
+            // thread, with the LAST one carrying pagination finalization
+            // (and, for a bulk fetch, the deferred cover-resume + prefetch).
             // total_dirs is not touched here: Core computes it once on
             // page 1 and carries the same value forward, so it never
             // changes across appended pages.
             //
-            // No auto-prefetch here. apply_initial_page pre-warms
-            // chunk 2 once; subsequent chunks are driven by the
-            // grid's onLoadMoreRequested as the user scrolls.
-            // Chaining a fetch_more here turned the look-ahead into a
+            // Chunks are driven by the grid's onLoadMoreRequested as the user
+            // scrolls. Chaining a fetch_more here turned demand loading into a
             // self-driving cascade that downloaded every page
             // back-to-back, tripping Core's WebSocket rate limit on
             // huge folders (Arcade).
@@ -3367,20 +3849,21 @@ fn apply_append_page(
                             return;
                         }
                         insert_sub_batch(model.as_mut(), batch);
-                        let visible = model.visible_first_row;
-                        model.as_mut().prefetch_around(visible);
+                        if !bulk {
+                            let visible = model.visible_first_row;
+                            model.as_mut().prefetch_around(visible);
+                        }
                         if is_last {
+                            if bulk {
+                                model.as_mut().set_cover_requests_paused(false);
+                                let visible = model.visible_first_row;
+                                model.as_mut().prefetch_around(visible);
+                            }
                             model.as_mut().set_has_next_page(has_next_page);
                             if model.total_files != total {
                                 model.as_mut().set_total_files(total);
                             }
-                            // Clear the look-ahead gate now that the
-                            // first follow-up chunk has fully landed.
-                            // If the cover gate already drained
-                            // (covers all cached or decode-settle
-                            // fired while we held it open) we're the
-                            // one releasing loading.
-                            release_initial_lookahead_gate(model.as_mut());
+                            model.as_mut().set_loading_more(false);
                         }
                     });
                 }
@@ -3401,12 +3884,6 @@ fn apply_append_page(
             if bulk {
                 model.as_mut().set_cover_requests_paused(false);
             }
-            // Even on a failed first prefetch, we have to release the
-            // cover gate's hold or the user is stuck on Loading…
-            // forever. The visible page is already in place from
-            // `apply_initial_page`; the missing tail just won't be
-            // there until the user retries.
-            release_initial_lookahead_gate(model.as_mut());
         }
     }
 }
@@ -3423,13 +3900,17 @@ mod tests {
     use super::{
         child_launch_text_from_browse_result, chunk_for_subbatching, compute_unresolved_keys,
         cover_key_for_with, cover_placeholder_for, decide_initial, dedup_roots_drop_ancestors,
-        detail_image_keys_from_meta, detail_tags_from_tags, display_name, display_title_for_entry,
-        entry_system_id, is_media_capable_entry, is_strict_ancestor_path, jump_fetch_limit,
-        media_capable_directory_browse_params, media_key_for, meta_params_for_entry,
-        ordered_detail_image_keys, position_of_game_path, prefetch_around_plan,
-        prefetch_cursor_window_plan, project_status, result_total_dirs, run_text_for_entry,
-        seeded_refetch_pagination_state, singleton_directory_needs_launch_resolution,
-        transform_entries, InitialAction, Projection,
+        detail_cover_key_for_entry, detail_image_keys_from_meta, detail_tags_from_tags,
+        display_name, display_title_for_entry, entry_system_id, favorites_tags,
+        games_random_launch_text, hub_target_system_id, initial_row_replacement,
+        is_filesystem_root_entry, is_media_capable_entry, is_strict_ancestor_path,
+        jump_fetch_limit, media_capable_directory_browse_params,
+        media_capable_directory_needs_child_resolution, media_key_for, meta_cache_key_for_entry,
+        meta_params_for_entry, ordered_detail_image_keys, position_of_game_path,
+        prefetch_around_plan, prefetch_cursor_window_plan, project_status, result_total_dirs,
+        root_distinguishers, run_text_for_entry, seeded_refetch_pagination_state,
+        singleton_directory_needs_launch_resolution, transform_entries, InitialAction,
+        InitialRowReplacement, Projection,
     };
     use super::{FETCH_MORE_RAPID_CHUNK_SIZE, JUMP_FETCH_CHUNK_SIZE};
     use crate::media_image_cache::{MediaImageCache, MediaKey};
@@ -3467,6 +3948,37 @@ mod tests {
             zap_script: format!("@{system_id}/{name}"),
             ..BrowseEntry::default()
         }
+    }
+
+    #[test]
+    fn favorites_scope_maps_to_core_tag_filter() {
+        assert!(favorites_tags(false).is_empty());
+        assert_eq!(favorites_tags(true), vec!["user:favorite"]);
+    }
+
+    #[test]
+    fn random_launch_uses_recursive_path_and_active_tags() {
+        assert_eq!(
+            games_random_launch_text("/media/fat/games/NES/RPG", "NES", false).as_deref(),
+            Some("**launch.random:/media/fat/games/NES/RPG")
+        );
+        assert_eq!(
+            games_random_launch_text("/media/fat/games/NES/RPG", "NES", true).as_deref(),
+            Some("**launch.random:/media/fat/games/NES/RPG?tags=user:favorite")
+        );
+    }
+
+    #[test]
+    fn random_launch_uses_system_at_root_and_escapes_separators() {
+        assert_eq!(
+            games_random_launch_text("", "SNES", false).as_deref(),
+            Some("**launch.random:SNES")
+        );
+        assert_eq!(
+            games_random_launch_text("/games/A?B,C&D|E^F", "SNES", false).as_deref(),
+            Some("**launch.random:/games/A^?B^,C^&D^|E^^F")
+        );
+        assert!(games_random_launch_text("", "", false).is_none());
     }
 
     #[test]
@@ -3576,6 +4088,73 @@ mod tests {
     }
 
     #[test]
+    fn total_dirs_adds_leading_virtual_roots() {
+        // Core's merged-root `totalDirs` counts only the merged physical
+        // directories; it excludes the virtual-scheme `root` entries the
+        // same response prepends ahead of them (`rootView: "contents"`).
+        let result = MediaBrowseResult {
+            entries: vec![
+                root("Arcade", "mame-arcade://", "Arcade"),
+                folder("Dir", "/games/Dir"),
+                media("Game", "/games/game.rom", "NES"),
+            ],
+            total_dirs: Some(1),
+            ..MediaBrowseResult::default()
+        };
+        assert_eq!(result_total_dirs(&result), 2);
+    }
+
+    #[test]
+    fn total_dirs_fallback_still_counts_roots_once() {
+        // Same case as `total_dirs_falls_back_to_folder_count_when_missing`,
+        // named to make explicit that the `None` fallback (an older Core
+        // without `totalDirs`) already counts `root` entries via
+        // `is_folder()` and must not be double-counted by the leading-roots
+        // fold, which only applies when `total_dirs` is present.
+        let result = MediaBrowseResult {
+            entries: vec![
+                root("NES", "/games/NES", "NES"),
+                media("Game", "/games/g", "NES"),
+            ],
+            total_dirs: None,
+            ..MediaBrowseResult::default()
+        };
+        assert_eq!(result_total_dirs(&result), 1);
+    }
+
+    #[test]
+    fn same_sized_nonempty_pages_replace_rows_in_place() {
+        assert_eq!(
+            initial_row_replacement(10, 10),
+            InitialRowReplacement::InPlace
+        );
+        assert_eq!(
+            initial_row_replacement(3, 3),
+            InitialRowReplacement::InPlace
+        );
+    }
+
+    #[test]
+    fn larger_models_remove_only_surplus_tail_rows() {
+        assert_eq!(
+            initial_row_replacement(20, 10),
+            InitialRowReplacement::TruncateInPlace
+        );
+        assert_eq!(
+            initial_row_replacement(219, 10),
+            InitialRowReplacement::TruncateInPlace
+        );
+    }
+
+    #[test]
+    fn empty_or_growing_pages_require_reset() {
+        assert_eq!(initial_row_replacement(0, 0), InitialRowReplacement::Reset);
+        assert_eq!(initial_row_replacement(0, 10), InitialRowReplacement::Reset);
+        assert_eq!(initial_row_replacement(10, 0), InitialRowReplacement::Reset);
+        assert_eq!(initial_row_replacement(3, 10), InitialRowReplacement::Reset);
+    }
+
+    #[test]
     fn seeded_refetch_after_append_keeps_pagination_cursor() {
         let (next_cursor, has_next_page) = seeded_refetch_pagination_state(
             24,
@@ -3604,7 +4183,11 @@ mod tests {
     }
 
     #[test]
-    fn decide_initial_with_single_root_eligible_returns_auto_nav() {
+    fn decide_initial_auto_navigates_single_virtual_root_at_system_root() {
+        // A lone `root` entry at the system root is always a route to skip
+        // past: either a virtual-only system Core never merges (MiSTer
+        // Arcade's single `mame-arcade://` route), or an older Core still
+        // returning the unmerged routes list.
         let result = MediaBrowseResult {
             entries: vec![root("NES", "/roms/NES", "NES")],
             ..MediaBrowseResult::default()
@@ -3618,16 +4201,19 @@ mod tests {
     }
 
     #[test]
-    fn decide_initial_with_single_directory_eligible_returns_auto_nav() {
+    fn decide_initial_with_single_directory_at_merged_root_renders_as_apply() {
+        // A merged system root (`rootView: "contents"`, see
+        // `merged_root_view`) can legitimately render as one directory --
+        // that's a system with a single subfolder of games, not a route to
+        // skip past. Only a lone `root` entry (see the sibling test with a
+        // `root` entry above) is a route to auto-nav through.
         let result = MediaBrowseResult {
             entries: vec![folder("Games", "/roms/Shared/Games")],
             ..MediaBrowseResult::default()
         };
         assert_eq!(
             decide_initial(&result, true, None, ""),
-            InitialAction::AutoNavigate {
-                path: "/roms/Shared/Games".into()
-            }
+            InitialAction::Apply
         );
     }
 
@@ -3654,16 +4240,33 @@ mod tests {
     fn decide_initial_with_single_folder_not_eligible_flattens_on_mister() {
         // On MiSTer, a `set_path` load that returns exactly one folder
         // also flattens — collections often unzip into nested
-        // single-child folders.
+        // single-child folders. Only applies below the system root: a
+        // real parent path here (not the merged root's empty path)
+        // distinguishes this from the merged-root case above.
         let result = MediaBrowseResult {
             entries: vec![folder("Sub", "/x/Sub")],
             ..MediaBrowseResult::default()
         };
         assert_eq!(
-            decide_initial(&result, false, Some(&Platform::Mister), ""),
+            decide_initial(&result, false, Some(&Platform::Mister), "/x"),
             InitialAction::AutoNavigate {
                 path: "/x/Sub".into()
             },
+        );
+    }
+
+    #[test]
+    fn decide_initial_does_not_flatten_at_root_on_mister() {
+        // The MiSTer single-child flatten is a drill-down rule; it must
+        // not also swallow a genuine single-directory merged root (see
+        // `decide_initial_with_single_directory_at_merged_root_renders_as_apply`).
+        let result = MediaBrowseResult {
+            entries: vec![folder("Games", "/roms/Shared/Games")],
+            ..MediaBrowseResult::default()
+        };
+        assert_eq!(
+            decide_initial(&result, false, Some(&Platform::Mister), ""),
+            InitialAction::Apply,
         );
     }
 
@@ -3759,6 +4362,41 @@ mod tests {
     fn display_title_falls_back_to_file_stem_when_name_empty() {
         let entry = media("", "/roms/PSX/D (Disc 2).cue", "PSX");
         assert_eq!(display_title_for_entry(&entry).as_ref(), "D (Disc 2)");
+    }
+
+    /// The games context menu refused every `root` row, so a system with
+    /// several configured game folders had no way to pin any of them. The
+    /// stated reason was that roots were a `..`/scope pseudo-entry; nothing
+    /// creates such a row. These pin down which roots are now eligible.
+    #[test]
+    fn filesystem_roots_are_pinnable_but_scheme_routes_are_not() {
+        assert!(is_filesystem_root_entry(&root(
+            "MS-DOS",
+            "/media/fat/games/AO486",
+            "MSDOS"
+        )));
+        assert!(is_filesystem_root_entry(&root(
+            "MS-DOS",
+            "/media/fat/games/_DOS Games",
+            "MSDOS"
+        )));
+        // Virtual-scheme routes: Core never merges these and they are still
+        // prepended to a merged listing, but a Hub folder tile is addressed
+        // by filesystem path, so there is nothing to pin.
+        assert!(!is_filesystem_root_entry(&root(
+            "Arcade",
+            "mame-arcade://",
+            "Arcade"
+        )));
+        // An empty path is the shape `dedup_roots_drop_ancestors` already
+        // guards against; it addresses nothing.
+        assert!(!is_filesystem_root_entry(&root("Empty", "", "NES")));
+        // Only `root` rows -- a directory takes the existing branch, and a
+        // media row is never a folder.
+        assert!(!is_filesystem_root_entry(&folder(
+            "Sub",
+            "/media/fat/games/NES/Sub"
+        )));
     }
 
     #[test]
@@ -3894,6 +4532,80 @@ mod tests {
     }
 
     #[test]
+    fn root_distinguishers_finds_the_first_diverging_component() {
+        let entries = vec![
+            root("SNES", "/media/fat/games/SNES", "SNES"),
+            root("SNES", "/media/usb0/games/SNES", "SNES"),
+        ];
+        let d = root_distinguishers(&entries);
+        assert_eq!(d, vec!["fat".to_string(), "usb0".to_string()]);
+    }
+
+    #[test]
+    fn root_distinguishers_uses_a_later_component_when_the_earlier_ones_match() {
+        let entries = vec![
+            root("SNES", "/media/fat/games/SNES", "SNES"),
+            root("SNES", "/media/fat/games2/SNES", "SNES"),
+        ];
+        let d = root_distinguishers(&entries);
+        assert_eq!(d, vec!["games".to_string(), "games2".to_string()]);
+    }
+
+    #[test]
+    fn root_distinguishers_blank_for_a_single_root() {
+        let entries = vec![root("SNES", "/media/fat/games/SNES", "SNES")];
+        assert_eq!(root_distinguishers(&entries), vec![String::new()]);
+    }
+
+    #[test]
+    fn root_distinguishers_blank_when_every_root_is_identical() {
+        // Shouldn't happen in practice (two roots at the exact same path),
+        // but must not panic or produce a spurious label.
+        let entries = vec![
+            root("SNES", "/media/fat/games/SNES", "SNES"),
+            root("SNES", "/media/fat/games/SNES", "SNES"),
+        ];
+        let d = root_distinguishers(&entries);
+        assert_eq!(d, vec![String::new(), String::new()]);
+    }
+
+    #[test]
+    fn root_distinguishers_ignores_non_root_and_blank_path_entries() {
+        let entries = vec![
+            root("SNES", "/media/fat/games/SNES", "SNES"),
+            root("SNES", "/media/usb0/games/SNES", "SNES"),
+            folder("RPGs", "/media/fat/games/SNES/RPGs"),
+            root("ghost", "", "SNES"),
+            media("smb", "/media/fat/games/SNES/smb.sfc", "SNES"),
+        ];
+        let d = root_distinguishers(&entries);
+        assert_eq!(
+            d,
+            vec![
+                "fat".to_string(),
+                "usb0".to_string(),
+                String::new(),
+                String::new(),
+                String::new(),
+            ]
+        );
+    }
+
+    #[test]
+    fn root_distinguishers_three_way_split() {
+        let entries = vec![
+            root("SNES", "/media/fat/games/SNES", "SNES"),
+            root("SNES", "/media/usb0/games/SNES", "SNES"),
+            root("SNES", "/media/usb1/games/SNES", "SNES"),
+        ];
+        let d = root_distinguishers(&entries);
+        assert_eq!(
+            d,
+            vec!["fat".to_string(), "usb0".to_string(), "usb1".to_string()]
+        );
+    }
+
+    #[test]
     fn entry_system_id_prefers_singular_field() {
         let entry = BrowseEntry {
             system_id: "SNES".into(),
@@ -3938,6 +4650,28 @@ mod tests {
         assert_eq!(
             cover_key_for_with(&entry, Some(&key), false, false),
             "icons/Loading"
+        );
+    }
+
+    // Round 10: a paused fetch (bulk/jump append in flight,
+    // `cover_requests_paused`) is "haven't asked yet," not "confirmed
+    // absent" -- `cover_key_for` must never fold `!requests_enabled` into
+    // `confirmed_absent` the way it used to, or every game (including
+    // ones with real art) flashes the file-icon chip for the whole pause
+    // window instead of staying blank like an in-flight fetch. This test
+    // pins the shape `cover_key_for` must produce for that case: a media
+    // key, nothing cached yet, not confirmed absent -> blank, not the
+    // chip. Same assertion as the plain in-flight case above by
+    // construction, since paused and in-flight both resolve to
+    // `confirmed_absent: false` post-fix.
+    #[test]
+    fn cover_key_for_paused_with_cover_stays_loading_not_file_icon() {
+        let entry = media("smb", "/p/smb", "NES");
+        let key = media_key_for(&entry).expect("media has key");
+        assert_eq!(
+            cover_key_for_with(&entry, Some(&key), false, false),
+            "icons/Loading",
+            "paused-but-not-confirmed-absent must render blank, never the chip"
         );
     }
 
@@ -4021,6 +4755,23 @@ mod tests {
     }
 
     #[test]
+    fn hub_target_system_id_prefers_the_row_then_the_browsed_system() {
+        let mut entry = BrowseEntry {
+            media_id: Some(7),
+            name: "Game".into(),
+            path: "/roms/PSX/Game".into(),
+            entry_type: "directory".into(),
+            ..BrowseEntry::default()
+        };
+        assert_eq!(hub_target_system_id(&entry, "PSX"), "PSX");
+        entry.system_ids = vec!["SNES".into()];
+        assert_eq!(hub_target_system_id(&entry, "PSX"), "SNES");
+        entry.system_id = "PSXJP".into();
+        assert_eq!(hub_target_system_id(&entry, "PSX"), "PSXJP");
+        assert!(media_capable_directory_needs_child_resolution(&entry));
+    }
+
+    #[test]
     fn singleton_directory_uses_media_id_for_meta_and_skips_container_run_text() {
         let entry = BrowseEntry {
             media_id: Some(42),
@@ -4036,6 +4787,10 @@ mod tests {
         assert_eq!(params.media_id, Some(42));
         assert!(params.system.is_empty());
         assert!(params.path.is_empty());
+        let cache_key = meta_cache_key_for_entry(&entry).expect("cache key");
+        assert_eq!(cache_key.system_id.as_ref(), "PSX");
+        assert_eq!(cache_key.path.as_ref(), "/roms/PSX/Game");
+        assert!(cache_key.media_id.is_none());
         let browse_params = media_capable_directory_browse_params(&entry).expect("browse params");
         assert_eq!(browse_params.path, "/roms/PSX/Game");
         assert_eq!(browse_params.systems, vec!["PSX".to_string()]);
@@ -4258,11 +5013,19 @@ mod tests {
     }
 
     #[test]
+    fn detail_cover_key_excludes_confirmed_no_cover_entry() {
+        let mut no_cover = media("nocovergame", "/p/nocovergame", "Arcade");
+        no_cover.has_cover = false;
+        assert!(detail_cover_key_for_entry(&no_cover).is_none());
+
+        let covered = media("coveredgame", "/p/coveredgame", "NES");
+        assert!(detail_cover_key_for_entry(&covered).is_some());
+    }
+
+    #[test]
     fn compute_unresolved_keys_excludes_no_cover_entries() {
         // Core sends has_cover=false for entries with no image property row.
-        // These entries will never resolve to cached bytes, so they must
-        // not be included in the gate set — otherwise the gate would always
-        // ride the safety timer on systems like Arcade.
+        // Exclude entries that can never resolve from unresolved telemetry.
         let mut no_cover = media("nocovergame", "/p/nocovergame", "Arcade");
         no_cover.has_cover = false;
         let entries = vec![no_cover, media("coveredgame", "/p/coveredgame", "NES")];
@@ -4275,9 +5038,8 @@ mod tests {
 
     #[test]
     fn compute_unresolved_keys_all_no_cover_returns_empty() {
-        // A page where Core confirmed no entry has a cover (e.g. Arcade
-        // with no scraped artwork) must result in an empty unresolved set
-        // so the gate releases immediately rather than timing out.
+        // A page where Core confirmed no entry has a cover has no unresolved
+        // visible-cover work.
         let mut a = media("a", "/p/a", "Arcade");
         a.has_cover = false;
         let mut b = media("b", "/p/b", "Arcade");

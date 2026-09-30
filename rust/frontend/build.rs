@@ -5,11 +5,16 @@
 use cxx_qt_build::{CxxQtBuilder, QmlModule};
 
 const MODEL_FILES: &[&str] = &[
+    "src/models/action_error.rs",
     "src/models/alternate_versions.rs",
     "src/models/categories.rs",
+    "src/models/controller_report.rs",
     "src/models/crt_video.rs",
+    "src/models/favorite_systems.rs",
+    "src/models/favorite_systems_state.rs",
     "src/models/systems.rs",
     "src/models/game_info.rs",
+    "src/models/game_launcher_override.rs",
     "src/models/games.rs",
     "src/models/favorites.rs",
     "src/models/browse.rs",
@@ -20,6 +25,7 @@ const MODEL_FILES: &[&str] = &[
     "src/models/dev_team.rs",
     "src/models/about_entries.rs",
     "src/models/app_status.rs",
+    "src/models/hub_layout.rs",
     "src/models/hub_state.rs",
     "src/models/image_overrides.rs",
     "src/models/systems_state.rs",
@@ -35,6 +41,7 @@ const MODEL_FILES: &[&str] = &[
     "src/models/recents_state.rs",
     "src/models/runtime.rs",
     "src/models/settings.rs",
+    "src/models/status_events.rs",
     "src/models/system_launchers.rs",
     "src/models/system_status.rs",
 ];

@@ -22,12 +22,28 @@ Item {
 
     property bool enabled: true
     property bool loading: false
+    // errorMessage is state only. It may contain backend diagnostics and must
+    // never be rendered; technical detail belongs in logs.
     property string errorMessage: ""
     property int count: 0
     property string emptyText: qsTr("Nothing here")
+    // Optional second line for the empty state, mirroring `errorText`'s
+    // role for errors. Carbon's empty-state anatomy is title plus a body
+    // that names the next step; a caller that has nothing useful to add
+    // leaves this empty and the detail line stays hidden, exactly as
+    // before this property existed.
+    property string emptyDetailText: ""
     property string loadingText: qsTr("Loading…")
+    property string errorText: qsTr("Check Zaparoo Core and try again.")
     property int loadingDelayMs: 300
     property int minimumLoadingVisibleMs: 200
+    // Vertical center for the loading cue, in overlay-local coordinates.
+    // Defaults to the overlay's own center (matching Empty/Error below);
+    // a caller whose visible content rect is offset from that — the
+    // games/systems grid sits below the header, for instance — overrides
+    // this so the cue lands at the exact y the global transition cue
+    // centered on, and the handoff between the two does not jump.
+    property real cueCenterY: overlay.height / 2
     readonly property bool loadingVisible: overlay.enabled && delayedLoading.showing
     // Named `viewState` rather than `state` — `Item.state` is a
     // built-in slot wired to `states:` / `transitions:`, and shadowing
@@ -39,23 +55,27 @@ Item {
 
     visible: overlay.enabled && overlay.viewState !== "ready"
 
+    // Loading state shares the delayed LoadingIndicator path with the
+    // global transition overlay — single visual vocabulary for "in
+    // flight" without flashing on sub-threshold loads. Positioned on
+    // `cueCenterY` rather than living in the Column below: it must line
+    // up with the global cue it hands off from, which Empty/Error text
+    // (a terminal state, never shown mid-transition) has no need to.
+    DelayedLoadingIndicator {
+        id: delayedLoading
+        objectName: "screenStateLoadingCue"
+        x: Sizing.center(overlay.width, width)
+        y: Sizing.px(overlay.cueCenterY - height / 2)
+        active: overlay.enabled && overlay.loading
+        delayMs: overlay.loadingDelayMs
+        minimumVisibleMs: overlay.minimumLoadingVisibleMs
+        text: overlay.loadingText
+    }
+
     Column {
         x: Sizing.center(parent.width, width)
         y: Sizing.center(parent.height, height)
         spacing: Sizing.pctH(0.6)
-
-        // Loading state shares the delayed LoadingIndicator path with the
-        // global transition overlay — single visual vocabulary for "in
-        // flight" without flashing on sub-threshold loads. Error/Empty
-        // stay as plain text since they are terminal states.
-        DelayedLoadingIndicator {
-            id: delayedLoading
-            anchors.horizontalCenter: parent.horizontalCenter
-            active: overlay.enabled && overlay.loading
-            delayMs: overlay.loadingDelayMs
-            minimumVisibleMs: overlay.minimumLoadingVisibleMs
-            text: overlay.loadingText
-        }
 
         Text {
             anchors.horizontalCenter: parent.horizontalCenter
@@ -70,18 +90,26 @@ Item {
                 return "";
             }
             font.family: Theme.fontUi
-            font.pixelSize: Sizing.fontSize(2.9)
+            font.pixelSize: Sizing.fontSection
             color: Theme.textPrimary
+            wrapMode: Text.WordWrap
             horizontalAlignment: Text.AlignHCenter
+            // Shares the detail line's measure below. Without a width this
+            // laid out at natural width, so a long title ran off-screen
+            // rather than wrapping -- the Hub's old single-line empty text
+            // overflowed a 320px 240p frame outright.
+            width: Sizing.px(overlay.width * 0.7)
             renderType: Text.NativeRendering
         }
 
         Text {
+            readonly property string _detail: overlay.viewState === "error" ? overlay.errorText : (overlay.viewState === "empty" ? overlay.emptyDetailText : "")
+
             anchors.horizontalCenter: parent.horizontalCenter
-            visible: overlay.viewState === "error" && overlay.errorMessage !== ""
-            text: overlay.errorMessage
+            visible: _detail !== ""
+            text: _detail
             font.family: Theme.fontUi
-            font.pixelSize: Sizing.fontSize(2.4)
+            font.pixelSize: Sizing.fontCaption
             color: Theme.textPrimary
             wrapMode: Text.WordWrap
             horizontalAlignment: Text.AlignHCenter

@@ -6,7 +6,10 @@
 // zaparoo_frontend_rs staticlib; Qt plugin wiring is handled here so that
 // Qt's CMake (qt_import_qml_plugins) can emit the correct link flags.
 
+#include "baked_icon_atlas.h"
 #include "custom_image_provider.h"
+#include "fb_mmap_fallback.h"
+#include "frontend_arguments.h"
 #include "media_image_provider.h"
 #include "native_video_writer.h"
 #include "tinted_svg_image_provider.h"
@@ -18,7 +21,6 @@
 #include <QGuiApplication>
 #include <QList>
 #include <QLocale>
-#include <QPixmapCache>
 #include <QQmlApplicationEngine>
 #include <QQuickStyle>
 #include <QQuickWindow>
@@ -28,7 +30,6 @@
 #include <QUrl>
 #include <QVariantMap>
 #include <QtQml/qqmlextensionplugin.h>
-#include <algorithm>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -36,17 +37,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <unistd.h>
-#include <vector>
-
-// Default QPixmapCache cap is 10 MiB. With ~100 system SVGs rasterized at
-// 256 px sourceSize the working set straddles that limit, so navigating
-// through every category evicts earlier system covers and re-renders
-// them on the next visit. Bumping to 50 MiB keeps the entire system-
-// cover set resident across category swaps for the cost of a one-time
-// allocation — a worthwhile trade on MiSTer's 1 GiB DDR3 since
-// pixmap decode on the UI thread is the visible "pop in" the user
-// flagged.
-constexpr int kPixmapCacheLimitKiB = 50 * 1024;
 
 extern "C" int zaparoo_rust_init(bool crtNativePathForced);
 extern "C" void zaparoo_rust_post_qt_start();
@@ -107,48 +97,6 @@ static void qtMessageHandler(QtMsgType type, const QMessageLogContext& /*ctx*/, 
     zaparoo_log_qt(static_cast<uint8_t>(type), utf8.constData(), static_cast<size_t>(utf8.size()));
 }
 
-struct ParsedArguments
-{
-    bool crtNativePathForced = false;
-    std::vector<char*> argv;
-    // Unfiltered process arguments (nullptr-terminated). The restart
-    // execvp must use these, not `argv`: `argv` has `--crt` stripped
-    // for Qt, and restarting with the filtered vector would silently
-    // drop the native CRT path on any restart-applied setting change.
-    std::vector<char*> originalArgv;
-};
-
-static ParsedArguments extractCrtArgument(int argc, char* argv[])
-{
-    ParsedArguments parsed;
-    parsed.argv.reserve(static_cast<size_t>(argc));
-    std::copy_n(argv, argc, std::back_inserter(parsed.argv));
-    parsed.originalArgv = parsed.argv;
-    parsed.originalArgv.push_back(nullptr);
-
-    std::vector<char*> filtered;
-    filtered.reserve(parsed.argv.size());
-    if (!parsed.argv.empty())
-    {
-        filtered.push_back(parsed.argv.front());
-    }
-
-    for (size_t i = 1; i < parsed.argv.size(); ++i)
-    {
-        char* arg = parsed.argv.at(i);
-        if (std::strcmp(arg, "--crt") == 0)
-        {
-            parsed.crtNativePathForced = true;
-            continue;
-        }
-        filtered.push_back(arg);
-    }
-
-    parsed.argv = std::move(filtered);
-    parsed.argv.push_back(nullptr);
-    return parsed;
-}
-
 static bool envFlagEnabled(const char* name)
 {
     const QByteArray value = qgetenv(name).trimmed().toLower();
@@ -171,7 +119,15 @@ static void startupTrace(const char* stage)
 
 int main(int argc, char* argv[]) // NOLINT
 {
-    ParsedArguments parsedArgs = extractCrtArgument(argc, argv);
+    zaparoo::ParsedArguments parsedArgs = zaparoo::parseArguments(argc, argv);
+    // Keep version discovery usable over SSH and in packaging checks: this
+    // must return before Rust, Qt, Core, or framebuffer initialization.
+    if (parsedArgs.versionRequested)
+    {
+        std::printf("Zaparoo Frontend %s\n", ZAPAROO_VERSION);
+        return EXIT_SUCCESS;
+    }
+
     const bool crtPreviewResolutionForced =
         !qEnvironmentVariableIsEmpty("ZAPAROO_CRT_PREVIEW_RESOLUTION");
     const bool crtNativePathForced = parsedArgs.crtNativePathForced || crtPreviewResolutionForced;
@@ -194,6 +150,33 @@ int main(int argc, char* argv[]) // NOLINT
         qputenv("QT_SCALE_FACTOR", "1");
         QGuiApplication::setHighDpiScaleFactorRoundingPolicy(
             Qt::HighDpiScaleFactorRoundingPolicy::Floor);
+    }
+
+    // Qt Quick's own decoded-pixmap cache (QQuickPixmapStore) has no
+    // documented default cap tuned for this app, and every cover `Image`
+    // in Tile.qml deliberately leaves `cache: true` (see that file's
+    // doc comment -- a constant `sourceSize` needs the pixmap cache so a
+    // reload short-circuits to it instead of re-decoding). That cache
+    // sits on top of, not instead of, the Rust-side media_image_cache's
+    // own 128 MiB encoded-bytes budget: a decoded RGBA cover is several
+    // times its encoded size, so an unbounded pixmap cache can make the
+    // real image-memory ceiling far exceed what CACHE_CAP_BYTES's own
+    // sizing math assumed (see that constant's doc comment -- it was
+    // sized as if it were the only image-memory consumer). On MiSTer's
+    // swap-free ~492 MiB this reads as a gradual system-wide slowdown
+    // (page cache eviction), not an OOM, which is easy to miss without
+    // an explicit cap to point at. 32 MiB is a conservative starting
+    // point -- room for a full grid page or two of decoded tiles without
+    // competing heavily with the encoded-bytes budget or the rest of
+    // what MiSTer needs (Core, the FPGA wrapper, the active core); tune
+    // with a real long-session capture (ZAPAROO_DEBUG=1) rather than
+    // guessing further from here. QML_PIXMAP_CACHE_LIMIT is in
+    // kilobytes and must be set before the QML engine's first image
+    // decode, so this has to happen this early, ahead of both
+    // QGuiApplication and QQmlApplicationEngine construction.
+    if (qEnvironmentVariableIsEmpty("QML_PIXMAP_CACHE_LIMIT"))
+    {
+        qputenv("QML_PIXMAP_CACHE_LIMIT", QByteArrayLiteral("32768"));
     }
 
     QGuiApplication::setApplicationName("Zaparoo Frontend");
@@ -225,6 +208,19 @@ int main(int argc, char* argv[]) // NOLINT
     const QLocale locale = langCode.isEmpty() ? QLocale::system() : QLocale(langCode);
     const QLocale::Language uiLanguage = locale.language();
     const bool crtNativePathEnabled = zaparoo_rust_crt_native_path_enabled();
+#ifdef ZAPAROO_EMBEDDED_BUILD
+    const uint32_t logicalVideoHeight = zaparoo_rust_video_height();
+    // Bitmap type auto-engages at 240p on embedded hardware even without
+    // --crt: a proportional antialiased face at 8-14px is illegible at that
+    // resolution. 400 matches Sizing.qml's 240-tier boundary. Gated to
+    // embedded builds only -- a resizable desktop window can cross this
+    // threshold at runtime and QGuiApplication::setFont() cannot follow a
+    // live resize.
+    const bool bitmapTypeEnabled =
+        crtNativePathEnabled || (logicalVideoHeight > 0 && logicalVideoHeight < 400);
+#else
+    const bool bitmapTypeEnabled = crtNativePathEnabled;
+#endif
 
     // Push the effective locale into Rust so `system_region::current_region()`
     // can resolve the `auto` region setting without calling back into Qt.
@@ -248,8 +244,10 @@ int main(int argc, char* argv[]) // NOLINT
 
     QGuiApplication app(qtArgc, qtArgv);
     startupTrace("cpp:QGuiApplication constructed");
-    QPixmapCache::setCacheLimit(kPixmapCacheLimitKiB);
-    startupTrace("cpp:QPixmapCache limit set");
+    // The linuxfb plugin maps the framebuffer while QGuiApplication is being
+    // constructed, so this is the first point at which the shim's outcome is
+    // known. The message handler is already installed, so it reaches the log.
+    logFbMmapFallbackStatus();
 
     // addApplicationFont returns -1 on failure (broken qrc path,
     // unreadable file). Logging the failure mode keeps a refactor that
@@ -278,7 +276,7 @@ int main(int argc, char* argv[]) // NOLINT
         QFontDatabase::addApplicationFallbackFontFamily(font.script, font.family);
     };
 
-    if (crtNativePathEnabled)
+    if (bitmapTypeEnabled)
     {
         registerFont(
             QStringLiteral(":/qt/qml/Zaparoo/App/resources/fonts/MxPlus_HP_100LX_6x8.ttf"));
@@ -297,7 +295,7 @@ int main(int argc, char* argv[]) // NOLINT
                               QStringLiteral("Noto Sans Arabic")});
         registeredScriptFallback = true;
     }
-    if (!crtNativePathEnabled && uiLanguage == QLocale::Hebrew)
+    if (!bitmapTypeEnabled && uiLanguage == QLocale::Hebrew)
     {
         registerFallbackFont({QChar::Script_Hebrew,
                               QStringLiteral(":/qt/qml/Zaparoo/App/resources/fonts/"
@@ -344,28 +342,36 @@ int main(int argc, char* argv[]) // NOLINT
     }
     {
         QFont defaultFont = QGuiApplication::font();
-        defaultFont.setFamily(crtNativePathEnabled ? QStringLiteral("MxPlus HP 100LX 6x8")
-                                                   : QStringLiteral("Noto Sans"));
+        defaultFont.setFamily(bitmapTypeEnabled ? QStringLiteral("MxPlus HP 100LX 6x8")
+                                                : QStringLiteral("Noto Sans"));
         QGuiApplication::setFont(defaultFont);
     }
     startupTrace("cpp:font registration complete");
-    if (crtNativePathEnabled)
+    const bool useUnsmoothedText = bitmapTypeEnabled;
+    if (useUnsmoothedText)
     {
         QQuickWindow::setTextRenderType(QQuickWindow::NativeTextRendering);
-        qInfo("CRT native path: using native text rendering");
-        // Desktop CRT preview: FreeType on X11/Wayland defaults to subpixel
-        // RGB antialiasing ("ClearType"), which paints faint coloured
-        // fringes either side of every glyph. MiSTer's linuxfb FreeType
-        // does not enable subpixel AA, so the same scene reads pixel-
-        // perfect there but blurry in the desktop preview. The bitmap
-        // pixel font (MxPlus HP 100LX 6x8) is also designed to never be
-        // smoothed. Set NoAntialias on the application default font so
-        // every Text item that doesn't override styleStrategy inherits it.
         QFont defaultFont = QGuiApplication::font();
         defaultFont.setStyleStrategy(QFont::NoAntialias);
         defaultFont.setHintingPreference(QFont::PreferFullHinting);
         QGuiApplication::setFont(defaultFont);
     }
+    if (crtNativePathEnabled)
+    {
+        qInfo("CRT native path: using unsmoothed native text");
+    }
+#ifdef ZAPAROO_EMBEDDED_BUILD
+    else if (bitmapTypeEnabled)
+    {
+        qInfo("Bitmap type auto-engaged at %up: using unsmoothed native text",
+              static_cast<unsigned int>(logicalVideoHeight));
+    }
+    else
+    {
+        qInfo("Embedded progressive path: using antialiased native text at %up",
+              static_cast<unsigned int>(logicalVideoHeight));
+    }
+#endif
     QQuickStyle::setStyle("Basic");
 
     // Install the locale .qm translator before constructing the QML engine
@@ -399,6 +405,13 @@ int main(int argc, char* argv[]) // NOLINT
     engine.addImageProvider(QStringLiteral("media-image"), new MediaImageProvider());
     // NOLINTNEXTLINE(cppcoreguidelines-owning-memory)
     engine.addImageProvider(QStringLiteral("tinted-svg"), new TintedSvgImageProvider());
+    // The baked icon masks live in the executable's .rodata, which is a
+    // file-backed MAP_PRIVATE range. On MiSTer that file is on SD, so the first
+    // touch of any page is a synchronous major fault at random-read speed --
+    // exactly the stall the bake exists to remove. Walk the pages once on a
+    // nice'd background runnable so the tint path finds them resident.
+    BakedIconAtlas::instance().prefaultAsync();
+    startupTrace("cpp:baked icon atlas prefault started");
     // User-supplied customization images (system artwork and Hub icons).
     // Files under the `[custom] dir` root in `frontend.toml` are served as-is
     // -- no tint pipeline. The provider validates that decoded paths stay
@@ -412,6 +425,7 @@ int main(int argc, char* argv[]) // NOLINT
 
     QVariantMap initialProperties = {
         {"crtNativePath", crtNativePathEnabled},
+        {"bitmapType", bitmapTypeEnabled},
         {"debugCrtSafeAreaOverlay", debugCrtSafeAreaOverlay},
     };
 #ifdef ZAPAROO_EMBEDDED_BUILD
@@ -460,6 +474,8 @@ int main(int argc, char* argv[]) // NOLINT
                              static_cast<int>(zaparoo_rust_video_width()));
     initialProperties.insert(QStringLiteral("videoHeight"),
                              static_cast<int>(zaparoo_rust_video_height()));
+    initialProperties.insert(QStringLiteral("defaultInterfaceProfile"),
+                             QStringLiteral(ZAPAROO_DEFAULT_INTERFACE_PROFILE));
     engine.setInitialProperties(initialProperties);
     startupTrace("cpp:QML initial properties set");
 
@@ -495,6 +511,19 @@ int main(int argc, char* argv[]) // NOLINT
                              logged = true;
                              startupTrace("cpp:first frame swapped");
                          });
+    }
+
+    // Staged fallback mode renders into RAM, so the framebuffer only changes
+    // when this runs. Queued for the same reason as the CRT copy below: the
+    // linuxfb QPA blits in `QFbScreen::doRedraw()` on a later event-loop
+    // iteration, so a direct connection would publish the previous frame.
+    // No-op in the default direct mode, where Qt composites into framebuffer
+    // memory itself and there is nothing to publish.
+    if (fbMmapFallbackActive() && rootWindow != nullptr)
+    {
+        QObject::connect(
+            rootWindow, &QQuickWindow::frameSwapped, rootWindow, []() { flushFbMmapFallback(); },
+            Qt::QueuedConnection);
     }
 
     if (crtNativePathEnabled)
@@ -550,6 +579,7 @@ int main(int argc, char* argv[]) // NOLINT
                      {
                          zaparoo_rust_shutdown();
                          stopNativeVideoWriter();
+                         stopFbMmapFallback();
                          qInstallMessageHandler(nullptr);
                      });
 

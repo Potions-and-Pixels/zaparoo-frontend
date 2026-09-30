@@ -19,3 +19,4 @@ pub mod readers_write;
 pub mod run;
 pub mod settings;
 pub mod system_launcher_default;
+pub mod systems_favorites;

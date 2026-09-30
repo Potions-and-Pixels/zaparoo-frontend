@@ -43,6 +43,8 @@ raw cargo as the default path; the justfile carries the expected environment.
 ## Always
 
 - Keep comments and docs in American English.
+- Follow `docs/content-style.md` for every user-visible string: menu
+  ordering, capitalization, terminology, and the settings-page checklist.
 - After editing C++, Rust, or QML, run `just lint`. Run `just test` when the
   change can affect runtime behavior.
 - Keep user-visible state persistent. Selected screen, row/grid positions,
@@ -85,8 +87,8 @@ raw cargo as the default path; the justfile carries the expected environment.
   "Software-renderer animation costs".
 - Do not hardcode pixel sizes or fixed element counts in UI. Use
   `Sizing.pctH()`, `Sizing.pctW()`, `Sizing.fontSize()`,
-  `Sizing.visibleCovers`, and `Sizing.cornerRadius` (for any rounded-square
-  surface — see `docs/style.md`). Any value that drives `x`/`y`/`width`/
+  `Sizing.visibleCovers`, and `Sizing.radiusMd`/`Sizing.radiusSm` (for any
+  rounded-square surface — see `docs/style.md`). Any value that drives `x`/`y`/`width`/
   `height`, border widths, margins, or font sizes must go through
   `Sizing.px()`, `Sizing.stroke()`, `Sizing.center()`, or `Sizing.half()`.
   The whole app must run cleanly at 240p; fractional geometry is a bug
@@ -122,6 +124,19 @@ raw cargo as the default path; the justfile carries the expected environment.
   a cold start. Any in-memory cache must enforce a strict bytes cap with LRU
   eviction — MiSTer has under 512 MB of shared system RAM and the frontend
   competes with Core, the FPGA wrapper, and the active core for it.
+  **Scoped exception:** `rust/frontend/src/hub_cover_manifest.rs` persists a
+  small path *list* (never image bytes or metadata) mapping each Hub
+  `zapscript` tile and the Resume tile to the Core thumbnail path Core itself
+  already wrote to `/media/fat/zaparoo/cache/thumbs/`, so those covers can
+  seed the in-memory cache before the first frame on a cold boot. Bounded to
+  ≤22 entries, colocated `MiSTer` only, and self-healing — a stale path just
+  fails to open and falls through to a normal Core request. Do not extend
+  this carve-out to any other cache without discussing it first.
+- Do not open a modal from a modal. A choice made inside a modal is a page
+  of that modal's own panel (`PickerList` hosted by the modal, see
+  `ScrapeSetupModal.qml`'s `page`); only an `action_error` alert may sit
+  above an open modal, and `ScreenManager.pushModal` warns on anything else.
+  See `docs/style.md` → "Modal depth".
 - Do not add `.git/` rerun-if triggers or `ZAPAROO_BUILD_*` provenance baking
   to `rust/frontend/build.rs`. Provenance lives in the `rust/build-info` leaf
   crate precisely so commits don't re-run the cxx-qt codegen. See
@@ -154,7 +169,7 @@ update rules, in short:
 | Path | Purpose |
 |---|---|
 | `src/app/main.cpp` | Thin Qt entry point, translator install, QML engine, Qt log bridge |
-| `src/ui/app/Main.qml` | Runtime router: input, persistence, forward-transition orchestration, global "Loading…" overlay, system-cover prefetch |
+| `src/ui/app/Main.qml` | Runtime router: input, persistence, forward-transition orchestration, global "Loading…" overlay |
 | `src/ui/app/MainLayout.qml` | Designer-editable visual tree, `pendingTransition` property, screen-state derivations, modal mounts |
 | `src/ui/screens/` | `Zaparoo.Screens`: `ScreenManager`, `HubScreen`, `SystemsScreen`, `GamesScreen` |
 | `src/ui/components/` | `Zaparoo.Ui`: `Tile`, `TileLoader`, `PagedGrid`, `ActiveLabel`, `LoadingIndicator`, `StatusIcon`, `TopStatusStrip`, `Modal`, `ScreenStateOverlay` |
@@ -225,6 +240,20 @@ state to go stale because there is no cross-screen state.
 - `ZAPAROO_CORE_ENDPOINT` overrides `[core] endpoint`; `ZAPAROO_STATE_FILE`
   redirects state for tests and ad-hoc runs.
 - Debug logging is enabled with `[logging] debug = true` or `ZAPAROO_DEBUG=1`.
+- `/tmp/zaparoo_launcher_input.json` is Main_MiSTer's alt-launcher input
+  report (written on every button press; source is
+  `support/zaparoo/launcher_input_metadata.cpp` in the `Main_MiSTer` repo).
+  `zaparoo_core::controller_report` polls it and feeds `Browse.ControllerReport`,
+  which drives the help bar's icon style and accept/cancel positions.
+  `ZAPAROO_INPUT_REPORT_FILE` redirects it and forces the watcher on
+  off-MiSTer, mirroring `ZAPAROO_STATE_FILE`. Button-style ids stay the
+  existing neutral `style_a`/`style_b`/`style_c`/`style_d`/`style_e` letters
+  — never a controller maker's name — even though the style is now
+  auto-detected. A pre-autodetect install's bare `a`/`b`/`c`/`d` (or the
+  even older `nintendo`/`xbox`/`sony`) force-migrates to `auto` once, not to
+  the matching `style_x`, so every existing install tries autodetection at
+  least one boot before falling back to a manual pick; see
+  `models::settings::normalize_button_layout`.
 
 ## MiSTer Deploy
 
@@ -259,6 +288,7 @@ release". Key points:
 - `docs/building.md` — build matrix, ARM32 toolchain, deploy bundle
 - `docs/qml-gotchas.md` — QML issues qmllint often catches late
 - `docs/style.md` — corner-radius token, tile aspect, pill vs. sharp shapes
+- `docs/content-style.md` — menu ordering, wording, and terminology rules
 - `docs/cxx-qt-bridge.md` — cxx-qt 0.8 bridge constraints
 - `docs/customization.md` — user overrides: `custom/` image folder, `[custom.system_names]`
 - `docs/translations.md` — `qsTr()`/`tr()` pipeline and locale catalogs

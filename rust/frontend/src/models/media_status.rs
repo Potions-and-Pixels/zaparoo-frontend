@@ -24,12 +24,24 @@
 // errors are logged but not surfaced as a Q_PROPERTY because the
 // notification stream is the source of truth for what the UI renders.
 
+use crate::media_image_cache::global_media_image_cache;
+use crate::models::action_error::report_action_error;
+use crate::models::with_persist_read;
 use cxx_qt::{Initialize, Threading};
 use cxx_qt_lib::{QString, QStringList};
 use std::pin::Pin;
 use tracing::warn;
 use zaparoo_core::media_types::{MediaIndexParams, MediaScrapeParams};
 use zaparoo_core::store::MediaStatusState;
+
+// Round 10: scraper choice for `ScrapeSetupModal.qml`, sourced from the
+// `scrapers` RPC -- never called anywhere in the frontend before this,
+// since every other scrape call site hardcodes `"gamelist.xml"`. This is
+// a one-shot fetch (`refresh_scrapers`), not part of the continuous
+// `MediaStatusState` watch channel every other field above projects from,
+// so it's applied directly from a `qt_thread().queue(...)` closure the
+// same way `GameInfo.load()` applies its own async result -- see that
+// file's `load()` for the identical shape.
 
 #[allow(
     clippy::struct_excessive_bools,
@@ -66,6 +78,17 @@ pub struct MediaStatusRust {
     scrape_current_step: i32,
     scrape_total_steps: i32,
     scrape_current_step_display: QString,
+
+    scrape_current_system_id: QString,
+    scrape_current_system_name: QString,
+    scrape_current_processed: i32,
+    scrape_current_total: i32,
+    scrape_current_matched: i32,
+    scrape_current_skipped: i32,
+
+    scraper_ids: QStringList,
+    scraper_names: QStringList,
+    scrapers_loading: bool,
 }
 
 #[cxx_qt::bridge]
@@ -108,6 +131,15 @@ pub mod ffi {
         #[qproperty(i32, scrape_current_step)]
         #[qproperty(i32, scrape_total_steps)]
         #[qproperty(QString, scrape_current_step_display)]
+        #[qproperty(QString, scrape_current_system_id)]
+        #[qproperty(QString, scrape_current_system_name)]
+        #[qproperty(i32, scrape_current_processed)]
+        #[qproperty(i32, scrape_current_total)]
+        #[qproperty(i32, scrape_current_matched)]
+        #[qproperty(i32, scrape_current_skipped)]
+        #[qproperty(QStringList, scraper_ids)]
+        #[qproperty(QStringList, scraper_names)]
+        #[qproperty(bool, scrapers_loading)]
         type MediaStatus = super::MediaStatusRust;
 
         #[qinvokable]
@@ -137,6 +169,28 @@ pub mod ffi {
 
         #[qinvokable]
         fn cancel_scrape(self: Pin<&mut MediaStatus>);
+
+        /// One-shot fetch of the `scrapers` RPC into `scraper_ids`/
+        /// `scraper_names`. Called by ScrapeSetupModal.qml on open.
+        #[qinvokable]
+        fn refresh_scrapers(self: Pin<&mut MediaStatus>);
+
+        /// Start a scrape with a caller-chosen scraper id, replacing the
+        /// hardcoded "gamelist.xml" every other scrape call site still
+        /// uses. `systems` is resolved by the caller (ScrapeSetupModal's
+        /// Systems row, via Main.qml's system-scope picker) -- empty means
+        /// every system the scraper supports, matching `start_scrape`'s
+        /// own "All systems" behavior. Per-system/per-category context-menu
+        /// scoping is unaffected; those entries stay on
+        /// `start_scrape_for_system`/`start_scrape_for_systems`, which stay
+        /// on "gamelist.xml".
+        #[qinvokable]
+        fn start_scrape_with_scraper(
+            self: Pin<&mut MediaStatus>,
+            scraper_id: QString,
+            systems: QStringList,
+            force: bool,
+        );
     }
 
     impl cxx_qt::Threading for MediaStatus {}
@@ -180,6 +234,55 @@ struct Snapshot {
     scrape_current_step: i32,
     scrape_total_steps: i32,
     scrape_current_step_display: QString,
+
+    scrape_current_system_id: QString,
+    scrape_current_system_name: QString,
+    scrape_current_processed: i32,
+    scrape_current_total: i32,
+    scrape_current_matched: i32,
+    scrape_current_skipped: i32,
+}
+
+/// The scraper every metadata import runs with — the one last chosen in
+/// `ScrapeSetupModal`, or `gamelist.xml` if nothing has been.
+///
+/// Read from persisted state rather than from `Browse.Settings` because these
+/// call sites are already off the Qt thread by the time they need it, and the
+/// persisted snapshot is the same value the settings singleton mirrors.
+/// Never returns empty: Core validates `scraperId` as `min=1` and has no
+/// server-side "default" alias, so an empty id is a guaranteed error.
+fn selected_scraper_id() -> String {
+    let id = with_persist_read(|s| s.settings.metadata_scraper.clone());
+    let trimmed = id.trim();
+    if trimmed.is_empty() {
+        "gamelist.xml".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+/// Record the scraper chosen in `ScrapeSetupModal` so later context-menu
+/// scrapes use it. Writes the persisted snapshot directly rather than going
+/// through `Settings::set_metadata_scraper`: this runs from the modal's own
+/// invokable, and routing back through the settings singleton would mean a
+/// second Qt-thread hop for a value the singleton re-reads on load anyway.
+///
+/// Mirrored into `frontend.toml` as well, not just `state.toml`. This is a
+/// durable preference, and on `MiSTer` the state file lives in `/tmp` — a
+/// state-only write would silently lose the choice on the next boot, which
+/// is the exact behavior this whole change exists to remove.
+fn persist_selected_scraper_id(scraper_id: &str) {
+    let trimmed = scraper_id.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let snapshot = crate::models::settings::persist_settings(|s| {
+        trimmed.clone_into(&mut s.metadata_scraper);
+    });
+    crate::models::settings::mirror_settings_to_config(
+        &zaparoo_core::platform_paths::config_file_path(),
+        &snapshot.settings,
+    );
 }
 
 fn project(state: &MediaStatusState) -> Snapshot {
@@ -211,6 +314,12 @@ fn project(state: &MediaStatusState) -> Snapshot {
         scrape_current_step: state.scrape_current_step,
         scrape_total_steps: state.scrape_total_steps,
         scrape_current_step_display: QString::from(state.scrape_current_step_display.as_str()),
+        scrape_current_system_id: QString::from(state.scrape_current_system_id.as_str()),
+        scrape_current_system_name: QString::from(state.scrape_current_system_name.as_str()),
+        scrape_current_processed: state.scrape_current_processed,
+        scrape_current_total: state.scrape_current_total,
+        scrape_current_matched: state.scrape_current_matched,
+        scrape_current_skipped: state.scrape_current_skipped,
     }
 }
 
@@ -242,6 +351,7 @@ impl ffi::MediaStatus {
         crate::models::global_handle().spawn(async move {
             if let Err(e) = resource.start_index(MediaIndexParams::default()).await {
                 warn!("media_status: start_index failed: {}", e.message);
+                report_action_error("media_index", "");
             }
         });
     }
@@ -259,6 +369,7 @@ impl ffi::MediaStatus {
             };
             if let Err(e) = resource.start_index(params).await {
                 warn!("media_status: start_index_for_system failed: {}", e.message);
+                report_action_error("media_index", "");
             }
         });
     }
@@ -268,6 +379,7 @@ impl ffi::MediaStatus {
         crate::models::global_handle().spawn(async move {
             if let Err(e) = resource.cancel_index().await {
                 warn!("media_status: cancel_index failed: {}", e.message);
+                report_action_error("media_cancel", "");
             }
         });
     }
@@ -275,22 +387,19 @@ impl ffi::MediaStatus {
     fn start_scrape(self: Pin<&mut Self>, force: bool) {
         let resource = crate::models::global_store().media_status();
         crate::models::global_handle().spawn(async move {
-            // ES gamelist.xml across every indexed system. `force` is
-            // a one-shot UI toggle for re-scraping existing metadata.
-            // Core ships this scraper in-tree (see `pkg/api/server.go`
-            // wiring `gamelistxml.NewGamelistXMLScraper`) and validates
-            // `scraperId` as `min=1` — there is no server-side "default"
-            // alias, so the id has to be a real scraper. An empty
-            // `systems` runs every system the scraper supports
-            // (gamelist.xml supports all). Picking a different scraper
-            // or a system subset is a future chooser-UI job.
+            // `force` is a one-shot UI toggle for re-scraping existing
+            // metadata. Core validates `scraperId` as `min=1` — there is no
+            // server-side "default" alias, so the id has to be a real
+            // scraper; `selected_scraper_id` guarantees a non-empty one. An
+            // empty `systems` runs every system the scraper supports.
             let params = MediaScrapeParams {
-                scraper_id: "gamelist.xml".into(),
+                scraper_id: selected_scraper_id(),
                 systems: Vec::new(),
                 force,
             };
             if let Err(e) = resource.start_scrape(params).await {
                 warn!("media_status: start_scrape failed: {}", e.message);
+                report_action_error("media_scrape", "");
             }
         });
     }
@@ -304,7 +413,7 @@ impl ffi::MediaStatus {
         let resource = crate::models::global_store().media_status();
         crate::models::global_handle().spawn(async move {
             let params = MediaScrapeParams {
-                scraper_id: "gamelist.xml".into(),
+                scraper_id: selected_scraper_id(),
                 systems: vec![system_id],
                 force: false,
             };
@@ -313,6 +422,7 @@ impl ffi::MediaStatus {
                     "media_status: start_scrape_for_system failed: {}",
                     e.message
                 );
+                report_action_error("media_scrape", "");
             }
         });
     }
@@ -335,6 +445,7 @@ impl ffi::MediaStatus {
                     "media_status: start_index_for_systems failed: {}",
                     e.message
                 );
+                report_action_error("media_index", "");
             }
         });
     }
@@ -352,7 +463,7 @@ impl ffi::MediaStatus {
         let resource = crate::models::global_store().media_status();
         crate::models::global_handle().spawn(async move {
             let params = MediaScrapeParams {
-                scraper_id: "gamelist.xml".into(),
+                scraper_id: selected_scraper_id(),
                 systems: ids,
                 force: false,
             };
@@ -361,6 +472,7 @@ impl ffi::MediaStatus {
                     "media_status: start_scrape_for_systems failed: {}",
                     e.message
                 );
+                report_action_error("media_scrape", "");
             }
         });
     }
@@ -370,6 +482,75 @@ impl ffi::MediaStatus {
         crate::models::global_handle().spawn(async move {
             if let Err(e) = resource.cancel_scrape().await {
                 warn!("media_status: cancel_scrape failed: {}", e.message);
+                report_action_error("media_cancel", "");
+            }
+        });
+    }
+
+    fn refresh_scrapers(mut self: Pin<&mut Self>) {
+        self.as_mut().set_scrapers_loading(true);
+        let qt_thread = self.qt_thread();
+        let client = crate::models::global_store().client();
+        crate::models::global_handle().spawn(async move {
+            let result = client.scrapers().await;
+            let _ = qt_thread.queue(move |mut model| {
+                model.as_mut().set_scrapers_loading(false);
+                match result {
+                    Ok(result) => {
+                        let mut ids = QStringList::default();
+                        let mut names = QStringList::default();
+                        for scraper in &result.scrapers {
+                            ids.append(QString::from(scraper.id.as_str()));
+                            names.append(QString::from(scraper.name.as_str()));
+                        }
+                        model.as_mut().set_scraper_ids(ids);
+                        model.as_mut().set_scraper_names(names);
+                    }
+                    Err(e) => {
+                        warn!("media_status: refresh_scrapers failed: {}", e.message);
+                        report_action_error("media_scrapers", "");
+                    }
+                }
+            });
+        });
+    }
+
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "cxx-qt qinvokable signature requires QString/QStringList by value"
+    )]
+    fn start_scrape_with_scraper(
+        self: Pin<&mut Self>,
+        scraper_id: QString,
+        systems: QStringList,
+        force: bool,
+    ) {
+        let scraper_id: String = scraper_id.into();
+        if scraper_id.is_empty() {
+            warn!("media_status: start_scrape_with_scraper ignored empty scraper_id");
+            return;
+        }
+        // Remember the pick. Every other scrape entry point (the full run and
+        // the per-system/per-category context-menu actions) reads it back
+        // through `selected_scraper_id`, so choosing a scraper here once means
+        // choosing it for good. They used to hardcode `gamelist.xml`, which
+        // silently discarded the choice on every later "Get metadata" press
+        // and read as "that scraper doesn't work".
+        persist_selected_scraper_id(&scraper_id);
+        let systems: Vec<String> = systems.iter().map(String::from).collect();
+        let resource = crate::models::global_store().media_status();
+        crate::models::global_handle().spawn(async move {
+            let params = MediaScrapeParams {
+                scraper_id,
+                systems,
+                force,
+            };
+            if let Err(e) = resource.start_scrape(params).await {
+                warn!(
+                    "media_status: start_scrape_with_scraper failed: {}",
+                    e.message
+                );
+                report_action_error("media_scrape", "");
             }
         });
     }
@@ -377,9 +558,23 @@ impl ffi::MediaStatus {
 
 #[allow(
     clippy::cognitive_complexity,
-    reason = "21 fields × diff-and-set is mechanical; folding it loses the per-field NOTIFY suppression"
+    clippy::too_many_lines,
+    reason = "27 fields × diff-and-set is mechanical; folding it loses the per-field NOTIFY suppression"
 )]
 fn apply(mut model: Pin<&mut ffi::MediaStatus>, s: Snapshot) {
+    // Edge detection for the negative image-cache memo -- see
+    // media_image_cache.rs's invalidate_negative_memo_for_system/_all doc
+    // comments for why: a "no image" answer memoized during a transient
+    // race (a NAS mount not yet up at boot, say) otherwise stays memoized
+    // for the rest of the process's life with nothing to clear it, so a
+    // subsequent successful reindex/rescrape never actually reaches the
+    // cache. Captured against the model's state going INTO this update
+    // (before anything below reads or moves out of `s`), so this is a
+    // "was busy a moment ago, now idle" edge, not a same-frame no-op.
+    let index_just_finished = model.indexing && !s.indexing;
+    let scrape_just_finished = model.scraping && !s.scraping;
+    let scrape_system_id = s.scrape_system_id.to_string();
+
     if model.seeded != s.seeded {
         model.as_mut().set_seeded(s.seeded);
     }
@@ -469,6 +664,52 @@ fn apply(mut model: Pin<&mut ffi::MediaStatus>, s: Snapshot) {
             .as_mut()
             .set_scrape_current_step_display(s.scrape_current_step_display);
     }
+    if model.scrape_current_system_id != s.scrape_current_system_id {
+        model
+            .as_mut()
+            .set_scrape_current_system_id(s.scrape_current_system_id);
+    }
+    if model.scrape_current_system_name != s.scrape_current_system_name {
+        model
+            .as_mut()
+            .set_scrape_current_system_name(s.scrape_current_system_name);
+    }
+    if model.scrape_current_processed != s.scrape_current_processed {
+        model
+            .as_mut()
+            .set_scrape_current_processed(s.scrape_current_processed);
+    }
+    if model.scrape_current_total != s.scrape_current_total {
+        model
+            .as_mut()
+            .set_scrape_current_total(s.scrape_current_total);
+    }
+    if model.scrape_current_matched != s.scrape_current_matched {
+        model
+            .as_mut()
+            .set_scrape_current_matched(s.scrape_current_matched);
+    }
+    if model.scrape_current_skipped != s.scrape_current_skipped {
+        model
+            .as_mut()
+            .set_scrape_current_skipped(s.scrape_current_skipped);
+    }
+
+    // Indexing carries no per-system scope (a whole-library operation),
+    // so a completion can only invalidate globally. A completed scrape
+    // targeting one system (`start_scrape_for_system`) invalidates just
+    // that system; an untargeted "all systems" scrape (empty
+    // scrape_system_id) invalidates globally, same as indexing.
+    if index_just_finished {
+        global_media_image_cache().invalidate_negative_memo_all();
+    }
+    if scrape_just_finished {
+        if scrape_system_id.is_empty() {
+            global_media_image_cache().invalidate_negative_memo_all();
+        } else {
+            global_media_image_cache().invalidate_negative_memo_for_system(&scrape_system_id);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -507,6 +748,12 @@ mod tests {
             scrape_current_step: 0,
             scrape_total_steps: 0,
             scrape_current_step_display: String::new(),
+            scrape_current_system_id: String::new(),
+            scrape_current_system_name: String::new(),
+            scrape_current_processed: 0,
+            scrape_current_total: 0,
+            scrape_current_matched: 0,
+            scrape_current_skipped: 0,
         };
         let snapshot = project(&state);
         assert!(snapshot.seeded);
@@ -539,6 +786,12 @@ mod tests {
             scrape_current_step: 2,
             scrape_total_steps: 5,
             scrape_current_step_display: "Super Nintendo".into(),
+            scrape_current_system_id: "SNES".into(),
+            scrape_current_system_name: "Super Nintendo Entertainment System".into(),
+            scrape_current_processed: 12,
+            scrape_current_total: 200,
+            scrape_current_matched: 10,
+            scrape_current_skipped: 2,
             ..MediaStatusState::default()
         };
         let snapshot = project(&state);
@@ -559,6 +812,14 @@ mod tests {
             snapshot.scrape_current_step_display,
             QString::from("Super Nintendo"),
         );
+        assert_eq!(
+            snapshot.scrape_current_system_name,
+            QString::from("Super Nintendo Entertainment System"),
+        );
+        assert_eq!(snapshot.scrape_current_processed, 12);
+        assert_eq!(snapshot.scrape_current_total, 200);
+        assert_eq!(snapshot.scrape_current_matched, 10);
+        assert_eq!(snapshot.scrape_current_skipped, 2);
     }
 
     #[test]

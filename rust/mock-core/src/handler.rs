@@ -10,6 +10,7 @@ use serde_json::Value;
 use tracing::{debug, info, warn};
 
 use crate::fixtures;
+use crate::media_state::{self, Notifier};
 
 #[derive(Deserialize)]
 struct RpcRequest {
@@ -36,8 +37,11 @@ struct RpcError {
 }
 
 const FALLBACK_INTERNAL_ERROR: &str = r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"internal serialization error"}}"#;
+/// JSON-RPC error code for the mock's domain errors (cancel-with-nothing-
+/// running). Not one of the reserved `-326xx` codes; arbitrary but stable.
+const DOMAIN_ERROR_CODE: i32 = -32000;
 
-pub fn dispatch(text: &str) -> String {
+pub fn dispatch(text: &str, notifier: &Notifier) -> String {
     let req: RpcRequest = match serde_json::from_str(text) {
         Ok(r) => r,
         Err(e) => {
@@ -56,36 +60,62 @@ pub fn dispatch(text: &str) -> String {
 
     debug!(method = %req.method, "rpc");
 
-    let result = match req.method.as_str() {
-        "systems" => Some(fixtures::systems_response()),
-        "launchers" => Some(fixtures::launchers_response()),
-        "settings" => Some(fixtures::settings_response()),
-        "settings.update" => Some(fixtures::settings_update_response(&req.params)),
-        "media.search" => Some(fixtures::media_search_response(&req.params)),
-        "media.browse" => Some(fixtures::media_browse_response(&req.params)),
-        "media.history" => Some(fixtures::media_history_response(&req.params)),
-        "media.history.latest" => Some(fixtures::media_history_latest_response()),
+    let outcome: Option<Result<Value, String>> = match req.method.as_str() {
+        "systems" => Some(Ok(fixtures::systems_response(&req.params))),
+        "launchers" => Some(Ok(fixtures::launchers_response())),
+        "scrapers" => Some(Ok(fixtures::scrapers_response())),
+        "settings" => Some(Ok(fixtures::settings_response())),
+        "settings.update" => Some(Ok(fixtures::settings_update_response(&req.params))),
+        "media.search" => Some(Ok(fixtures::media_search_response(&req.params))),
+        "media.browse" => Some(Ok(fixtures::media_browse_response(&req.params))),
+        "media.browse.index" => Some(Ok(fixtures::media_browse_index_response(&req.params))),
+        "media.meta" => Some(Ok(fixtures::media_meta_response(&req.params))),
+        "media.meta.update" => Some(fixtures::media_meta_update_response(&req.params)),
+        "media.history" => Some(Ok(fixtures::media_history_response(&req.params))),
+        "media.history.latest" => Some(Ok(fixtures::media_history_latest_response())),
+        "media" => Some(Ok(media_state::media_response())),
+        "media.scrape.status" => Some(Ok(media_state::scrape_status_response())),
+        "media.generate" => Some(Ok(media_state::start_index(notifier))),
+        "media.generate.cancel" => Some(media_state::cancel_index(notifier)),
+        "media.scrape" => {
+            let force = req
+                .params
+                .get("force")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            Some(Ok(media_state::start_scrape(force, notifier)))
+        }
+        "media.scrape.cancel" => Some(media_state::cancel_scrape(notifier)),
         "run" => {
             let zap_script = req.params.get("text").and_then(Value::as_str).unwrap_or("");
             info!(%zap_script, "run");
             // Upstream returns null on success.
-            Some(Value::Null)
+            Some(Ok(Value::Null))
         }
         "readers.write" => {
             let zap_script = req.params.get("text").and_then(Value::as_str).unwrap_or("");
             info!(%zap_script, "readers.write");
-            Some(Value::Null)
+            Some(Ok(Value::Null))
         }
-        "version" => Some(fixtures::version_response()),
+        "version" => Some(Ok(fixtures::version_response())),
         _ => None,
     };
 
-    let response = match result {
-        Some(r) => RpcResponse {
+    let response = match outcome {
+        Some(Ok(r)) => RpcResponse {
             jsonrpc: "2.0",
             id: req.id.unwrap_or(Value::Null),
             result: Some(r),
             error: None,
+        },
+        Some(Err(message)) => RpcResponse {
+            jsonrpc: "2.0",
+            id: req.id.unwrap_or(Value::Null),
+            result: None,
+            error: Some(RpcError {
+                code: DOMAIN_ERROR_CODE,
+                message,
+            }),
         },
         None => RpcResponse {
             jsonrpc: "2.0",
@@ -115,7 +145,16 @@ mod tests {
 
     use serde_json::Value;
 
-    use super::dispatch;
+    use super::dispatch as dispatch_with_notifier;
+    use crate::media_state::Notifier;
+
+    // Every existing test below predates the notifier parameter and has
+    // no socket-pump task to receive pushed notifications — route them
+    // through a no-op `Notifier` so none of those call sites need to
+    // change.
+    fn dispatch(text: &str) -> String {
+        dispatch_with_notifier(text, &Notifier::noop())
+    }
 
     fn parse(text: &str) -> Value {
         serde_json::from_str(text).expect("dispatch output must be valid JSON")
@@ -131,11 +170,29 @@ mod tests {
     }
 
     #[test]
-    fn systems_returns_fixture_catalog() {
+    fn systems_returns_fixture_catalog_with_counts() {
         let req = r#"{"jsonrpc":"2.0","id":"1","method":"systems","params":{}}"#;
         let resp = parse(&dispatch(req));
         let systems = resp["result"]["systems"].as_array().expect("array");
         assert_eq!(systems.len(), 10);
+        assert!(systems.iter().all(|system| system["mediaCount"].is_u64()));
+    }
+
+    #[test]
+    fn systems_filters_and_counts_favorite_tag() {
+        let req =
+            r#"{"jsonrpc":"2.0","id":"1","method":"systems","params":{"tags":["user:favorite"]}}"#;
+        let resp = parse(&dispatch(req));
+        let systems = resp["result"]["systems"].as_array().expect("array");
+        assert!(!systems.is_empty());
+        assert!(systems
+            .iter()
+            .all(|system| { system["mediaCount"].as_u64().is_some_and(|count| count > 0) }));
+        let total = systems
+            .iter()
+            .filter_map(|system| system["mediaCount"].as_u64())
+            .sum::<u64>();
+        assert_eq!(total, 20);
     }
 
     #[test]
@@ -170,6 +227,7 @@ mod tests {
         assert!(results
             .iter()
             .all(|g| g["system"]["id"].as_str() == Some("NES")));
+        assert!(results.iter().all(|g| g["hasCover"].is_boolean()));
     }
 
     #[test]
@@ -182,15 +240,104 @@ mod tests {
 
     #[test]
     fn media_search_emits_pagination_envelope() {
-        let req = r#"{"jsonrpc":"2.0","id":"1","method":"media.search","params":{"systems":[],"maxResults":50}}"#;
+        // A page that covers every row reports no next page and no cursor.
+        let req = r#"{"jsonrpc":"2.0","id":"1","method":"media.search","params":{"systems":[],"maxResults":1000}}"#;
         let resp = parse(&dispatch(req));
+        let results = resp["result"]["results"].as_array().expect("array");
         let pagination = resp["result"]["pagination"]
             .as_object()
             .expect("pagination object");
         assert_eq!(pagination["hasNextPage"], Value::Bool(false));
-        assert_eq!(pagination["pageSize"], Value::from(50));
-        // Deprecated but still present for backward compatibility.
-        assert_eq!(resp["result"]["total"], Value::from(-1));
+        assert_eq!(pagination["pageSize"], Value::from(1000));
+        assert!(!pagination.contains_key("nextCursor"));
+        // Deprecated current-page count, matching real Core. It is not the
+        // dataset total and must not be used to stop cursor pagination.
+        assert_eq!(resp["result"]["total"], Value::from(results.len()));
+    }
+
+    // Favorites uses cursor pagination. Short pages must advertise a next
+    // page and return a cursor that resumes where prior page stopped.
+    #[test]
+    fn media_search_paginates_with_a_resumable_cursor() {
+        let first = parse(&dispatch(
+            r#"{"jsonrpc":"2.0","id":"1","method":"media.search","params":{"systems":[],"maxResults":5}}"#,
+        ));
+        let page1 = first["result"]["results"].as_array().expect("array");
+        assert_eq!(page1.len(), 5);
+        assert_eq!(first["result"]["total"], Value::from(5));
+        assert_eq!(
+            first["result"]["pagination"]["hasNextPage"],
+            Value::Bool(true)
+        );
+        let cursor = first["result"]["pagination"]["nextCursor"]
+            .as_str()
+            .expect("cursor");
+        // Offset cursor: page two must resume exactly where page one ended,
+        // not skip rows or restart inside page one.
+        assert_eq!(cursor, "5");
+
+        let second = parse(&dispatch(&format!(
+            r#"{{"jsonrpc":"2.0","id":"2","method":"media.search","params":{{"systems":[],"maxResults":5,"cursor":"{cursor}"}}}}"#
+        )));
+        let page2 = second["result"]["results"].as_array().expect("array");
+        assert_eq!(page2.len(), 5);
+        // The second page resumes rather than repeating the first.
+        assert_ne!(page1[0]["path"], page2[0]["path"]);
+    }
+
+    // Favorites are a tag query. Without this the Favorites screen in
+    // `just mock-core` lists every game and the feature cannot be exercised.
+    #[test]
+    fn media_search_filters_by_user_favorite_tag() {
+        let req = r#"{"jsonrpc":"2.0","id":"1","method":"media.search","params":{"systems":[],"maxResults":1000,"tags":["user:favorite"]}}"#;
+        let resp = parse(&dispatch(req));
+        let results = resp["result"]["results"].as_array().expect("array");
+        assert!(!results.is_empty(), "some mock games are favorites");
+
+        let unfiltered = parse(&dispatch(
+            r#"{"jsonrpc":"2.0","id":"2","method":"media.search","params":{"systems":[],"maxResults":1000}}"#,
+        ));
+        let all = unfiltered["result"]["results"].as_array().expect("array");
+        assert!(
+            results.len() < all.len(),
+            "the tag filter must narrow the set"
+        );
+
+        for game in results {
+            let tags = game["tags"].as_array().expect("tags array");
+            assert!(
+                tags.iter()
+                    .any(|tag| tag["type"] == "user" && tag["tag"] == "favorite"),
+                "every returned row carries the favorite tag"
+            );
+        }
+    }
+
+    #[test]
+    fn media_search_applies_name_sort_before_paging() {
+        let req = r#"{"jsonrpc":"2.0","id":"1","method":"media.search","params":{"maxResults":1000,"sort":"name-asc"}}"#;
+        let resp = parse(&dispatch(req));
+        let results = resp["result"]["results"].as_array().expect("array");
+        let names: Vec<String> = results
+            .iter()
+            .filter_map(|game| game["name"].as_str())
+            .map(str::to_lowercase)
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted);
+    }
+
+    // Search rows carry real system metadata rather than bare ids.
+    #[test]
+    fn media_search_rows_carry_system_name_and_category() {
+        let req = r#"{"jsonrpc":"2.0","id":"1","method":"media.search","params":{"systems":["NES"],"maxResults":5}}"#;
+        let resp = parse(&dispatch(req));
+        let results = resp["result"]["results"].as_array().expect("array");
+        let system = &results[0]["system"];
+        assert_eq!(system["id"], Value::from("NES"));
+        assert_eq!(system["name"], Value::from("Nintendo Entertainment System"));
+        assert_eq!(system["category"], Value::from("Consoles"));
     }
 
     #[test]
@@ -209,6 +356,134 @@ mod tests {
         }
         assert!(resp["result"]["totalFiles"].is_number());
         assert!(resp["result"]["pagination"].is_object());
+    }
+
+    #[test]
+    fn media_browse_filters_and_pages_favorites() {
+        let first = parse(&dispatch(
+            r#"{"jsonrpc":"2.0","id":"1","method":"media.browse","params":{"path":"/games","maxResults":2,"tags":["user:favorite"]}}"#,
+        ));
+        let page1 = first["result"]["entries"].as_array().expect("array");
+        assert_eq!(page1.len(), 2);
+        assert!(page1
+            .iter()
+            .all(|entry| entry["tags"].as_array().is_some_and(|tags| tags
+                .iter()
+                .any(|tag| tag["type"] == "user" && tag["tag"] == "favorite"))));
+        assert_eq!(first["result"]["pagination"]["hasNextPage"], true);
+        let cursor = first["result"]["pagination"]["nextCursor"]
+            .as_str()
+            .expect("cursor");
+        let second = parse(&dispatch(&format!(
+            r#"{{"jsonrpc":"2.0","id":"2","method":"media.browse","params":{{"path":"/games","maxResults":2,"cursor":"{cursor}","tags":["user:favorite"]}}}}"#
+        )));
+        let page2 = second["result"]["entries"].as_array().expect("array");
+        assert!(!page2.is_empty());
+        assert_ne!(page1[0]["path"], page2[0]["path"]);
+    }
+
+    #[test]
+    fn media_browse_root_contents_merges_directories_and_media() {
+        let req = r#"{"jsonrpc":"2.0","id":"1","method":"media.browse","params":{"systems":["NES"],"rootView":"contents"}}"#;
+        let resp = parse(&dispatch(req));
+        assert_eq!(resp["result"]["path"], Value::from(""));
+        let entries = resp["result"]["entries"].as_array().expect("array");
+        // Virtual root first, then the two mock directories, then media --
+        // mirrors `browseSystemRootContents`'s ordering in zaparoo-core.
+        assert_eq!(entries[0]["type"], Value::from("root"));
+        assert_eq!(entries[1]["type"], Value::from("directory"));
+        assert_eq!(entries[2]["type"], Value::from("directory"));
+        assert!(entries[3..].iter().all(|entry| entry["type"] == "media"));
+        // `totalDirs` counts the merged directories only, excluding the
+        // leading virtual root.
+        assert_eq!(resp["result"]["totalDirs"], Value::from(2));
+        assert!(resp["result"]["totalFiles"].as_u64().unwrap_or(0) > 0);
+    }
+
+    #[test]
+    fn media_browse_without_root_view_returns_route_roots() {
+        let req =
+            r#"{"jsonrpc":"2.0","id":"1","method":"media.browse","params":{"systems":["NES"]}}"#;
+        let resp = parse(&dispatch(req));
+        let entries = resp["result"]["entries"].as_array().expect("array");
+        assert!(entries.iter().all(|entry| entry["type"] == "root"));
+        assert_eq!(resp["result"]["totalFiles"], Value::from(0));
+        assert_eq!(resp["result"]["totalDirs"], Value::from(0));
+        assert!(resp["result"]["pagination"].is_null());
+    }
+
+    #[test]
+    fn media_browse_index_matches_favorite_scope() {
+        let req = r#"{"jsonrpc":"2.0","id":"1","method":"media.browse.index","params":{"path":"/games","tags":["user:favorite"]}}"#;
+        let resp = parse(&dispatch(req));
+        let groups = resp["result"]["groups"].as_array().expect("array");
+        let indexed: u64 = groups
+            .iter()
+            .filter_map(|group| group["count"].as_u64())
+            .sum();
+        let browse = parse(&dispatch(
+            r#"{"jsonrpc":"2.0","id":"2","method":"media.browse","params":{"path":"/games","maxResults":1000,"tags":["user:favorite"]}}"#,
+        ));
+        assert_eq!(
+            indexed,
+            browse["result"]["totalFiles"].as_u64().unwrap_or(0)
+        );
+    }
+
+    #[test]
+    fn media_meta_preserves_batch_order() {
+        let req = r#"{"jsonrpc":"2.0","id":"1","method":"media.meta","params":{"items":[{"system":"NES","path":"/games/first.nes"},{"mediaId":42}]}}"#;
+        let resp = parse(&dispatch(req));
+        let items = resp["result"]["items"].as_array().expect("items");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["media"]["path"], "/games/first.nes");
+        assert_eq!(items[0]["media"]["title"]["system"]["id"], "NES");
+        assert_eq!(items[1]["media"]["path"], "/mock/media/42");
+    }
+
+    #[test]
+    fn media_meta_update_sets_and_media_meta_reflects_the_override() {
+        let update = r#"{"jsonrpc":"2.0","id":"1","method":"media.meta.update","params":{"system":"SNES","path":"/games/set.sfc","media":{"launcherOverride":"snes9x"}}}"#;
+        let resp = parse(&dispatch(update));
+        assert_eq!(resp["result"]["media"]["launcherOverride"], "snes9x");
+
+        let read = r#"{"jsonrpc":"2.0","id":"2","method":"media.meta","params":{"system":"SNES","path":"/games/set.sfc"}}"#;
+        let resp = parse(&dispatch(read));
+        assert_eq!(resp["result"]["media"]["launcherOverride"], "snes9x");
+    }
+
+    #[test]
+    fn media_meta_update_clear_removes_the_override() {
+        let set = r#"{"jsonrpc":"2.0","id":"1","method":"media.meta.update","params":{"system":"SNES","path":"/games/clear.sfc","media":{"launcherOverride":"snes9x"}}}"#;
+        dispatch(set);
+
+        let clear = r#"{"jsonrpc":"2.0","id":"2","method":"media.meta.update","params":{"system":"SNES","path":"/games/clear.sfc","media":{"launcherOverride":null}}}"#;
+        let resp = parse(&dispatch(clear));
+        assert!(resp["result"]["media"]["launcherOverride"].is_null());
+    }
+
+    #[test]
+    fn media_meta_update_rejects_unknown_launcher() {
+        let update = r#"{"jsonrpc":"2.0","id":"1","method":"media.meta.update","params":{"system":"SNES","path":"/games/unknown.sfc","media":{"launcherOverride":"not-a-real-launcher"}}}"#;
+        let resp = parse(&dispatch(update));
+        assert_eq!(resp["error"]["code"], -32000);
+        assert!(resp["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("launcher not found"));
+    }
+
+    #[test]
+    fn media_meta_update_rejects_launcher_from_a_different_system() {
+        // "nestopia" is a real fixture launcher, but it's registered for
+        // NES, not SNES.
+        let update = r#"{"jsonrpc":"2.0","id":"1","method":"media.meta.update","params":{"system":"SNES","path":"/games/wrong-system.sfc","media":{"launcherOverride":"nestopia"}}}"#;
+        let resp = parse(&dispatch(update));
+        assert_eq!(resp["error"]["code"], -32000);
+        assert!(resp["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("launcher not found"));
     }
 
     #[test]
@@ -234,22 +509,55 @@ mod tests {
     }
 
     #[test]
-    fn media_history_returns_entries_with_pagination() {
-        let req = r#"{"jsonrpc":"2.0","id":"1","method":"media.history","params":{"limit":5}}"#;
-        let resp = parse(&dispatch(req));
-        let entries = resp["result"]["entries"].as_array().expect("array");
-        assert!(!entries.is_empty());
-        for entry in entries {
+    fn media_history_returns_cursor_pages() {
+        let first_req = r#"{"jsonrpc":"2.0","id":"1","method":"media.history","params":{"limit":5,"distinctMedia":true}}"#;
+        let first = parse(&dispatch(first_req));
+        let first_entries = first["result"]["entries"].as_array().expect("array");
+        assert_eq!(first_entries.len(), 5);
+        for entry in first_entries {
             assert!(entry["mediaName"].is_string());
             assert!(entry["mediaPath"].is_string());
             assert!(entry["systemId"].is_string());
             assert!(entry["systemName"].is_string());
             assert!(entry["launcherId"].is_string());
+            assert!(entry["hasCover"].is_boolean());
         }
-        let pagination = resp["result"]["pagination"]
+        let pagination = first["result"]["pagination"]
             .as_object()
             .expect("pagination object");
-        assert_eq!(pagination["hasNextPage"], Value::Bool(false));
+        assert_eq!(pagination["hasNextPage"], Value::Bool(true));
+        assert_eq!(pagination["nextCursor"], Value::String("5".into()));
+
+        let next_req = r#"{"jsonrpc":"2.0","id":"2","method":"media.history","params":{"limit":5,"cursor":"5","distinctMedia":true}}"#;
+        let next = parse(&dispatch(next_req));
+        let next_entries = next["result"]["entries"].as_array().expect("array");
+        assert!(!next_entries.is_empty());
+        let first_paths = first_entries
+            .iter()
+            .map(|entry| entry["mediaPath"].as_str().expect("first path"))
+            .collect::<std::collections::HashSet<_>>();
+        assert!(next_entries.iter().all(|entry| {
+            !first_paths.contains(entry["mediaPath"].as_str().expect("next path"))
+        }));
+    }
+
+    #[test]
+    fn media_history_honors_distinct_media_before_paging() {
+        let repeated_req = r#"{"jsonrpc":"2.0","id":"1","method":"media.history","params":{"limit":2,"distinctMedia":false}}"#;
+        let repeated = parse(&dispatch(repeated_req));
+        let repeated_entries = repeated["result"]["entries"].as_array().expect("array");
+        assert_eq!(
+            repeated_entries[0]["mediaPath"],
+            repeated_entries[1]["mediaPath"]
+        );
+
+        let distinct_req = r#"{"jsonrpc":"2.0","id":"2","method":"media.history","params":{"limit":2,"distinctMedia":true}}"#;
+        let distinct = parse(&dispatch(distinct_req));
+        let distinct_entries = distinct["result"]["entries"].as_array().expect("array");
+        assert_ne!(
+            distinct_entries[0]["mediaPath"],
+            distinct_entries[1]["mediaPath"]
+        );
     }
 
     #[test]
@@ -272,5 +580,83 @@ mod tests {
         let entries = resp["result"]["entries"].as_array().expect("array");
         assert!(entries.is_empty());
         assert!(resp["result"].get("pagination").is_none());
+    }
+
+    // The media.generate/media.scrape sequence tests below rely on
+    // `media_state`'s single process-wide `Mutex<MediaState>`. That is
+    // only test-safe because `just test-rust` runs on `cargo nextest`,
+    // which gives every test its own process — a plain `cargo test`
+    // invocation would run these in one process and the shared state
+    // could race across tests. Mark new stateful tests `#[tokio::test]`
+    // (media.generate/media.scrape call `tokio::spawn`, which panics
+    // outside a runtime) and keep them independent of one another.
+
+    #[test]
+    fn media_returns_seed_response_shape() {
+        let req = r#"{"jsonrpc":"2.0","id":"1","method":"media","params":{}}"#;
+        let resp = parse(&dispatch(req));
+        let database = resp["result"]["database"].as_object().expect("object");
+        for key in [
+            "exists",
+            "indexing",
+            "optimizing",
+            "paused",
+            "totalSteps",
+            "currentStep",
+            "currentStepDisplay",
+            "totalFiles",
+            "totalMedia",
+        ] {
+            assert!(database.contains_key(key), "missing {key}");
+        }
+        assert!(resp["result"]["active"]
+            .as_array()
+            .expect("array")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn media_generate_starts_indexing() {
+        let notifier = Notifier::noop();
+        let req = r#"{"jsonrpc":"2.0","id":"1","method":"media.generate","params":{}}"#;
+        let resp = parse(&dispatch_with_notifier(req, &notifier));
+        assert!(resp["result"].is_null());
+        assert!(resp["error"].is_null());
+
+        let seed_req = r#"{"jsonrpc":"2.0","id":"2","method":"media","params":{}}"#;
+        let seed = parse(&dispatch_with_notifier(seed_req, &notifier));
+        assert_eq!(seed["result"]["database"]["indexing"], Value::Bool(true));
+    }
+
+    #[tokio::test]
+    async fn media_generate_cancel_without_running_index_returns_domain_error() {
+        let notifier = Notifier::noop();
+        let req = r#"{"jsonrpc":"2.0","id":"1","method":"media.generate.cancel","params":{}}"#;
+        let resp = parse(&dispatch_with_notifier(req, &notifier));
+        assert!(resp["result"].is_null());
+        assert_eq!(resp["error"]["code"], -32000);
+    }
+
+    #[tokio::test]
+    async fn media_scrape_starts_scraping() {
+        let notifier = Notifier::noop();
+        let req = r#"{"jsonrpc":"2.0","id":"1","method":"media.scrape","params":{"force":false}}"#;
+        let resp = parse(&dispatch_with_notifier(req, &notifier));
+        assert!(resp["result"].is_null());
+        assert!(resp["error"].is_null());
+
+        let status_req = r#"{"jsonrpc":"2.0","id":"2","method":"media.scrape.status","params":{}}"#;
+        let status = parse(&dispatch_with_notifier(status_req, &notifier));
+        assert_eq!(status["result"]["scraping"], Value::Bool(true));
+        assert!(status["result"]["currentSystem"].is_object());
+    }
+
+    #[tokio::test]
+    async fn media_scrape_cancel_without_running_scrape_returns_domain_error() {
+        let notifier = Notifier::noop();
+        let req = r#"{"jsonrpc":"2.0","id":"1","method":"media.scrape.cancel","params":{}}"#;
+        let resp = parse(&dispatch_with_notifier(req, &notifier));
+        assert!(resp["result"].is_null());
+        assert_eq!(resp["error"]["code"], -32000);
     }
 }

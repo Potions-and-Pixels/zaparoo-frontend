@@ -4,9 +4,11 @@
 
 #[macro_use]
 mod bind;
+mod hub_cover_manifest;
 pub mod image_overrides;
 mod media_image_cache;
 mod media_meta_cache;
+mod mister_battery;
 mod mister_runtime;
 mod models;
 pub mod system_logos;
@@ -49,6 +51,7 @@ use std::time::{Duration, Instant};
 use zaparoo_core::{
     client::Client,
     config::load_config,
+    controller_report, hub_layout,
     logger::{debug_logging_enabled, install},
     persist, platform,
     platform_paths::{config_file_path, custom_dir, log_file_path, stderr_log_path},
@@ -376,12 +379,10 @@ pub extern "C" fn zaparoo_rust_init(crt_native_path_forced: bool) -> c_int {
 
     // CRT path always renders to one of the native writer's mode
     // geometries (352x240 NTSC, 352x288 PAL, 720x480 480i), selected by
-    // the persisted video standard. User-configured [video] dimensions
-    // still apply to the normal MiSTer path, but `--crt` overrides them
-    // so startup `vmode`, the desktop preview canvas, and the writer's
-    // fb0 validation all agree. frontend.toml is the durable source for
-    // the standard and offsets (state.toml lives on tmpfs on MiSTer and
-    // mirrors it).
+    // the persisted video standard. Digital MiSTer validates an explicit
+    // [video] render size or resolves an automatic framebuffer size below.
+    // frontend.toml remains the durable source for CRT standard and offsets
+    // (state.toml lives on tmpfs on MiSTer and mirrors it).
     if crt_native_path_forced {
         let standard = zaparoo_core::config::normalize_crt_video_standard(
             config.settings.crt_video_standard.as_deref().unwrap_or(""),
@@ -396,6 +397,7 @@ pub extern "C" fn zaparoo_rust_init(crt_native_path_forced: bool) -> c_int {
         let _ = CRT_H_OFFSET.set(h_offset);
         let _ = CRT_V_OFFSET.set(v_offset);
     }
+    mister_runtime::resolve_video_size(&mut config, crt_native_path_forced);
 
     // Cache the language override so `zaparoo_rust_language_code` (called
     // from main.cpp before the QML engine loads) can return it without
@@ -452,6 +454,11 @@ pub extern "C" fn zaparoo_rust_init(crt_native_path_forced: bool) -> c_int {
     startup_trace("rust:client created");
     platform::spawn_fetcher(client.clone(), &handle);
     startup_trace("rust:platform fetcher spawned");
+    startup_trace(if controller_report::spawn_watcher() {
+        "rust:controller report watcher spawned"
+    } else {
+        "rust:controller report watcher skipped (not MiSTer)"
+    });
     let store = Store::new(client.clone(), handle.clone());
     startup_trace("rust:store created");
 
@@ -468,6 +475,12 @@ pub extern "C" fn zaparoo_rust_init(crt_native_path_forced: bool) -> c_int {
         hidden_system_ids: config.settings.hidden_system_ids.clone(),
     }));
     startup_trace("rust:hidden browse prefs loaded");
+
+    // The Hub's persisted layout ("go all in" replacement for Hub
+    // hide/order — see hub_layout.rs) — same frontend.toml, own top-level
+    // parse, same reasoning as hidden_browse_prefs above.
+    let hub_layout = Arc::new(Mutex::new(hub_layout::load_hub_layout(&config_path)));
+    startup_trace("rust:hub layout loaded");
 
     // Register the customization root without scanning it. Hub and system
     // image scans run asynchronously after first paint; system display-name
@@ -489,10 +502,17 @@ pub extern "C" fn zaparoo_rust_init(crt_native_path_forced: bool) -> c_int {
         store,
         persist_state,
         hidden_browse_prefs,
+        hub_layout,
         config.key_to_action.clone(),
         core_is_local,
     );
     startup_trace("rust:model globals initialized");
+
+    // Seed the Hub/Resume cold-boot cover manifest before Qt/QML starts —
+    // see hub_cover_manifest.rs's module doc. Small, local, sequential
+    // reads (no network); a no-op off a colocated MiSTer.
+    hub_cover_manifest::seed_from_manifest();
+    startup_trace("rust:hub cover manifest seeded");
 
     0
 }

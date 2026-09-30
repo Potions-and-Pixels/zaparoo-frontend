@@ -17,13 +17,25 @@
 //     ticket that disarms stale callbacks.
 //
 // History is flat (no folder navigation, no auto-nav) so this model
-// stays a fraction of the size of `GamesModel`. Rows are deduplicated
-// by exact `mediaPath`; Core returns newest-first history, so the first
-// row for a path is the one shown. Card-write isn't wired here yet —
-// recents launches by `run`-ing the entry's launcher route.
+// stays a fraction of the size of `GamesModel`. Every page asks Core for
+// newest-session-per-`(systemId, mediaPath)` rows; a matching defensive
+// filter only protects the model from malformed or older responses.
+//
+// `write_card_at`/`launch_text_at` reuse `launch_text_for`'s raw
+// `media_path` payload (see that function's doc comment) rather than a
+// portable `System/Title` ZapScript token — history rows carry no title
+// metadata to build one from. A token written from Recents is therefore
+// specific to this device, unlike one written from Games/Favorites. There
+// is deliberately no favorite-toggle here: Core's `media.history` response
+// carries no tags, so `is_favorite_at` would need either a per-row
+// `media.query` round trip or a Core API change, neither of which belongs
+// in this model.
 
 use crate::media_image_cache::{global_media_image_cache, MediaImageCache, MediaKey};
-use crate::media_meta_cache::{global_media_meta_cache, MetaLookup};
+use crate::media_meta_cache::{
+    fetch_media_meta_with_path_fallback, global_media_meta_cache, MetaLookup,
+};
+use crate::models::action_error::report_action_error;
 use crate::models::nav_timing::NavTiming;
 use crate::models::tag_utils::tag_display_value;
 use crate::models::{global_handle, global_store};
@@ -41,10 +53,11 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use zaparoo_core::client::{ClientError, ConnectionState};
+use zaparoo_core::endpoints::readers_write::ReadersWriteMutation;
 use zaparoo_core::endpoints::run::RunMutation;
 use zaparoo_core::media_types::{
     MediaHistoryEntry, MediaHistoryLatestEntry, MediaHistoryParams, MediaHistoryResult, MediaMeta,
-    MediaMetaParams, RunParams, TagInfo,
+    MediaMetaParams, ReadersWriteParams, RunParams, TagInfo,
 };
 
 const NAME_ROLE: i32 = 256 + 1;
@@ -58,6 +71,22 @@ const HIDDEN_ROLE: i32 = 256 + 8;
 // History entries carry no tags; the role exists only so the shared
 // grid/list delegates (which require it for media rows) bind cleanly here.
 const DISAMBIGUATING_TAGS_ROLE: i32 = 256 + 9;
+// Every real row is a real history entry, never a structural placeholder;
+// the role exists only so PagedGrid's `isEmpty` delegate contract (round 6
+// follow-up — see PagedGrid.qml) is satisfied by direct QAbstractListModel
+// callers.
+const IS_EMPTY_ROLE: i32 = 256 + 10;
+// Round 11: `entryType`/`fileCount` exist so this model satisfies the same
+// shared BrowseList/PagedGrid delegate contract GamesModel's folder-count
+// suffix uses (see games.rs's identically-named roles). A history entry is
+// always a `media` row, never a folder, so these are constant.
+const ENTRY_TYPE_ROLE: i32 = 256 + 11;
+const FILE_COUNT_ROLE: i32 = 256 + 12;
+// No Recents row is ever "disabled" (Hub-only concept). The role exists
+// only so PagedGrid's `cellItem.disabled` delegate contract (round 11
+// follow-up — see PagedGrid.qml) is satisfied by direct QAbstractListModel
+// callers.
+const DISABLED_ROLE: i32 = 256 + 13;
 
 // Page size for the initial load and every cursor follow-up. Core caps
 // `limit` at 100; history rows are tiny (one tile + one caption per row)
@@ -146,6 +175,12 @@ pub struct RecentsModelRust {
     // thread between sleep-completion and abort.
     cover_gate_seq: Arc<AtomicU64>,
     nav_timing: Option<NavTiming>,
+    card_write_pending: bool,
+    card_write_error: QString,
+    // Disarms a stale write's callback the same way `resume_seq`/`seq` do
+    // for their own async paths — see `favorites.rs::write_card_at` for
+    // the identical pattern this mirrors.
+    card_write_seq: Arc<AtomicU64>,
 }
 
 impl Default for RecentsModelRust {
@@ -185,6 +220,9 @@ impl Default for RecentsModelRust {
             cover_gate_timer: None,
             cover_gate_seq: Arc::new(AtomicU64::new(0)),
             nav_timing: None,
+            card_write_pending: false,
+            card_write_error: QString::default(),
+            card_write_seq: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -226,6 +264,8 @@ pub mod ffi {
         #[qproperty(QString, detail_prefetch_key_prev)]
         #[qproperty(bool, cover_requests_paused)]
         #[qproperty(bool, show_original_filenames, READ, WRITE = set_show_original_filenames, NOTIFY)]
+        #[qproperty(bool, card_write_pending)]
+        #[qproperty(QString, card_write_error)]
         type RecentsModel = super::RecentsModelRust;
 
         #[qinvokable]
@@ -233,6 +273,9 @@ pub mod ffi {
 
         #[qinvokable]
         fn fetch_more(self: Pin<&mut RecentsModel>);
+
+        #[qinvokable]
+        fn retry(self: Pin<&mut RecentsModel>);
 
         #[qinvokable]
         fn launch_at(self: Pin<&mut RecentsModel>, index: i32);
@@ -259,6 +302,9 @@ pub mod ffi {
         fn system_id_at(self: &RecentsModel, index: i32) -> QString;
 
         #[qinvokable]
+        fn system_name_at(self: &RecentsModel, index: i32) -> QString;
+
+        #[qinvokable]
         fn peek_detail_at(self: Pin<&mut RecentsModel>, index: i32);
 
         #[qinvokable]
@@ -275,6 +321,15 @@ pub mod ffi {
 
         #[qinvokable]
         fn index_for_path(self: &RecentsModel, path: &QString) -> i32;
+
+        #[qinvokable]
+        fn launch_text_at(self: &RecentsModel, index: i32) -> QString;
+
+        #[qinvokable]
+        fn write_card_at(self: Pin<&mut RecentsModel>, index: i32);
+
+        #[qinvokable]
+        fn cancel_card_write(self: Pin<&mut RecentsModel>);
 
         #[inherit]
         #[cxx_name = "beginResetModel"]
@@ -345,6 +400,15 @@ fn page_snapshot(result: &MediaHistoryResult) -> PageSnapshot {
     )
 }
 
+fn history_page_params(cursor: Option<String>) -> MediaHistoryParams {
+    MediaHistoryParams {
+        limit: Some(PAGE_SIZE),
+        cursor,
+        systems: Vec::new(),
+        distinct_media: Some(true),
+    }
+}
+
 fn apply_state(
     mut model: Pin<&mut ffi::RecentsModel>,
     (data, err): (Option<PageSnapshot>, String),
@@ -362,7 +426,7 @@ fn apply_state(
         model.as_mut().rust_mut().seq.fetch_add(1, Ordering::SeqCst);
         model.as_mut().ensure_cover_subscription();
         let raw_len = entries.len();
-        let entries = dedupe_latest_by_path(entries);
+        let entries = dedupe_latest_by_identity(entries);
         info!(
             raw_len,
             deduped_len = entries.len(),
@@ -504,13 +568,14 @@ impl ffi::RecentsModel {
                 cover_key_for(entry, !self.cover_requests_paused).as_str(),
             )),
             LAUNCHER_ID_ROLE => QVariant::from(&QString::from(entry.launcher_id.as_str())),
-            FAVORITE_ROLE => QVariant::from(&0_i32),
+            FAVORITE_ROLE | FILE_COUNT_ROLE => QVariant::from(&0_i32),
             FILE_STEM_ROLE => QVariant::from(&QString::from(file_stem_or_name(
                 &entry.media_path,
                 &entry.media_name,
             ))),
-            HIDDEN_ROLE => QVariant::from(&false),
             DISAMBIGUATING_TAGS_ROLE => QVariant::from(&QString::default()),
+            HIDDEN_ROLE | IS_EMPTY_ROLE | DISABLED_ROLE => QVariant::from(&false),
+            ENTRY_TYPE_ROLE => QVariant::from(&QString::from("media")),
             _ => QVariant::default(),
         }
     }
@@ -529,6 +594,10 @@ impl ffi::RecentsModel {
             DISAMBIGUATING_TAGS_ROLE,
             QByteArray::from("disambiguatingTags"),
         );
+        h.insert(IS_EMPTY_ROLE, QByteArray::from("isEmpty"));
+        h.insert(ENTRY_TYPE_ROLE, QByteArray::from("entryType"));
+        h.insert(FILE_COUNT_ROLE, QByteArray::from("fileCount"));
+        h.insert(DISABLED_ROLE, QByteArray::from("disabled"));
         h
     }
 
@@ -638,11 +707,7 @@ impl ffi::RecentsModel {
         global_handle().spawn(async move {
             let result = store
                 .client()
-                .media_history(MediaHistoryParams {
-                    limit: Some(PAGE_SIZE),
-                    cursor: None,
-                    systems: Vec::new(),
-                })
+                .media_history(history_page_params(None))
                 .await;
             match &result {
                 Ok(r) => info!(
@@ -690,6 +755,15 @@ impl ffi::RecentsModel {
             .resume_seq
             .fetch_add(1, Ordering::SeqCst);
         self.as_mut().set_resume_loading(true);
+        // The Hub's Resume tile can be the only thing in this session
+        // that ever touches RecentsModel — a user who never opens the
+        // Recents screen would otherwise leave `cover_subscription`
+        // unset (the other two call sites are both tied to the
+        // paginated-list fetch lifecycle), so `resume_cover_key_for`'s
+        // own async cover fetch below would complete with nothing
+        // listening to refresh it. See `notify_cover_update`'s
+        // `model.resume_entry` branch.
+        self.as_mut().ensure_cover_subscription();
         sync_resume_state(self.as_mut());
         let seq = self.rust().resume_seq.clone();
         let ticket = seq.load(Ordering::SeqCst);
@@ -703,6 +777,11 @@ impl ffi::RecentsModel {
                 apply_resume_latest_result(model, result);
             });
         });
+    }
+
+    fn retry(mut self: Pin<&mut Self>) {
+        self.as_mut().rust_mut().history_requested = false;
+        self.as_mut().ensure_loaded();
     }
 
     fn fetch_more(mut self: Pin<&mut Self>) {
@@ -719,11 +798,7 @@ impl ffi::RecentsModel {
         global_handle().spawn(async move {
             let result = store
                 .client()
-                .media_history(MediaHistoryParams {
-                    limit: Some(PAGE_SIZE),
-                    cursor,
-                    systems: Vec::new(),
-                })
+                .media_history(history_page_params(cursor))
                 .await;
             let _ = qt_thread.queue(move |model| {
                 if seq.load(Ordering::SeqCst) != ticket {
@@ -815,6 +890,85 @@ impl ffi::RecentsModel {
         QString::from(self.entries[index as usize].system_id.as_str())
     }
 
+    // See the module doc comment: this is the raw device-specific path,
+    // not a portable `System/Title` token — history rows have nothing
+    // else to build one from.
+    fn launch_text_at(&self, index: i32) -> QString {
+        if index < 0 || index >= self.count {
+            return QString::default();
+        }
+        QString::from(launch_text_for(&self.entries[index as usize]).as_str())
+    }
+
+    fn write_card_at(mut self: Pin<&mut Self>, index: i32) {
+        if index < 0 || index >= self.count {
+            self.as_mut()
+                .set_card_write_error(QString::from("invalid selection"));
+            self.as_mut().set_card_write_pending(false);
+            return;
+        }
+        let entry = &self.entries[index as usize];
+        let text = launch_text_for(entry);
+        if text.is_empty() {
+            self.as_mut()
+                .set_card_write_error(QString::from("missing launch payload"));
+            self.as_mut().set_card_write_pending(false);
+            return;
+        }
+        let name = entry.media_name.clone();
+        let store = global_store();
+        let seq = self.rust().card_write_seq.clone();
+        let ticket = seq.fetch_add(1, Ordering::SeqCst) + 1;
+        self.as_mut().set_card_write_error(QString::default());
+        self.as_mut().set_card_write_pending(true);
+        let qt_thread = self.qt_thread();
+        global_handle().spawn(async move {
+            let result = store
+                .run_mutation::<ReadersWriteMutation>(ReadersWriteParams { text })
+                .await;
+            let _ = qt_thread.queue(move |mut model| {
+                if seq.load(Ordering::SeqCst) != ticket {
+                    return;
+                }
+                let error = match result {
+                    Ok(()) => QString::default(),
+                    Err(e) => {
+                        warn!("card write failed for {name}: {}", e.message);
+                        QString::from(e.message.as_str())
+                    }
+                };
+                model.as_mut().set_card_write_error(error);
+                model.as_mut().set_card_write_pending(false);
+            });
+        });
+    }
+
+    fn cancel_card_write(mut self: Pin<&mut Self>) {
+        self.as_mut()
+            .rust()
+            .card_write_seq
+            .fetch_add(1, Ordering::SeqCst);
+        if !self.card_write_error.is_empty() {
+            self.as_mut().set_card_write_error(QString::default());
+        }
+        if self.card_write_pending {
+            self.as_mut().set_card_write_pending(false);
+        }
+    }
+
+    fn system_name_at(&self, index: i32) -> QString {
+        if index < 0 || index >= self.count {
+            return QString::default();
+        }
+        let entry = &self.entries[index as usize];
+        let name = entry.system_name.trim();
+        QString::from(if name.is_empty() {
+            entry.system_id.as_str()
+        } else {
+            name
+        })
+    }
+
     // Immediate, non-debounced sibling of `load_detail_at`. Called the moment
     // the focused row changes so the detail table reflects THIS row at once —
     // cached metadata (instant), a memoized blank, or a clean blank while a
@@ -888,17 +1042,20 @@ impl ffi::RecentsModel {
         let system = entry.system_id.clone();
         let path = entry.media_path.clone();
         let media_id = entry.media_id;
+        let has_cover = entry.has_cover;
         if system.trim().is_empty() || path.trim().is_empty() {
             clear_current_detail_state(self.as_mut());
             return;
         }
-        let detail_key = match media_id {
-            Some(id) => MediaKey::with_media_id(system.clone(), path.clone(), id),
-            None => MediaKey::new(system.clone(), path.clone()),
-        }
-        .with_current_cover_preference();
-        self.as_mut().rust_mut().current_detail_media_key = Some(detail_key);
-        self.as_mut().rust_mut().current_detail_media_id = media_id;
+        let detail_key = has_cover.then(|| {
+            match media_id {
+                Some(id) => MediaKey::with_media_id(system.clone(), path.clone(), id),
+                None => MediaKey::new(system.clone(), path.clone()),
+            }
+            .with_current_cover_preference()
+        });
+        self.as_mut().rust_mut().current_detail_media_key = detail_key;
+        self.as_mut().rust_mut().current_detail_media_id = has_cover.then_some(media_id).flatten();
         sync_current_detail_image_key(self.as_mut());
         refresh_adjacent_cover_prefetch(self.as_mut());
 
@@ -925,19 +1082,18 @@ impl ffi::RecentsModel {
         self.as_mut().set_current_detail_tags(QString::default());
         let seq = self.rust().detail_seq.clone();
         let qt_thread = self.qt_thread();
-        let store = global_store();
         let store_key = meta_key.clone();
+        let fallback_system = system.clone();
+        let fallback_path = path.clone();
+        let meta_params = media_id.map_or_else(
+            || MediaMetaParams::for_media(system, path.clone()),
+            MediaMetaParams::for_media_id,
+        );
         global_handle().spawn(async move {
-            let result = store
-                .client()
-                .media_meta(MediaMetaParams::for_media(system, path.clone()))
-                .await;
-            // Cache the outcome (positive or negative) regardless of whether
-            // this callback is still current, so a later revisit is instant.
-            match &result {
-                Ok(r) => global_media_meta_cache().store(store_key, Some(r.media.clone())),
-                Err(_) => global_media_meta_cache().store(store_key, None),
-            }
+            let result =
+                fetch_media_meta_with_path_fallback(meta_params, fallback_system, fallback_path)
+                    .await;
+            global_media_meta_cache().store_fetch_result(store_key, &result);
             let _ = qt_thread.queue(move |mut model| {
                 if seq.load(Ordering::SeqCst) != ticket {
                     return;
@@ -1021,17 +1177,69 @@ fn cover_key_for(entry: &MediaHistoryEntry, requests_enabled: bool) -> String {
             cache.enqueue_search_cover_with_media_id(k.clone(), entry.media_id, PAGE_SIZE);
         }
     }
-    cover_key_for_with(
-        entry,
-        media_key.as_ref(),
-        cached,
-        negative,
-        soft_no_image || !requests_enabled,
-    )
+    // `!requests_enabled` (paused for a bulk/jump append) is deliberately
+    // NOT folded into `soft_no_image` here -- see games.rs's
+    // `cover_key_for` for the round-10 rationale: "paused" means "haven't
+    // asked yet," not "confirmed absent," and must stay blank
+    // (`icons/Loading`) rather than falling back to the system-logo
+    // placeholder the way a real soft-no-image memo does.
+    cover_key_for_with(entry, media_key.as_ref(), cached, negative, soft_no_image)
 }
 
-fn resume_cover_key_for(_entry: &MediaHistoryEntry, _requests_enabled: bool) -> String {
-    RESUME_FALLBACK_COVER_KEY.to_string()
+/// Resolve the Hub Resume tile's own cover key. Mirrors `cover_key_for`'s
+/// cached / in-flight / negative-memoed triple and enqueues the same
+/// miss-driven fetch; the pure decision itself lives in
+/// `resume_cover_key_for_with` below, split out the same way
+/// `cover_key_for_with` is so it's testable without the global cache and
+/// its tokio runtime.
+///
+/// Unlike `cover_key_for`, this never takes a `requests_enabled` gate.
+/// `cover_requests_paused` exists to stop a *grid* of dozens of tiles from
+/// flooding Core with requests mid-append, and it defaults to `true` until
+/// the Recents screen is actually opened (`Main.qml`'s
+/// `_resumeRecentsCovers`) — which the Hub Resume tile, one image on the
+/// Hub screen, never triggers. Gating this on that flag left the tile
+/// permanently blank (round 10 regression): it never enqueued its fetch,
+/// so it sat on `"icons/Loading"` forever instead of resolving to either a
+/// real cover or the play-glyph fallback.
+fn resume_cover_key_for(entry: &MediaHistoryEntry) -> String {
+    let media_key = media_key_for(entry).map(MediaKey::with_current_cover_preference);
+    let cache = global_media_image_cache();
+    let cached = media_key.as_ref().is_some_and(|k| cache.is_cached(k));
+    let negative = media_key.as_ref().is_some_and(|k| cache.is_negative(k));
+    let soft_no_image = media_key
+        .as_ref()
+        .is_some_and(|k| cache.is_soft_no_image(k));
+    if !cached && !negative && !soft_no_image {
+        if let Some(k) = media_key.as_ref() {
+            cache.enqueue_search_cover_with_media_id(k.clone(), entry.media_id, PAGE_SIZE);
+        }
+    }
+    resume_cover_key_for_with(entry, media_key.as_ref(), cached, negative, soft_no_image)
+}
+
+/// Pure helper for `resume_cover_key_for`, mirroring `cover_key_for_with`'s
+/// shape (cached / in-flight / negative-memoed / unattributed). The one
+/// difference from `cover_key_for_with`: a captioned recents row reads
+/// fine next to a system logo when it has no art, but the Resume tile has
+/// no caption to give a bare system logo context, so its "no art
+/// available" state falls back to the dedicated `RESUME_FALLBACK_COVER_KEY`
+/// glyph instead of `systems/<id>`.
+fn resume_cover_key_for_with(
+    entry: &MediaHistoryEntry,
+    key: Option<&MediaKey>,
+    cached: bool,
+    negative: bool,
+    soft_no_image: bool,
+) -> String {
+    if entry.system_id.is_empty() {
+        return RESUME_FALLBACK_COVER_KEY.to_string();
+    }
+    match key {
+        Some(k) if cached => MediaImageCache::image_key_for(k),
+        Some(_) if !negative && !soft_no_image => "icons/Loading".to_string(),
+        _ => RESUME_FALLBACK_COVER_KEY.to_string(),
+    }
 }
 
 fn apply_resume_latest_result(
@@ -1050,11 +1258,26 @@ fn apply_resume_latest_result(
             return;
         }
     };
+    // Captured before the assignment below so a repeated poll that
+    // reports the same current game doesn't churn the manifest — only a
+    // genuine change in *which* game is resumable should trigger the
+    // (occasional) local-path RPC in refresh_resume_entry.
+    let previous_target = model
+        .resume_entry
+        .as_ref()
+        .map(|e| (e.system_id.clone(), e.media_path.clone()));
     model.as_mut().rust_mut().resume_entry =
         latest.map(history_entry_from_latest).filter(|entry| {
             !launch_text_for(entry).is_empty()
                 && resume_entry_is_fresh(entry, OffsetDateTime::now_utc())
         });
+    let next_target = model
+        .resume_entry
+        .as_ref()
+        .map(|e| (e.system_id.clone(), e.media_path.clone()));
+    if next_target != previous_target {
+        crate::hub_cover_manifest::refresh_resume_entry(next_target);
+    }
     if model.resume_loading {
         model.as_mut().set_resume_loading(false);
     }
@@ -1085,7 +1308,7 @@ fn sync_resume_state(mut model: Pin<&mut ffi::RecentsModel>) {
                 )
                 .as_str(),
             ),
-            QString::from(resume_cover_key_for(entry, !model.cover_requests_paused).as_str()),
+            QString::from(resume_cover_key_for(entry).as_str()),
         ),
         None => (
             false,
@@ -1126,7 +1349,7 @@ fn emit_cover_key_range(mut model: Pin<&mut ffi::RecentsModel>, first_row: i32, 
 /// Build the canonical `(systemId, mediaPath)` identifier for a history
 /// row. Returns `None` for rows without enough info to key on.
 fn media_key_for(entry: &MediaHistoryEntry) -> Option<MediaKey> {
-    if entry.system_id.is_empty() || entry.media_path.is_empty() {
+    if !entry.has_cover || entry.system_id.is_empty() || entry.media_path.is_empty() {
         return None;
     }
     match entry.media_id {
@@ -1215,10 +1438,11 @@ fn enqueue_meta_prefetch(entries: &[MediaHistoryEntry], count: i32, row: i32) {
         if system.trim().is_empty() || path.trim().is_empty() {
             continue;
         }
-        requests.push((
-            MediaKey::new(system.clone(), path.clone()),
-            MediaMetaParams::for_media(system, path),
-        ));
+        let params = entry.media_id.map_or_else(
+            || MediaMetaParams::for_media(system.clone(), path.clone()),
+            MediaMetaParams::for_media_id,
+        );
+        requests.push((MediaKey::new(system, path), params));
     }
     if !requests.is_empty() {
         global_media_meta_cache().prefetch(requests);
@@ -1466,7 +1690,19 @@ fn notify_cover_update(mut model: Pin<&mut ffi::RecentsModel>, key: &MediaKey) {
     {
         sync_current_detail_image_key(model.as_mut());
     }
-    if resume_entry(&model.entries)
+    // `model.resume_entry` — not `resume_entry(&model.entries)` — is the
+    // field `resume_cover_key_for`/`sync_resume_state` actually derive
+    // the Hub Resume tile's cover from; it comes from the dedicated
+    // `media.history.latest` RPC (`apply_resume_latest_result`), a
+    // separate fetch from the paginated `entries` list `resume_entry()`
+    // searches. Checking `entries` here previously meant the Resume
+    // tile's own async cover fetch (enqueued from `resume_cover_key_for`)
+    // could complete without ever refreshing `resume_cover_key` when
+    // `entries` was empty — the common case for a user who has only ever
+    // used the Hub's Resume tile and never opened the Recents screen.
+    if model
+        .resume_entry
+        .as_ref()
         .and_then(media_key_for)
         .map(MediaKey::with_current_cover_preference)
         .as_ref()
@@ -1632,10 +1868,12 @@ fn launch_entry(entry: &MediaHistoryEntry) {
     if text.is_empty() {
         return;
     }
+    let name = entry.media_name.clone();
     let store = global_store();
     global_handle().spawn(async move {
         if let Err(e) = store.run_mutation::<RunMutation>(RunParams { text }).await {
-            warn!("run failed: {}", e.message);
+            warn!("run failed for {name}: {}", e.message);
+            report_action_error("launch", name);
         }
     });
 }
@@ -1648,6 +1886,12 @@ fn launch_text_for(entry: &MediaHistoryEntry) -> String {
     entry.media_path.clone()
 }
 
+// Test-only convenience wrapper now — `notify_cover_update` reads
+// `model.resume_entry` (the dedicated field) directly rather than
+// searching `entries` with this, but the freshness/launchability search
+// it exercises is still worth covering standalone; see the comment on
+// that `notify_cover_update` branch for why the search target changed.
+#[cfg(test)]
 fn resume_entry(entries: &[MediaHistoryEntry]) -> Option<&MediaHistoryEntry> {
     let now = OffsetDateTime::now_utc();
     entries
@@ -1682,16 +1926,15 @@ fn position_of_path(entries: &[MediaHistoryEntry], needle: &str) -> i32 {
         .map_or(-1, |i| i as i32)
 }
 
-/// Keep the newest history row for each exact, non-empty path. Core
-/// returns history newest-first, so preserving the first occurrence
-/// implements latest-wins without parsing timestamps. Empty paths are
-/// malformed/unlaunchable and stay as-is instead of all collapsing into
-/// one bucket.
-fn dedupe_latest_by_path(entries: Vec<MediaHistoryEntry>) -> Vec<MediaHistoryEntry> {
-    filter_entries_by_path(std::iter::empty::<&MediaHistoryEntry>(), entries)
+/// Defensive duplicate filter for Core's `distinctMedia` response. Core owns
+/// newest-session selection and cursor pagination; this only prevents a broken
+/// or older response from duplicating the same `(systemId, mediaPath)` identity
+/// in the model. Empty paths stay as-is instead of collapsing malformed rows.
+fn dedupe_latest_by_identity(entries: Vec<MediaHistoryEntry>) -> Vec<MediaHistoryEntry> {
+    filter_entries_by_identity(std::iter::empty::<&MediaHistoryEntry>(), entries)
 }
 
-fn filter_entries_by_path<'a, I>(
+fn filter_entries_by_identity<'a, I>(
     existing_entries: I,
     incoming_entries: Vec<MediaHistoryEntry>,
 ) -> Vec<MediaHistoryEntry>
@@ -1704,13 +1947,16 @@ where
             if entry.media_path.is_empty() {
                 None
             } else {
-                Some(entry.media_path.clone())
+                Some((entry.system_id.clone(), entry.media_path.clone()))
             }
         })
         .collect::<HashSet<_>>();
     incoming_entries
         .into_iter()
-        .filter(|entry| entry.media_path.is_empty() || seen.insert(entry.media_path.clone()))
+        .filter(|entry| {
+            entry.media_path.is_empty()
+                || seen.insert((entry.system_id.clone(), entry.media_path.clone()))
+        })
         .collect()
 }
 
@@ -1729,7 +1975,7 @@ fn apply_append_page(
         Ok(result) => {
             let has_next_page = result.has_next_page();
             let next_cursor = result.next_cursor();
-            let entries = filter_entries_by_path(model.entries.iter(), result.entries);
+            let entries = filter_entries_by_identity(model.entries.iter(), result.entries);
             let new_count = i32::try_from(entries.len()).unwrap_or(i32::MAX - model.count);
             if !model.cover_requests_paused {
                 enqueue_recents_covers(&entries);
@@ -1751,6 +1997,14 @@ fn apply_append_page(
         }
         Err(e) => {
             warn!("media.history follow-up page failed: {}", e.message);
+            // A pending PagedGrid target chains another request whenever
+            // loading_more falls while has_next_page remains true. Disarm the
+            // failed cursor first so the grid settles and waits for explicit
+            // retry instead of spinning on the same RPC indefinitely.
+            model.as_mut().rust_mut().next_cursor = None;
+            if model.has_next_page {
+                model.as_mut().set_has_next_page(false);
+            }
             model
                 .as_mut()
                 .set_error_message(QString::from(e.message.as_str()));
@@ -1769,9 +2023,10 @@ mod tests {
     )]
 
     use super::{
-        compute_unresolved_keys, cover_key_for_with, dedupe_latest_by_path, filter_entries_by_path,
-        launch_text_for, media_key_for, page_snapshot, position_of_path, resume_cover_key_for,
-        resume_entry, resume_entry_is_fresh, RESUME_FALLBACK_COVER_KEY,
+        compute_unresolved_keys, cover_key_for_with, dedupe_latest_by_identity,
+        filter_entries_by_identity, history_page_params, launch_text_for, media_key_for,
+        page_snapshot, position_of_path, resume_cover_key_for_with, resume_entry,
+        resume_entry_is_fresh, RESUME_FALLBACK_COVER_KEY,
     };
     use crate::media_image_cache::{MediaImageCache, MediaKey};
     use std::collections::HashSet;
@@ -1851,10 +2106,85 @@ mod tests {
     }
 
     #[test]
-    fn resume_cover_key_always_uses_play_outline() {
+    fn resume_cover_key_falls_back_when_entry_has_no_system() {
+        let e = entry("smb", "/p/smb", "", "NES");
+        let key = media_key_for(&e);
+        assert_eq!(
+            resume_cover_key_for_with(&e, key.as_ref(), false, false, false),
+            RESUME_FALLBACK_COVER_KEY
+        );
+    }
+
+    #[test]
+    fn resume_cover_key_uses_real_art_when_cached() {
         let e = entry("smb", "/p/smb", "NES", "NES");
-        assert_eq!(resume_cover_key_for(&e, true), RESUME_FALLBACK_COVER_KEY);
-        assert_eq!(resume_cover_key_for(&e, false), RESUME_FALLBACK_COVER_KEY);
+        let key = media_key_for(&e).expect("media has key");
+        assert_eq!(
+            resume_cover_key_for_with(&e, Some(&key), true, false, false),
+            MediaImageCache::image_key_for(&key)
+        );
+    }
+
+    #[test]
+    fn resume_cover_key_uses_loading_icon_when_in_flight() {
+        let e = entry("smb", "/p/smb", "NES", "NES");
+        let key = media_key_for(&e).expect("media has key");
+        assert_eq!(
+            resume_cover_key_for_with(&e, Some(&key), false, false, false),
+            "icons/Loading"
+        );
+    }
+
+    #[test]
+    fn resume_cover_key_falls_back_to_glyph_when_negatively_memoed() {
+        let e = entry("smb", "/p/smb", "NES", "NES");
+        let key = media_key_for(&e).expect("media has key");
+        // Unlike `cover_key_for_with`, which falls back to the system logo
+        // here -- the Resume tile has no caption to give a bare logo
+        // context, so it falls back to the dedicated glyph instead.
+        assert_eq!(
+            resume_cover_key_for_with(&e, Some(&key), false, true, false),
+            RESUME_FALLBACK_COVER_KEY
+        );
+    }
+
+    #[test]
+    fn resume_cover_key_falls_back_to_glyph_when_soft_missed() {
+        let e = entry("smb", "/p/smb", "NES", "NES");
+        let key = media_key_for(&e).expect("media has key");
+        assert_eq!(
+            resume_cover_key_for_with(&e, Some(&key), false, false, true),
+            RESUME_FALLBACK_COVER_KEY
+        );
+    }
+
+    #[test]
+    fn resume_cover_key_falls_back_to_glyph_when_no_key() {
+        let e = entry("smb", "/p/smb", "NES", "NES");
+        assert_eq!(
+            resume_cover_key_for_with(&e, None, false, false, false),
+            RESUME_FALLBACK_COVER_KEY
+        );
+    }
+
+    // Round 11: `resume_cover_key_for` no longer takes a `requests_enabled`
+    // gate at all (round 10 wired it to `cover_requests_paused`, which
+    // defaults to `true` and is only cleared by opening the Recents
+    // screen -- something the Hub Resume tile never does, so the tile's
+    // fetch never enqueued and it sat blank forever). The Resume tile is
+    // one image, not a grid of dozens; it always enqueues. There is no
+    // "paused" state left to distinguish at the pure `_with` level -- an
+    // in-flight fetch, paused or not, renders the same blank
+    // `icons/Loading` placeholder as any other in-flight fetch.
+    #[test]
+    fn resume_cover_key_in_flight_or_paused_stays_loading_not_glyph() {
+        let e = entry("smb", "/p/smb", "NES", "NES");
+        let key = media_key_for(&e).expect("media has key");
+        assert_eq!(
+            resume_cover_key_for_with(&e, Some(&key), false, false, false),
+            "icons/Loading",
+            "an unresolved fetch must render blank, never the glyph fallback"
+        );
     }
 
     #[test]
@@ -1866,6 +2196,19 @@ mod tests {
         assert_eq!(
             cover_key_for_with(&e, Some(&key), false, false, false),
             "icons/Loading"
+        );
+    }
+
+    // Round 10: same fix as the Resume-tile variant above, for the plain
+    // recents-row cover path.
+    #[test]
+    fn cover_key_paused_stays_loading_not_system_fallback() {
+        let e = entry("smb", "/p/smb", "NES", "NES");
+        let key = media_key_for(&e).expect("media has key");
+        assert_eq!(
+            cover_key_for_with(&e, Some(&key), false, false, false),
+            "icons/Loading",
+            "paused-but-not-soft-missed must render blank, never the system fallback"
         );
     }
 
@@ -1911,6 +2254,14 @@ mod tests {
             cover_key_for_with(&e, None, false, false, false),
             "icons/File"
         );
+    }
+
+    #[test]
+    fn confirmed_no_cover_skips_key_and_first_paint_gate() {
+        let mut e = entry("smb", "/p/smb", "NES", "NES");
+        e.has_cover = false;
+        assert!(media_key_for(&e).is_none());
+        assert!(compute_unresolved_keys(&[e], |_| false, |_| false).is_empty());
     }
 
     #[test]
@@ -1960,9 +2311,10 @@ mod tests {
     }
 
     #[test]
-    fn dedupe_latest_by_path_keeps_first_matching_path() {
-        let entries = dedupe_latest_by_path(vec![
+    fn dedupe_latest_by_identity_keeps_first_matching_system_and_path() {
+        let entries = dedupe_latest_by_identity(vec![
             entry("latest smb", "/p/smb", "NES", "NES"),
+            entry("arcade twin", "/p/smb", "Arcade", "Arcade"),
             entry("zelda", "/p/zelda", "NES", "NES"),
             entry("older smb", "/p/smb", "NES", "NES"),
             entry("metroid", "/p/metroid", "NES", "NES"),
@@ -1971,13 +2323,13 @@ mod tests {
             .iter()
             .map(|entry| entry.media_name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(names, vec!["latest smb", "zelda", "metroid"]);
+        assert_eq!(names, vec!["latest smb", "arcade twin", "zelda", "metroid"]);
     }
 
     #[test]
-    fn filter_entries_by_path_skips_existing_and_later_incoming_duplicates() {
+    fn filter_entries_by_identity_skips_existing_and_later_incoming_duplicates() {
         let existing = [entry("latest smb", "/p/smb", "NES", "NES")];
-        let entries = filter_entries_by_path(
+        let entries = filter_entries_by_identity(
             existing.iter(),
             vec![
                 entry("older smb", "/p/smb", "NES", "NES"),
@@ -1994,8 +2346,8 @@ mod tests {
     }
 
     #[test]
-    fn dedupe_latest_by_path_preserves_empty_paths() {
-        let entries = dedupe_latest_by_path(vec![
+    fn dedupe_latest_by_identity_preserves_empty_paths() {
+        let entries = dedupe_latest_by_identity(vec![
             entry("ghost one", "", "NES", "NES"),
             entry("smb", "/p/smb", "NES", "NES"),
             entry("ghost two", "", "NES", "NES"),
@@ -2027,6 +2379,17 @@ mod tests {
     fn position_of_path_missing_returns_minus_one() {
         let entries = vec![entry("smb", "/p/smb", "NES", "NES")];
         assert_eq!(position_of_path(&entries, "/missing"), -1);
+    }
+
+    #[test]
+    fn history_page_params_preserve_distinct_media_for_every_cursor() {
+        let initial = history_page_params(None);
+        assert_eq!(initial.distinct_media, Some(true));
+        assert!(initial.cursor.is_none());
+
+        let continuation = history_page_params(Some("cursor-2".into()));
+        assert_eq!(continuation.distinct_media, Some(true));
+        assert_eq!(continuation.cursor.as_deref(), Some("cursor-2"));
     }
 
     #[test]

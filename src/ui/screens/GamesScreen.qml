@@ -23,6 +23,14 @@ MediaListScreen {
     id: games
 
     property alias gamesGrid: games.mediaGrid
+    // Main.qml reads this when folder request signal arrives. Captured before
+    // synchronous persistence so telemetry includes full perceived button time.
+    property double lastNavigationInputAt: 0
+
+    // Seed persisted server-side scope before first system browse.
+    Component.onCompleted: {
+        Browse.GamesModel.apply_favorites_filter(Browse.GamesState.favorites_filter === true);
+    }
 
     readonly property bool _portraitNonCrtList: !Theme.crtNativePath && Browse.Settings.current_orientation !== "horizontal"
     readonly property int _listPageSize: games._portraitNonCrtList ? 16 : 10
@@ -31,7 +39,6 @@ MediaListScreen {
     readonly property int _gridColumns: games._gridShape.columns
     readonly property int _gridRows: games._gridShape.rows
     readonly property int _browsePageSize: games._listLayout ? Math.max(1, games.listCard.visibleRowCount) : games.gamesGrid.pageSize
-    readonly property bool _crtGridLayout: Theme.crtNativePath && !games._listLayout
     readonly property bool _tateListLayout: games._tateOrientation
     readonly property string _gridViewId: "gamesGrid"
     readonly property string _listViewId: "gamesList"
@@ -45,6 +52,9 @@ MediaListScreen {
     readonly property var _footerProfile: games._gridProfile && games._gridProfile.footer ? games._gridProfile.footer : null
 
     mediaModel: Browse.GamesModel
+    // Favorites scope can produce empty folder. Keep View reachable so user
+    // can return to unfiltered results.
+    pageMenuEnabledWhenEmpty: true
     emptyText: qsTr("No games in this system")
     loadingText: qsTr("Loading games…")
     totalItemsOverride: Browse.GamesModel.total_dirs + Browse.GamesModel.total_files
@@ -68,6 +78,7 @@ MediaListScreen {
         return selected.length > 0 ? selected[selected.length - 1] : "";
     }
     persistSelectionPath: path => games._scheduleSelectedPersist(path)
+    discardSelectionPersist: () => games.discardSelectedPersist()
     gridMoveAction: (dx, dy) => games._performGridMove(dx, dy)
     linearMoveAction: delta => games._performLinearMove(delta)
     pageAction: delta => games._performPage(delta)
@@ -75,7 +86,16 @@ MediaListScreen {
     gridViewId: games._gridViewId
     listViewId: games._listViewId
     tateListViewId: games._tateListViewId
-    contextMenuEnabledAt: index => Browse.GamesModel.is_media_capable_at(index)
+    // A plain (non-media-capable) directory gets a menu with just "Add to
+    // Hub" -- see Main.qml's `buildContextMenuEntries`. A `root` row does
+    // too, as long as it addresses a real filesystem folder: those are a
+    // system's configured game directories, and refusing them was why a
+    // system with several of them could not have any of them pinned. The
+    // earlier justification here (that roots were a ".."/scope pseudo-entry)
+    // described a row nothing ever creates -- Back is the cancel button, not
+    // a list entry. Virtual-scheme routes stay out; see
+    // `is_filesystem_root_at`.
+    contextMenuEnabledAt: index => Browse.GamesModel.is_media_capable_at(index) || Browse.GamesModel.entry_type_at(index) === "directory" || Browse.GamesModel.is_filesystem_root_at(index)
     retryAction: () => {
         if (games._atFolderLevel()) {
             const stack = Browse.GamesState.path_stack;
@@ -95,6 +115,7 @@ MediaListScreen {
             return;
         const entryType = Browse.GamesModel.entry_type_at(index);
         if ((entryType === "directory" || entryType === "root") && !Browse.GamesModel.is_media_capable_at(index)) {
+            games.lastNavigationInputAt = Date.now();
             // Persist synchronously (MiSTer may be killed at any time), then
             // play the cue and defer the navigation signal so the push-in
             // completes on a static scene before the model reload starts.
@@ -118,6 +139,8 @@ MediaListScreen {
         // Disarm any pending accept so a press-then-back inside the deferred
         // window cannot launch/navigate after the user has backed out.
         pressCommit.stop();
+        if (games._atFolderLevel())
+            games.lastNavigationInputAt = Date.now();
         games.flushSelectedPersist();
         if (games._atFolderLevel())
             games.requestNavigateOutOfFolder();
@@ -126,37 +149,84 @@ MediaListScreen {
     }
     showTopStrip: games._statusProfile ? games._statusProfile.topStripVisible : true
     topStripTitleProvider: () => {
+        // Only trust the folder-basename title once actually below the
+        // system root -- `current_path` is non-empty at the root too (it's
+        // the system's own root browse path), so a bare non-empty check
+        // here mistook root browsing for folder browsing and printed the
+        // raw directory name ("SMS", "MegaDrive") instead of the resolved
+        // system name ("Master System", "Genesis"). `_atFolderLevel()` is
+        // the same "are we actually inside a navigated folder" signal
+        // `cancelAction` above already uses for back routing.
+        if (games._atFolderLevel()) {
+            const folderName = games._folderNameForPath(Browse.GamesModel.current_path);
+            if (folderName !== "")
+                return folderName;
+        }
         const sid = Browse.GamesModel.current_system_id;
         if (sid === "")
             return "";
-        const idx = Browse.SystemsModel.index_for_system_id(sid);
-        return idx >= 0 ? Browse.SystemsModel.system_name_at(idx) : sid;
+        return games._systemDisplayName(sid);
     }
     topStripCurrentPageProvider: () => Math.floor(games.gamesGrid.currentIndex / games._browsePageSize)
-    topStripTotalPagesProvider: () => games._footerProfile && games._footerProfile.bottomStatusVisible ? 1 : Math.max(1, Math.ceil((Browse.GamesModel.total_dirs + Browse.GamesModel.total_files) / games._browsePageSize))
-    topStripTotalTextProvider: () => games._listLayout || (games._footerProfile && games._footerProfile.bottomStatusVisible) ? "" : (Browse.GamesModel.total_files > 0 ? qsTr("%1 files").arg(Browse.GamesModel.total_files) : "")
-    topStripRightTextProvider: () => {
-        if (!games._listLayout)
-            return "";
-        if (Browse.GamesModel.loading_more)
-            return qsTr("Loading more…");
-        if (games.gamesGrid.itemCount <= 0)
-            return "";
-        const total = Math.max(1, Browse.GamesModel.total_dirs + Browse.GamesModel.total_files);
-        return qsTr("%1 / %2").arg(games.gamesGrid.currentIndex + 1).arg(total);
-    }
+    topStripTotalPagesProvider: () => Math.max(1, Math.ceil((Browse.GamesModel.total_dirs + Browse.GamesModel.total_files) / games._browsePageSize))
+    // Shown at the top on every theme except CRT (whose top strip is
+    // hidden entirely and keeps this in the footer instead --
+    // `_pageCueInFooter`/`bottomStatusLeftText` below). List layout leaves
+    // this slot blank deliberately -- the visible rows already carry
+    // per-item identity, so a running "%1 games" total next to the page
+    // cue would be redundant; the same total still surfaces in the footer
+    // on CRT via `bottomStatusLeftText`.
+    topStripTotalTextProvider: () => games._listLayout ? "" : (Browse.GamesModel.total_files > 0 ? qsTr("%1 games").arg(Format.count(Browse.GamesModel.total_files)) : "")
+    // Detailed list layout normally shows focused-item/total-items on the
+    // right. Temporarily replace it with “Loading more…” while a background
+    // fetch is filling in
+    // rows the user has scrolled past the end of; MediaListScreen yields
+    // the slot back to this plain text for as long as it's non-empty.
+    topStripRightTextProvider: () => games._listLayout && Browse.GamesModel.loading_more && games.gamesGrid.itemCount > 0 ? qsTr("Loading more…") : ""
     gridBottomMargin: games._footerProfile ? games._footerProfile.gridBottomMargin : (Sizing.pctH(8) + Sizing.pctH(7))
+
+    // Resolve a system id to the same display name the Systems screen shows.
+    //
+    // `SystemsModel.index_for_system_id` only searches the rows of the
+    // CURRENTLY loaded category, so it returns -1 whenever this screen's
+    // system isn't in that category -- a Hub system/folder shortcut, or a
+    // startup restore whose saved category differs from the saved system's.
+    // The old fallback printed the raw Core id there, which is why the header
+    // read "Genesis" while the Systems grid read "Mega Drive" for the same
+    // system. `system_name_for_id` looks at the whole catalog instead and
+    // applies the full priority chain (`[custom.system_names]` -> regional
+    // names table -> Core's own name), so both screens agree by construction.
+    //
+    // The two `void` reads establish binding dependencies the lookup itself
+    // can't: it's a #[qinvokable] method, not a Q_PROPERTY, so without them a
+    // title resolved before the catalog landed would never re-evaluate. Region
+    // is the other input -- it selects which names table applies.
+    function _systemDisplayName(systemId: string): string {
+        void Browse.SystemsModel.count;
+        void Browse.Settings.current_region;
+        const resolved = Browse.SystemsModel.system_name_for_id(systemId);
+        return resolved !== "" ? resolved : systemId;
+    }
+
+    function _folderNameForPath(path: string): string {
+        const trimmed = path.replace(/[\\/]+$/, "");
+        if (trimmed === "")
+            return "";
+        const separator = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
+        return trimmed.substring(separator + 1);
+    }
     gridColumnsOverride: games._gridColumns
     gridRowsOverride: games._gridRows
     gridTotalItemsOverride: Browse.GamesModel.total_dirs + Browse.GamesModel.total_files
     gridHasMorePages: Browse.GamesModel.has_next_page
-    gridLoadMoreAction: urgent => {
-        // A letter jump bulk-loads to the target in one shot (overlay is up);
-        // page-wrap targets and fast-scroll stay on the rapid trickle, ordinary
-        // prefetch on the gentle one.
+    gridLoadingMore: Browse.GamesModel.loading_more
+    gridLoadMoreAction: _urgent => {
+        // Letter jumps bulk-load to their target and held rapid scrolling uses
+        // larger chunks. A pending ordinary page turn is urgent only because
+        // the user is waiting; one visual page is sufficient to satisfy it.
         if (games.gamesGrid.hasPendingJump)
             Browse.GamesModel.fetch_more_jump(games.gamesGrid.pendingJumpIndex);
-        else if (urgent || games.detailRapidScrollActive)
+        else if (games.detailRapidScrollActive)
             Browse.GamesModel.fetch_more_rapid();
         else
             Browse.GamesModel.fetch_more();
@@ -167,17 +237,30 @@ MediaListScreen {
         if (!games._listLayout)
             Browse.GamesModel.prefetch_around(first);
     }
-    activeLabelTextProvider: () => games.gamesGrid.itemCount > 0 ? Browse.GamesModel.name_at(games.gamesGrid.currentIndex) : ""
+    activeLabelTextProvider: () => {
+        // name_at() is a #[qinvokable], not a Q_PROPERTY -- calling it alone
+        // establishes no binding dependency on the row's own data, only on
+        // itemCount/currentIndex below. A folder swap that lands on the same
+        // index with the same item count (a common in-place-replacement
+        // case) left this label showing the previous folder's row name.
+        // rows_revision bumps on exactly that in-place-replacement path
+        // (games.rs's apply_initial_page); reading it here -- unused, but
+        // read -- makes it a tracked dependency so the label refires too.
+        void Browse.GamesModel.rows_revision;
+        return games.gamesGrid.itemCount > 0 ? Browse.GamesModel.name_at(games.gamesGrid.currentIndex) : "";
+    }
     activeLabelAtBottom: true
     activeLabelBottomMargin: games._footerProfile ? games._footerProfile.activeLabelBottomMargin : Sizing.pctH(8)
     activeLabelHeight: games._footerProfile ? games._footerProfile.activeLabelHeight : Sizing.pctH(7)
-    showBottomStatusRow: games._footerProfile ? games._footerProfile.bottomStatusVisible : false
     bottomStatusLeftMargin: games._footerProfile ? games._footerProfile.bottomStatusLeftMargin : 0
     bottomStatusRightMargin: games._footerProfile ? games._footerProfile.bottomStatusRightMargin : 0
-    bottomStatusLeftText: games._footerProfile && games._footerProfile.bottomStatusVisible && Browse.GamesModel.total_files > 0 ? qsTr("%1 files").arg(Browse.GamesModel.total_files) : ""
-    bottomStatusRightText: games._footerProfile && games._footerProfile.bottomStatusVisible && Math.ceil((Browse.GamesModel.total_dirs + Browse.GamesModel.total_files) / games._browsePageSize) > 1 ? qsTr("%1 / %2").arg(Math.floor(games.gamesGrid.currentIndex / games._browsePageSize) + 1).arg(Math.max(1, Math.ceil((Browse.GamesModel.total_dirs + Browse.GamesModel.total_files) / games._browsePageSize))) : ""
-    pageLoadingVisible: !games._listLayout && Browse.GamesModel.loading_more && games.gamesGrid.hasPendingTarget
-    pageLoadingLeftMargin: games._footerProfile && games._footerProfile.bottomStatusVisible && games.bottomStatusLeftText !== "" ? Sizing.px(games.width / 3) : games.gamesGrid.leftInset
+    // Footer's own count badge, only actually shown on CRT
+    // (`_pageCueInFooter`, MediaListScreen.qml) -- every other theme shows
+    // the count via `topStripTotalTextProvider` above instead. Computed
+    // unconditionally regardless of which slot is visible; cheap and
+    // keeps this binding simple.
+    bottomStatusLeftText: Browse.GamesModel.total_files > 0 ? (Sizing.tier === "240" ? Format.count(Browse.GamesModel.total_files) : qsTr("%1 games").arg(Format.count(Browse.GamesModel.total_files))) : ""
+    pageLoadingVisible: Browse.GamesModel.loading_more && (games._listLayout ? games.gamesGrid.itemCount > 0 : games.gamesGrid.hasPendingTarget)
 
     Binding {
         target: Browse.GamesModel
@@ -244,6 +327,21 @@ MediaListScreen {
     function _scheduleSelectedPersist(path: string): void {
         games._pendingSelectedPath = path;
         persistDebounce.restart();
+    }
+
+    // Throw away a pending persist without committing it. The mirror of
+    // `flushSelectedPersist` below, for the one case where the scheduled path
+    // must NOT reach disk: a folder/scope replacement, where the grid snaps to
+    // index 0 while the outgoing folder's rows are still mounted, so the path
+    // read back belongs to the folder being left but the top of `path_stack`
+    // is already the folder being entered. Committing it wrote the wrong
+    // folder's row into the new level's slot; on Back that poisoned the
+    // parent's saved selection, so the next return to it found no match, fell
+    // to index 0 and started a full-folder `fetch_more_restore` walk for a
+    // path that was never there.
+    function discardSelectedPersist(): void {
+        persistDebounce.stop();
+        games._pendingSelectedPath = "";
     }
 
     // Force any pending persist to land synchronously. Called from the

@@ -60,6 +60,28 @@ pub fn custom_dir() -> PathBuf {
     }
 }
 
+/// Frontend-owned cache directory — currently just the Hub/Resume
+/// cold-boot cover manifest (a path list, not image bytes; see
+/// `media_image_cache.rs`'s "Memory only — never disk" module doc, which
+/// stays true of the bytes themselves). On `MiSTer` this is a sibling of
+/// Core's own `cache/thumbs/` inside Core's existing cache root
+/// (`config.CacheDir` in the Core repo) — confirmed safe from Core's own
+/// cleanup, which only ever touches `cache/thumbs/*` and a handful of
+/// named `.gob`/`.json` files, and already excluded from Core's
+/// backup/sync policy (`cache/` is regenerable, never collected). Returned
+/// even when it does not exist on disk — callers create it on first
+/// write, same convention as `custom_dir`.
+pub fn cache_dir() -> PathBuf {
+    if runtime::current().is_mister() {
+        PathBuf::from("/media/fat/zaparoo/cache/frontend")
+    } else {
+        dirs_next::cache_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("zaparoo")
+            .join("frontend")
+    }
+}
+
 pub fn state_file_path() -> PathBuf {
     // ZAPAROO_STATE_FILE lets tests (and ad-hoc runs) redirect state
     // persistence away from the real user path. Checked first so the
@@ -140,6 +162,23 @@ pub fn about_dir_path() -> PathBuf {
     }
 }
 
+/// Path to `Main_MiSTer`'s alt-launcher controller-input report (see
+/// `crate::controller_report`) -- a fixed `/tmp` location on every runtime,
+/// since only a colocated `Main_MiSTer` ever writes it. Not gated on
+/// `runtime::current().is_mister()` here; `controller_report::spawn_watcher`
+/// does that gating itself (and also honors this same override to force the
+/// watcher on off-`MiSTer`). `ZAPAROO_INPUT_REPORT_FILE` lets tests and
+/// desktop dev runs point at a fixture, mirroring `ZAPAROO_STATE_FILE`
+/// above.
+pub fn launcher_input_report_path() -> PathBuf {
+    if let Ok(custom) = std::env::var("ZAPAROO_INPUT_REPORT_FILE") {
+        if !custom.is_empty() {
+            return PathBuf::from(custom);
+        }
+    }
+    PathBuf::from("/tmp/zaparoo_launcher_input.json")
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -149,7 +188,10 @@ mod tests {
         reason = "tests should fail-fast on unexpected errors"
     )]
 
-    use super::{config_file_path, custom_dir, log_file_path, state_file_path, stderr_log_path};
+    use super::{
+        cache_dir, config_file_path, custom_dir, launcher_input_report_path, log_file_path,
+        state_file_path, stderr_log_path,
+    };
     use crate::runtime;
 
     #[test]
@@ -234,6 +276,19 @@ mod tests {
     }
 
     #[test]
+    fn cache_dir_resolves_per_runtime() {
+        let dir = cache_dir();
+        if runtime::current().is_mister() {
+            assert_eq!(dir.to_str(), Some("/media/fat/zaparoo/cache/frontend"));
+        } else {
+            assert!(
+                dir.ends_with("zaparoo/frontend"),
+                "cache dir did not end with zaparoo/frontend: {dir:?}"
+            );
+        }
+    }
+
+    #[test]
     fn state_file_sits_next_to_config_file_on_desktop() {
         if runtime::current().is_mister() {
             return;
@@ -244,6 +299,19 @@ mod tests {
             cfg.parent(),
             state.parent(),
             "state.toml must be a sibling of frontend.toml: cfg={cfg:?} state={state:?}"
+        );
+    }
+
+    #[test]
+    fn launcher_input_report_path_is_fixed_tmp_location() {
+        // No test sets ZAPAROO_INPUT_REPORT_FILE, so the default applies on
+        // every platform -- it is a MiSTer-only artifact at a fixed path.
+        if std::env::var("ZAPAROO_INPUT_REPORT_FILE").is_ok() {
+            return;
+        }
+        assert_eq!(
+            launcher_input_report_path().to_str(),
+            Some("/tmp/zaparoo_launcher_input.json")
         );
     }
 }

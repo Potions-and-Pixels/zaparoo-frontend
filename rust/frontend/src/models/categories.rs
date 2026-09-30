@@ -50,17 +50,14 @@ pub struct CategoriesModelRust {
     /// from `count` (visible categories) and `raw_count` (all categories):
     /// Core's launchables surface as systems under the `Other` category
     /// even with no media-db index, so `count`/`raw_count` are non-zero on
-    /// a fresh device. `indexed_count` ignores launchables, so the first-
-    /// run scan prompt in `Main.qml` can tell "no games indexed yet" apart
-    /// from "only launchables present".
+    /// a fresh device. `indexed_count` ignores launchables, so background
+    /// first-run indexing can tell "no games indexed yet" apart from "only
+    /// launchables present".
     indexed_count: i32,
-    // Sticky-true flag: flips to true the first time the catalog
-    // resolves Ready, never resets. The first-run modal in
-    // `Main.qml` gates on `loaded && count === 0` so it only fires
-    // after we've seen an authoritative empty catalog — without
-    // this we'd misread the initial Default state (count=0,
-    // pre-fetch) as "no systems" and fire the modal on every cold
-    // launch before Core has answered.
+    // Sticky-true flag: flips to true the first time the catalog resolves
+    // Ready, never resets. Main's background first-run index gate waits for
+    // `loaded && indexed_count === 0`; otherwise the default pre-fetch zero
+    // state would start indexing before Core answered.
     loaded: bool,
     error_message: QString,
 }
@@ -108,6 +105,12 @@ pub mod ffi {
         /// reflects new visibility without waiting for a catalog refetch.
         #[qinvokable]
         fn reproject(self: Pin<&mut CategoriesModel>);
+
+        /// Force the shared catalog endpoint to refetch. SystemsModel uses the
+        /// same resource, so one request refreshes both Hub categories and the
+        /// active Systems grid.
+        #[qinvokable]
+        fn refresh(self: Pin<&mut CategoriesModel>);
 
         #[inherit]
         #[cxx_name = "beginResetModel"]
@@ -307,14 +310,16 @@ fn reproject_inner(mut model: Pin<&mut ffi::CategoriesModel>) {
         show_hidden,
         hide_empty,
     );
-    let count = names.len() as i32;
-    debug!(count, categories = ?names, "categories: reproject_inner");
-    model.as_mut().begin_reset_model();
-    model.as_mut().rust_mut().categories = names;
-    model.as_mut().rust_mut().hidden_flags = flags;
-    model.as_mut().rust_mut().count = count;
-    model.as_mut().end_reset_model();
-    model.as_mut().count_changed();
+    if model.rust().categories != names || model.rust().hidden_flags != flags {
+        let count = names.len() as i32;
+        debug!(count, categories = ?names, "categories: reproject_inner changed rows");
+        model.as_mut().begin_reset_model();
+        model.as_mut().rust_mut().categories = names;
+        model.as_mut().rust_mut().hidden_flags = flags;
+        model.as_mut().rust_mut().count = count;
+        model.as_mut().end_reset_model();
+        model.as_mut().count_changed();
+    }
     if !model.loaded {
         model.as_mut().set_loaded(true);
     }
@@ -424,6 +429,10 @@ impl ffi::CategoriesModel {
 
     fn reproject(self: Pin<&mut Self>) {
         reproject_inner(self);
+    }
+
+    fn refresh(self: Pin<&mut Self>) {
+        global_store().subscribe::<CatalogEndpoint>(()).refetch();
     }
 }
 

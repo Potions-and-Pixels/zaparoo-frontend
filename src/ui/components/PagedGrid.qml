@@ -26,11 +26,14 @@ import Zaparoo.Theme
 // Selection is `currentIndex` over the source model; (page, row, col)
 // are derived. Cells size themselves to the available container minus
 // reserved chrome — callers pass a model and delegate, the grid
-// handles layout. The right gutter renders a scroll indicator (up/down
-// arrows + free-floating thumb) sized and positioned from
-// `totalItemsOverride` (with `itemCount` fallback), so paginated
-// callers like `GamesScreen` get a thumb that reflects the dataset's
-// true total page count rather than the loaded slice.
+// handles layout, unconditionally centering the cell block against the
+// full inset-to-inset width. There is no in-grid scroll indicator —
+// grids are paged, not scrolled; the host screen's footer renders the
+// page cue (`PageIndicator.qml`) off `hasPagesAbove`/`hasPagesBelow`/
+// `currentPage`/`totalPageCount`, which stay derived from
+// `totalItemsOverride` (with `itemCount` fallback) exactly as before, so
+// a paginated caller like `GamesScreen` still reflects the dataset's
+// true total rather than just the loaded slice.
 //
 // Page changes are instant cuts (no fade, no slide). On Qt Quick's
 // Software adaptation the renderer cannot keep up with a per-frame
@@ -43,9 +46,35 @@ Item {
 
     required property var model
     required property Component delegate
+    // Optional. When set, a model row whose `isEmpty` role is true renders
+    // through this component instead of `delegate` — a genuinely blank,
+    // structural placeholder rather than a real delegate with nothing on
+    // it. `null` (every caller but the Hub) is byte-identical to today:
+    // `isEmpty` is still a required role every model must supply (see
+    // below), but with no `emptyDelegate` every row just renders through
+    // `delegate` regardless of its value. See EmptySlot.qml and
+    // HubScreen.qml's `_padToPageSize`.
+    property Component emptyDelegate: null
+    // When true, every cursor path (`moveSelection`, `pageBy`, and the
+    // per-cell MouseArea) treats `isEmpty` rows as unreachable rather than
+    // an ordinary cell -- the cursor steps past them as if they weren't
+    // there instead of landing on them. `false` (default, every caller but
+    // the Hub outside a Move session) is byte-identical to before: those
+    // models hardcode `isEmpty` to `false` on every row anyway, so this
+    // property is a no-op for them regardless of its value. The Hub binds
+    // it to `!moveArmed` -- Move must still be able to target a blank (or
+    // the reserve page `beginMove` pads in), which is why this is a
+    // property the host toggles rather than a permanent behavior. See
+    // EmptySlot.qml and docs/style.md -> "Empty slots".
+    property bool skipEmptyCells: false
 
     property int currentIndex: 0
-    readonly property int itemCount: itemRepeater.count
+    // List layout keeps this grid as cursor/page authority while rendering a
+    // separate row view. Removing the hidden Repeater model avoids one cell
+    // object and role-binding set per loaded row; count still follows source
+    // model so navigation math remains unchanged.
+    property bool suspendDelegates: false
+    readonly property int itemCount: root.suspendDelegates ? (root.model && root.model.count !== undefined ? root.model.count : 0) : itemRepeater.count
 
     // Whether this section currently owns user focus. Tile uses this to
     // gate the selection card so only one section shows the focus cue
@@ -54,27 +83,47 @@ Item {
     // untouched.
     property bool focused: true
     property bool coverLoadingPaused: false
+    // False keeps delegate/cursor structure alive while withholding Image
+    // sources. Useful during a model replacement: unlike suspending Repeater,
+    // it avoids a synchronous teardown/rebuild while still preventing cold
+    // cover decodes behind a transition cue.
+    property bool coverRequestsEnabled: true
     property bool rapidRenderMode: false
-    readonly property int _coverRetentionPages: Math.max(1, Math.ceil(Sizing.visibleCovers))
-    // Pulse counter for the one-shot tile push-in. Callers increment via
+    // Number of pages after current whose covers are decoded speculatively.
+    // Media grids keep one page warm; SVG-heavy systems grids can set zero and
+    // rely on their router-owned visible-page prefetch gate.
+    property int coverLookaheadPages: 1
+    // When false, focused tint variants are requested only for selected tile.
+    // Normal grids preserve eager variants; systems opt out because every
+    // variant requires a separate SVG raster on MiSTer's small ARM CPU.
+    property bool eagerFocusedCovers: true
+    // Decode bundled artwork inline so a page's logos paint with the page.
+    // Narrowed per cell below: only the current page, and never during
+    // rapidRenderMode. Hosts that want the old reader-thread behavior for every
+    // cell can set this false.
+    property bool coverSynchronous: true
+    // Sizing.visibleCovers is a tile count, not a page count. Convert it through
+    // current column count; treating five covers as five whole pages retained up
+    // to 110 live Tile trees and made deep-page Back block Qt's main thread.
+    readonly property int _coverRetentionPages: Math.max(1, Math.ceil(Sizing.visibleCovers / Math.max(1, root.columns)))
+    // Pulse counter for the one-shot tile press. Callers increment via
     // pulseActivate(); TileLoader forwards the value to Tile where only the
-    // focused+selected delegate fires its cue. The same cue serves both
+    // focused+selected delegate lowers its face. The same cue serves both
     // forward navigation and game launch.
     property int activatePulse: 0
     function pulseActivate(): void {
         root.activatePulse++;
     }
-    // Release counter for the push-in cue. Callers increment via
-    // releaseActivate() to settle the focused tile back to rest after a launch
-    // that keeps the frontend on the same screen (e.g. an Audio track). Forward
-    // navigation never calls this — the screen transition + `settling` reset
-    // handle the held scale off-screen.
+    // Release counter for the press cue. Callers increment via
+    // releaseActivate() to raise the focused tile after a launch that keeps the
+    // frontend on the same screen (e.g. an Audio track). Forward navigation
+    // never calls this — the screen transition + `settling` reset handles it.
     property int releasePulse: 0
     function releaseActivate(): void {
         root.releasePulse++;
     }
-    // When true, Tile delegates reset their push-in scale back to 1.0
-    // so a held push-in from the previous visit does not persist when
+    // When true, Tile delegates return their raised face to rest so a held
+    // press from the previous visit does not persist when
     // the screen is shown again. Set by the host screen to `!active`
     // (i.e. true while the screen is off-screen).
     property bool screenSettling: false
@@ -83,8 +132,43 @@ Item {
     // so the default tile 0 never paints a ring before restore lands; default
     // true keeps focus rendering on for hosts that do not wire it.
     property bool focusReady: true
+    // Hide only cell delegates while retaining scrollbar chrome. Rapid-scroll
+    // snapshot mode uses this so the frozen grid replaces cells without making
+    // the live gutter disappear.
+    property bool cellsVisible: true
+    // Optional index -> string callback for a compact label above tile art.
+    // Empty/null keeps existing tile geometry unchanged.
+    property var tileTopLabelProvider: null
     property var layoutProfile: null
     readonly property var _gridProfile: root.layoutProfile && root.layoutProfile.grid ? root.layoutProfile.grid : null
+    readonly property var _surfaceProfile: root.layoutProfile && root.layoutProfile.surface ? root.layoutProfile.surface : null
+    readonly property int _cardRadius: root._surfaceProfile ? root._surfaceProfile.cardRadius : Sizing.radiusMd
+
+    // When true, both `cellWidth` and `cellHeight` clamp to the smaller of
+    // the two independent per-axis fits, producing square cells regardless
+    // of which axis is the binding constraint — see `cellWidth`/`cellHeight`
+    // below. Opt-in: every existing caller defaults false and keeps
+    // dividing each axis independently, byte-identical to before (see
+    // docs/style.md -> "Tile aspect and grid blocks").
+    property bool squareCells: false
+    // Fixed vertical ceiling used for the height-fit half of `squareCells`,
+    // in place of the item's own `height` — needed by a caller (the Hub)
+    // that derives ITS `height` FROM the fitted cell size; fitting against
+    // `height` in that case would be circular (the fit output would be an
+    // input to itself). Every other existing caller already fixes `height`
+    // independently (anchors to a sibling), so -1 (the default) simply
+    // reproduces the item's own height and changes nothing. Unlike `height`,
+    // this is the RAW ceiling — `topInset`/`bottomInset` are subtracted from
+    // it internally, same as they are from `height`.
+    property int heightBudget: -1
+    // Index of a tile the host has picked up for a reorder (the Hub's
+    // Options -> Move). -1 (default, every other caller) means nothing is
+    // held. The held cell's Tile blinks a solid full-tile overlay on top
+    // of itself — see Tile.qml's `delegateHeld` — a single-cell change,
+    // not a grid-wide animation, matching CLAUDE.md's dirty-rect rule for
+    // the software renderer. The cell's geometry (position, z-order) is
+    // otherwise untouched — held does not lift, sink, or resize anything.
+    property int heldIndex: -1
 
     // Emitted when the user is sitting on the last loaded page after a
     // selection move. Models with more data fetch the next page in
@@ -144,7 +228,26 @@ Item {
     // the user can actually navigate to right now, not a paginated
     // model's reported total.
     readonly property bool hasPagesAbove: currentPage > 0
-    readonly property bool hasPagesBelow: currentPage < pageCount - 1
+    // A model that says it has more rows coming has a page below,
+    // whether or not the total is known -- the old `!paginationTotalKnown
+    // &&` term meant a *known*-total paginated model (Games: fetched
+    // exactly `pageSize` rows on first load, `paginationTotalKnown: true`,
+    // `hasMorePages: true`) reported `hasPagesBelow: false` on entry:
+    // `pageCount` is `floor(itemCount / pageSize) === 1` (only the loaded
+    // rows count), so `currentPage(0) < pageCount(1) - 1` is false, and the
+    // known-total branch of the old OR term never even looked at
+    // `hasMorePages`. The chevrons and "N / M" readout (both gated on this
+    // flag -- see PageIndicator.qml's `_hasNavigationRange`) then stayed
+    // hidden until the first d-pad move triggered `loadMoreRequested` and
+    // grew `itemCount` past a second page. The count itself was always
+    // right (it reads the model's own authoritative total, not this flag);
+    // only this visibility predicate under-reported it. `totalPageCount`
+    // (below) is the more semantically direct comparison here -- and
+    // `pageBy()` already wraps against it, so today's chevrons under-report
+    // what the shoulder buttons can actually do -- but switching this flag
+    // to it changes behavior for every paginated caller in one step; kept
+    // to the minimal, already-safe `pageCount` fix for this round.
+    readonly property bool hasPagesBelow: currentPage < pageCount - 1 || root.hasMorePages
 
     // Caller-supplied total item count, used by the scroll thumb so its
     // size and position reflect the full dataset rather than the loaded
@@ -154,8 +257,16 @@ Item {
     // this to their model's authoritative total so the thumb stays
     // stable while `fetch_more` grows the slice in the background.
     property int totalItemsOverride: -1
-    readonly property int totalItems: totalItemsOverride >= 0 ? totalItemsOverride : itemCount
+    // Unknown-length cursor lists must derive navigation only from loaded rows
+    // and `hasMorePages`. Ignore any stale/legacy total hint until a caller
+    // explicitly declares its total authoritative.
+    readonly property int totalItems: paginationTotalKnown && totalItemsOverride >= 0 ? totalItemsOverride : itemCount
     readonly property int totalPageCount: Math.max(1, Math.ceil(totalItems / pageSize))
+    // False when a cursor chain has no authoritative final count. Navigation
+    // continues forward by requesting another page instead of wrapping at the
+    // current loaded edge; chrome keeps arrows but suppresses the misleading
+    // growing scrollbar thumb.
+    property bool paginationTotalKnown: true
 
     // Caller-supplied "more pages exist" flag for paginated models.
     // Drives the pending-target watchdog: if the model says no more pages
@@ -164,6 +275,10 @@ Item {
     // callers leave this false; their pending targets always resolve
     // immediately because totalPageCount === pageCount.
     property bool hasMorePages: false
+    // True while model owns an RPC or frame-gapped append tail. Pending-target
+    // navigation waits for it to clear before requesting another cursor page,
+    // preventing later-page rows from interleaving with current append.
+    property bool loadingMore: false
 
     // Pending wrap-target state. Set by Up-at-page-0, Down-past-last-
     // loaded, and pageBy when the destination page hasn't been fetched
@@ -211,45 +326,55 @@ Item {
         root._pendingTargetIndex = -1;
     }
 
-    // Reserved chrome around the cell area. Vertical insets must be
-    // large enough to contain the focused tile's 1.06× scale bleed
-    // (~3% of cellHeight per side) — without them, top-row and
-    // bottom-row tiles get clipped when focused. The scrollbar gutter
-    // (`gutterWidth`) is treated as part of the grid for edge-spacing
-    // purposes: it sits inboard of `rightInset` (which matches
-    // `leftInset` so the cells+gutter block has equal margin on each
-    // screen edge) with `gutterGap` of breathing room between the
-    // rightmost cell and the gutter. `gutterGap` is intentionally
-    // tighter than `cellSpacingX` — the scrollbar reads as chrome,
-    // not as another cell, so a full inter-cell gap looks like wasted
-    // space next to it. The gutter stays reserved on a single page
-    // (just hidden) so cells don't reflow when paging activates.
-    readonly property int leftInset: root._gridProfile ? root._gridProfile.leftInset : Sizing.pctW(5)
-    readonly property int rightInset: root._gridProfile ? root._gridProfile.rightInset : Sizing.pctW(5)
-    readonly property int gutterWidth: root._gridProfile ? root._gridProfile.gutterWidth : Sizing.pctW(3)
-    readonly property int gutterGap: root._gridProfile ? root._gridProfile.gutterGap : Sizing.pctW(1.5)
-    readonly property int scrollThumbWidth: root._gridProfile ? root._gridProfile.scrollThumbWidth : Sizing.pctW(1.2)
-    readonly property int scrollThumbRightInset: root._gridProfile ? root._gridProfile.scrollThumbRightInset : 0
-    readonly property bool scrollThumbRightAligned: root._gridProfile && root._gridProfile.scrollThumbRightAligned !== undefined ? root._gridProfile.scrollThumbRightAligned : false
-    readonly property int scrollArrowSize: root._gridProfile ? root._gridProfile.scrollArrowSize : Math.min(gutterWidth, Sizing.pctH(4))
-    readonly property int topInset: root._gridProfile ? root._gridProfile.topInset : Sizing.pctH(2)
-    readonly property int bottomInset: root._gridProfile ? root._gridProfile.bottomInset : Sizing.pctH(2)
-    readonly property int cellSpacingX: root._gridProfile ? root._gridProfile.columnGap : Sizing.pctW(3)
-    readonly property int cellSpacingY: root._gridProfile ? root._gridProfile.rowGap : Sizing.pctH(4)
+    // Reserved chrome around the cell area. Vertical insets provide equal
+    // breathing room around top and bottom rows; `leftInset`/`rightInset`
+    // do the same horizontally. There is no scrollbar gutter to reserve —
+    // grids are paged, not scrolled; the page cue lives in the host
+    // screen's footer (see PageIndicator.qml) and never affects this
+    // component's geometry.
+    readonly property int leftInset: root._gridProfile ? root._gridProfile.leftInset : (Sizing.tier === "240" ? Sizing.headerSideMargin : Sizing.pctW(3))
+    readonly property int rightInset: root._gridProfile ? root._gridProfile.rightInset : (Sizing.tier === "240" ? Sizing.headerSideMargin : Sizing.pctW(3))
+    readonly property int topInset: root._gridProfile ? root._gridProfile.topInset : (Sizing.tier === "240" ? 2 : Sizing.pctH(2))
+    readonly property int bottomInset: root._gridProfile ? root._gridProfile.bottomInset : (Sizing.tier === "240" ? 4 : Sizing.pctH(2))
+    readonly property int cellSpacingX: root._gridProfile ? root._gridProfile.columnGap : (Sizing.tier === "240" ? 4 : Sizing.pctW(2))
+    readonly property int cellSpacingY: root._gridProfile ? root._gridProfile.rowGap : (Sizing.tier === "240" ? 4 : Sizing.pctH(4))
     readonly property int _contentWidth: root.columns * root.cellWidth + (root.columns - 1) * root.cellSpacingX
-    readonly property int _scrollGutterX: root._gridProfile && root._gridProfile.gutterFollowsContentWidth ? root.leftInset + root._contentWidth + root.gutterGap : width - root.rightInset - root.gutterWidth
+    readonly property int _contentHeight: root.rows * root.cellHeight + (root.rows - 1) * root.cellSpacingY
+    // Cell block always centers against the full inset-to-inset width.
+    // With no gutter to reserve, `_availableWidth` already is that full
+    // width, so this is just ordinary centering — unlike before the
+    // gutter's removal, becoming/ceasing to be paginated can no longer
+    // shift or resize this block at all.
+    readonly property int _cellBlockOffsetX: Math.max(0, Math.floor((root._availableWidth - root._contentWidth) / 2))
+    readonly property int _cellBlockOffsetY: Math.max(0, Math.floor((root._availableHeight - root._contentHeight) / 2))
 
     // Computed cell dimensions — fill the available area, divided by
-    // columns × rows. The cell area
-    // also reserves `gutterGap + gutterWidth` on the right for the
-    // tight-gap-then-scrollbar layout described above.
-    readonly property int _availableWidth: Math.max(0, width - leftInset - rightInset - gutterGap - gutterWidth)
+    // columns × rows.
+    readonly property int _availableWidth: Math.max(0, width - leftInset - rightInset)
     readonly property int _availableHeight: Math.max(0, height - topInset - bottomInset)
-    readonly property int cellWidth: Math.max(0, Math.floor((root._availableWidth - (root.columns - 1) * root.cellSpacingX) / root.columns))
-    readonly property int cellHeight: Math.max(0, Math.floor((root._availableHeight - (root.rows - 1) * root.cellSpacingY) / root.rows))
+    // Per-axis fits. `_widthFit` always divides the item's own available
+    // width — every caller already sets `width` as a free-standing input
+    // (e.g. `width: parent.width`), so there is no circularity to avoid on
+    // that axis. `_heightFit` divides `heightBudget` when a caller supplies
+    // one (`squareCells`'s doc comment explains why); otherwise it divides
+    // the item's own available height, identical to before.
+    readonly property int _widthFit: Math.max(0, Math.floor((root._availableWidth - (root.columns - 1) * root.cellSpacingX) / root.columns))
+    readonly property int _heightFit: Math.max(0, Math.floor((root._heightFitAvailable - (root.rows - 1) * root.cellSpacingY) / root.rows))
+    readonly property int _heightFitAvailable: Math.max(0, (root.heightBudget >= 0 ? root.heightBudget : height) - topInset - bottomInset)
+    readonly property int cellWidth: root.squareCells ? Math.min(root._widthFit, root._heightFit) : root._widthFit
+    readonly property int cellHeight: root.squareCells ? Math.min(root._widthFit, root._heightFit) : root._heightFit
 
     function setCurrentIndexImmediate(idx: int): void {
         root.currentIndex = idx;
+    }
+
+    // Disarm model-relative navigation before a folder/scope replacement can
+    // shrink row count. Resetting from a deep loaded page while Qt still owns a
+    // pending delegate index can make DelegateModel cancel an index against the
+    // new smaller count. Selection restoration runs after replacement.
+    function prepareForModelReplacement(): void {
+        root._clearPendingTarget();
+        root.currentIndex = 0;
     }
 
     function _handleWheel(wheel: WheelEvent): void {
@@ -260,13 +385,17 @@ Item {
         wheel.accepted = true;
     }
 
+    // Corner radius of the rect `currentCellRectIn()` returns, for
+    // ContextMenu's rounded scrim hole (Part 5).
+    readonly property int currentCellRadius: root._cardRadius
+
     function currentCellRectIn(target: Item): rect {
         if (root.itemCount <= 0)
             return Qt.rect(0, 0, 0, 0);
         const local = root.currentIndex % root.pageSize;
         const row = Math.floor(local / root.columns);
         const col = local % root.columns;
-        const p = root.mapToItem(target, root.leftInset + col * (root.cellWidth + root.cellSpacingX), root.topInset + row * (root.cellHeight + root.cellSpacingY));
+        const p = root.mapToItem(target, root.leftInset + root._cellBlockOffsetX + col * (root.cellWidth + root.cellSpacingX), root.topInset + root._cellBlockOffsetY + row * (root.cellHeight + root.cellSpacingY));
         return Qt.rect(p.x, p.y, root.cellWidth, root.cellHeight);
     }
 
@@ -281,12 +410,88 @@ Item {
     // on a partial last page it clamps to the last existing item.
     // Returns true if the index changed synchronously, false if a
     // pending-jump was stashed or the dataset is single-page.
-    function pageBy(delta: int): bool {
-        if (root.itemCount <= 0 || root.totalPageCount <= 1 || delta === 0)
+    // Reads the `isEmpty` role for an arbitrary flat index. Goes through
+    // the Repeater's own delegate (`itemAt`) rather than querying
+    // `root.model` directly so this works uniformly whether the model is a
+    // QML ListModel (the Hub) or a Rust-backed model (every other caller,
+    // which never sets `isEmpty` true) without needing model-type-specific
+    // access. The Repeater's `cellItem` delegate is created synchronously
+    // (see the `asynchronous` note on the Loader below, which is scoped to
+    // the *TileLoader*, not this outer delegate), so `itemAt` never returns
+    // null for a valid index.
+    function _isEmptyAt(index: int): bool {
+        if (index < 0 || index >= root.itemCount)
             return false;
-        const total = root.totalPageCount;
-        // JS `%` keeps sign on negatives — normalise into [0, total).
-        const targetPage = ((root.currentPage + delta) % total + total) % total;
+        const cell = itemRepeater.itemAt(index);
+        return cell ? cell.isEmpty : false;
+    }
+
+    // First non-`isEmpty` cell on `page`, scanning row-major from `fromLocal`
+    // (a page-local index) and wrapping within the page's own filled span.
+    // -1 if the page has no non-empty cell at all (a fully-blank page, e.g.
+    // Move's reserve page or an entirely-emptied Hub). Used by `pageBy`'s
+    // skip-empty pass below.
+    function _firstNonEmptyOnPage(page: int, fromLocal: int): int {
+        const pageStart = page * root.pageSize;
+        const itemsOnPage = Math.min(root.pageSize, root.itemCount - pageStart);
+        if (itemsOnPage <= 0)
+            return -1;
+        for (let step = 0; step < itemsOnPage; step++) {
+            const local = (fromLocal + step) % itemsOnPage;
+            const idx = pageStart + local;
+            if (!root._isEmptyAt(idx))
+                return idx;
+        }
+        return -1;
+    }
+
+    // Turn the page by `delta`, skipping over any page whose landing slot
+    // (and, failing that, whose entire span) is `isEmpty` -- see
+    // `skipEmptyCells` above. Bounded by `pageCount` steps: a direction with
+    // no reachable non-empty page anywhere settles back on the starting
+    // index rather than looping. Any mid-scan failure of the underlying
+    // step (`_pageByStep` returning false -- a pending fetch stash, or
+    // genuinely nowhere left to go) also settles back to the start; this
+    // is deliberately conservative rather than landing partway, since a
+    // stash means the destination isn't even loaded yet.
+    function pageBy(delta: int): bool {
+        if (!root.skipEmptyCells)
+            return root._pageByStep(delta);
+
+        const startIndex = root.currentIndex;
+        for (let steps = 0; steps < root.pageCount; steps++) {
+            if (!root._pageByStep(delta))
+                break;
+            const found = root._firstNonEmptyOnPage(root.currentPage, root.currentIndex - root.currentPage * root.pageSize);
+            if (found < 0)
+                continue; // whole page is blank -- keep paging the same direction
+            if (found !== root.currentIndex)
+                root.currentIndex = found;
+            return true;
+        }
+        if (root.currentIndex !== startIndex)
+            root.currentIndex = startIndex;
+        return false;
+    }
+
+    function _pageByStep(delta: int): bool {
+        if (root.itemCount <= 0 || delta === 0)
+            return false;
+        let targetPage;
+        if (!root.paginationTotalKnown && root.hasMorePages) {
+            // No final page exists to wrap to yet. Backward paging stops at
+            // page zero; forward paging past the loaded edge requests the next
+            // cursor page below.
+            targetPage = root.currentPage + delta;
+            if (targetPage < 0)
+                return false;
+        } else {
+            if (root.totalPageCount <= 1)
+                return false;
+            const total = root.totalPageCount;
+            // JS `%` keeps sign on negatives — normalise into [0, total).
+            targetPage = ((root.currentPage + delta) % total + total) % total;
+        }
         if (targetPage === root.currentPage)
             return false;
         if (targetPage > root.pageCount - 1) {
@@ -370,9 +575,8 @@ Item {
                 return;
             }
             if (root.hasMorePages) {
-                // Keep loading; `fetch_more_*` is debounced model-side via
-                // `loading_more`, so a redundant emit is cheap.
-                root.loadMoreRequested(true);
+                if (!root.loadingMore)
+                    root.loadMoreRequested(true);
                 return;
             }
             // Dataset genuinely can't reach the target (Core revised the
@@ -386,11 +590,11 @@ Item {
         }
         if (root._pendingTargetPage < 0)
             return;
-        // Total may have shrunk under us (e.g. Core revised total_files
-        // downward); clamp the target to whatever the dataset reports
-        // now so we never overshoot.
+        // Known totals may shrink under us, so clamp to their reported final
+        // page. Unknown-length cursor lists cannot clamp while another page
+        // exists: their loaded total necessarily trails the pending target.
         const totalLast = root.totalPageCount - 1;
-        const targetPage = Math.min(root._pendingTargetPage, totalLast);
+        const targetPage = root.paginationTotalKnown || !root.hasMorePages ? Math.min(root._pendingTargetPage, totalLast) : root._pendingTargetPage;
         if (targetPage < 0) {
             root._pendingTargetPage = -1;
             return;
@@ -399,10 +603,8 @@ Item {
         if (targetIdx >= root.itemCount) {
             // Specific (page, row, col) slot not realised yet.
             if (root.hasMorePages) {
-                // Keep the chain going; `fetch_more` is debounced
-                // model-side via `loading_more`, so a redundant emit
-                // is cheap.
-                root.loadMoreRequested(true);
+                if (!root.loadingMore)
+                    root.loadMoreRequested(true);
                 return;
             }
             // Model says no more pages are coming. Settle on the
@@ -450,7 +652,122 @@ Item {
     // - Landing on a hole on a partial target page (column doesn't
     //   exist there): clamp to the last existing item on the target
     //   page so the user always moves rather than sticking on a hole.
+    //
+    // When `skipEmptyCells` is set: horizontal presses still step the SAME
+    // way `_moveSelectionStep` always has, just repeated until a non-empty
+    // cell turns up -- Left/Right staying within the source row is a real,
+    // separate invariant (Move's `_wouldWrapColumn` depends on it), not
+    // part of what this property changes. Vertical presses do NOT reuse
+    // that "same column, repeated step" approach: on a freely-arranged
+    // board (the Hub, the only caller) a column can be empty for several
+    // rows in a row while a real tile sits one column over, and marching
+    // straight down that empty column -- even wrapping through pages --
+    // tunnels past it. `_nearestVerticalCandidate` below searches every
+    // real tile on the board instead. See its own doc comment.
     function moveSelection(dCol: int, dRow: int): bool {
+        if (!root.skipEmptyCells)
+            return root._moveSelectionStep(dCol, dRow);
+
+        if (dRow !== 0) {
+            const candidate = root._nearestVerticalCandidate(dRow, root.currentIndex);
+            if (candidate < 0)
+                return false;
+            root._clearPendingTarget();
+            root.currentIndex = candidate;
+            return true;
+        }
+
+        // Horizontal: same-row skip, bounded repeat of the ordinary step --
+        // see the doc comment above for why this one is unchanged.
+        const startIndex = root.currentIndex;
+        for (let steps = 0; steps < root.itemCount; steps++) {
+            if (!root._moveSelectionStep(dCol, dRow))
+                break;
+            if (root.currentIndex !== startIndex && !root._isEmptyAt(root.currentIndex))
+                return true;
+        }
+        if (root.currentIndex !== startIndex)
+            root.currentIndex = startIndex;
+        return false;
+    }
+
+    // Finds the best real (non-`isEmpty`) tile in the vertical direction
+    // `dRow` from `fromIndex`, searching the WHOLE board rather than a
+    // single column -- see `moveSelection`'s doc comment for why the
+    // column-only approach tunnels past nearby content on a freely
+    // arranged Hub layout. Pages stack vertically (this file's own header
+    // comment), so every cell's position collapses to one flat
+    // `virtualRow = page * rows + row` axis plus `column`; distance is
+    // then scored in plain grid units exactly the way Android's
+    // `FocusFinder` -- the algorithm behind d-pad navigation on Android TV
+    // since 2007 -- scores pixel rects: `13 * majorAxisDistance² +
+    // minorAxisDistance²`. The 13:1 ratio is that same shipped, tuned
+    // constant, reused rather than re-derived: it strongly prefers staying
+    // column-aligned (a tile 1 row further but perfectly aligned beats one
+    // 1 column off), while still being willing to drift a column or two
+    // rather than travel several rows past nearer content. Grid units
+    // (not pixels) are correct here specifically because the Hub always
+    // uses `squareCells: true`, so a row step and a column step already
+    // cover equal physical distance.
+    //
+    // Two passes:
+    // 1. Only tiles strictly in the pressed direction. Cheapest, most
+    //    common case -- most presses have something below/above.
+    // 2. Nothing there at all: wrap. Every remaining real tile is scored
+    //    as if the press had continued past the edge and come back
+    //    around (mirrors the horizontal skip's own wrap and the
+    //    confirmed Move-page wrap), so the winner is whichever tile is
+    //    closest to the far edge, still column-weighted the same way.
+    // Returns -1 (moveSelection settles back to the start, unmoved) only
+    // when `fromIndex` is the sole real tile on the entire board.
+    function _nearestVerticalCandidate(dRow: int, fromIndex: int): int {
+        const totalRows = root.totalPageCount * root.rows;
+        const srcLocal = fromIndex % root.pageSize;
+        const srcRow = Math.floor(srcLocal / root.columns);
+        const srcCol = srcLocal % root.columns;
+        const srcVirtualRow = Math.floor(fromIndex / root.pageSize) * root.rows + srcRow;
+
+        let best = -1;
+        let bestScore = Infinity;
+        for (let idx = 0; idx < root.itemCount; idx++) {
+            if (idx === fromIndex || root._isEmptyAt(idx))
+                continue;
+            const local = idx % root.pageSize;
+            const row = Math.floor(local / root.columns);
+            const col = local % root.columns;
+            const virtualRow = Math.floor(idx / root.pageSize) * root.rows + row;
+            if (dRow > 0 ? virtualRow <= srcVirtualRow : virtualRow >= srcVirtualRow)
+                continue;
+            const major = dRow > 0 ? virtualRow - srcVirtualRow : srcVirtualRow - virtualRow;
+            const minor = Math.abs(col - srcCol);
+            const score = 13 * major * major + minor * minor;
+            if (score < bestScore) {
+                bestScore = score;
+                best = idx;
+            }
+        }
+        if (best >= 0)
+            return best;
+
+        for (let idx = 0; idx < root.itemCount; idx++) {
+            if (idx === fromIndex || root._isEmptyAt(idx))
+                continue;
+            const local = idx % root.pageSize;
+            const row = Math.floor(local / root.columns);
+            const col = local % root.columns;
+            const virtualRow = Math.floor(idx / root.pageSize) * root.rows + row;
+            const major = dRow > 0 ? virtualRow + (totalRows - srcVirtualRow) : srcVirtualRow + (totalRows - virtualRow);
+            const minor = Math.abs(col - srcCol);
+            const score = 13 * major * major + minor * minor;
+            if (score < bestScore) {
+                bestScore = score;
+                best = idx;
+            }
+        }
+        return best;
+    }
+
+    function _moveSelectionStep(dCol: int, dRow: int): bool {
         if (root.itemCount <= 0)
             return false;
 
@@ -497,6 +814,8 @@ Item {
             const itemsOnPage = Math.min(root.pageSize, root.itemCount - root.currentPage * root.pageSize);
             const lastFilledRowOnPage = Math.floor((itemsOnPage - 1) / root.columns);
             if (rowCandidate < 0) {
+                if (!root.paginationTotalKnown && root.hasMorePages && root.currentPage === 0)
+                    return false;
                 const targetPage = root.currentPage === 0 ? root.totalPageCount - 1 : root.currentPage - 1;
                 if (targetPage > root.pageCount - 1) {
                     root._pendingTargetIndex = -1;
@@ -510,7 +829,7 @@ Item {
                 newRow = root.rows - 1;
             } else if (rowCandidate >= root.rows || rowCandidate > lastFilledRowOnPage) {
                 const lastPage = root.totalPageCount - 1;
-                const targetPage = root.currentPage === lastPage ? 0 : root.currentPage + 1;
+                const targetPage = !root.paginationTotalKnown && root.hasMorePages && root.currentPage >= root.pageCount - 1 ? root.currentPage + 1 : (root.currentPage === lastPage ? 0 : root.currentPage + 1);
                 if (targetPage > root.pageCount - 1) {
                     root._pendingTargetIndex = -1;
                     root._pendingTargetPage = targetPage;
@@ -579,14 +898,20 @@ Item {
             root._commitPendingTarget();
     }
 
+    onLoadingMoreChanged: {
+        if (!root.loadingMore && root.hasPendingTarget)
+            root._commitPendingTarget();
+    }
+
     onItemCountChanged: {
-        if (root.itemCount < root._previousItemCount) {
+        // Destroying the Repeater during suspension briefly reports zero before
+        // itemCount rebinds to source count. That is not model shrinkage and
+        // must not reset restored list selection.
+        const sourceCountRetained = root.model && root.model.count >= root._previousItemCount;
+        if (root.itemCount < root._previousItemCount && !sourceCountRetained) {
             // Model shed rows (reset, system change, path change). The
-            // pending-target context no longer applies — drop it before
-            // the row-count check below moves currentIndex.
+            // pending-target context no longer applies.
             root._clearPendingTarget();
-            if (root.currentIndex >= root.itemCount)
-                root.currentIndex = Math.max(0, root.itemCount - 1);
         } else if (root.itemCount > root._previousItemCount) {
             // Pages were appended. If a wrap-target jump is pending,
             // try to commit it now; the helper chains another
@@ -595,6 +920,13 @@ Item {
             // says no more pages are coming.
             root._commitPendingTarget();
         }
+        // Universal loaded-page invariant: whenever rows exist, currentIndex
+        // points at one of them. Model replacement can invalidate a persisted
+        // numeric index without taking the ordinary shrink branch (notably a
+        // zero-to-populated reset); directional input used to repair this only
+        // after the page had already painted with no focused item.
+        if (root.itemCount > 0 && (root.currentIndex < 0 || root.currentIndex >= root.itemCount))
+            root.currentIndex = 0;
         root._previousItemCount = root.itemCount;
     }
 
@@ -618,7 +950,7 @@ Item {
         Repeater {
             id: itemRepeater
 
-            model: root.model
+            model: root.suspendDelegates ? null : root.model
 
             Item {
                 id: cellItem
@@ -633,36 +965,56 @@ Item {
                 required property string coverKey
                 required property int favorite
                 required property bool hidden
+                // True while a tile's live precondition isn't currently met
+                // (Hub only today). Required, same as `entryType`/
+                // `fileCount` below -- a plain non-required property does
+                // NOT automatically bind to a matching model role (Qt only
+                // wires that up for `required property`), so every model
+                // reaching this delegate declares this role even though
+                // only Hub's `hubGridModel` ever sets it to `true`.
+                required property bool disabled
                 // Newline-joined disambiguating-tag tokens (empty for models
                 // without variants). Every Browse model exposes this role.
                 required property string disambiguatingTags
+                // Round 11. Required, same as `disambiguatingTags` above --
+                // a plain non-required property does NOT automatically bind
+                // to a matching model role (Qt only wires that up for
+                // `required property`), so every model reaching this
+                // delegate, including Hub's hand-built `ListModel`
+                // (HubScreen.qml's `hubGridModel`), sets both explicitly.
+                required property string entryType
+                required property int fileCount
+                // Structural placeholder, not a real item — see
+                // `root.emptyDelegate` above. Every model supplies this
+                // (default `false` for models that never have one).
+                required property bool isEmpty
 
                 readonly property int cellPage: Math.floor(index / root.pageSize)
                 readonly property int cellLocal: index % root.pageSize
                 readonly property int cellRow: Math.floor(cellLocal / root.columns)
                 readonly property int cellCol: cellLocal % root.columns
                 readonly property bool isSelected: index === root.currentIndex
+                readonly property string topLabel: typeof root.tileTopLabelProvider === "function" ? (root.tileTopLabelProvider(index) ?? "") : ""
 
                 // Cover-decode gate AND delegate-materialisation gate.
                 // PagedGrid's Repeater creates one cellItem per model
                 // row at construction. Two-tier gate, both anchored on
                 // distance from `root.currentPage`:
                 //
-                //   - decode range (current + next page): cells hand
-                //     their real coverKey to Tile, forcing hidden
-                //     next-page Image decode/QPixmapCache warm before
-                //     the page cut. Rust still owns byte-fetch priority
+                //   - decode range (current + configured lookahead pages):
+                //     cells hand their real coverKey to Tile, forcing hidden
+                //     next-page Image decode/QPixmapCache warm before the page
+                //     cut when lookahead is enabled. Rust still owns byte-fetch priority
                 //     via `prefetch_around`; this range only makes QML
                 //     consume already-warmed bytes early enough.
-                //   - retention range (±5 pages): cells inside this
-                //     radius keep their TileLoader.active=true so the
-                //     Tile delegate stays materialised, AND cells that
-                //     have already requested keep their coverKey set
-                //     so Tile's Image keeps the decoded texture
-                //     referenced. The active gate is what prevents
-                //     per-press binding cost from growing with the
-                //     dataset - only ~110 Tile delegates exist at any
-                //     time regardless of N. Retention doesn't trigger
+                //   - retention range (current ± enough pages for one
+                //     Sizing.visibleCovers span): cells inside this radius keep
+                //     their TileLoader.active=true, AND cells that have already
+                //     requested keep their coverKey set so Tile's Image keeps
+                //     the decoded texture referenced. The active gate prevents
+                //     per-press binding cost from growing with dataset size;
+                //     only current and adjacent-page Tile delegates exist at
+                //     normal grid densities. Retention doesn't trigger
                 //     new cover requests; only the decode range does.
                 //
                 // Off-radius cells (outside retention) set
@@ -674,13 +1026,13 @@ Item {
                 // collapses to the procedural fallback and the
                 // texture reference drops.
                 //
-                // Memory ceiling tracks visible cover density: ±
-                // _coverRetentionPages around currentPage keeps enough
-                // decoded pages warm for the current UI scale. Re-decode
+                // Memory ceiling tracks visible cover density:
+                // _coverRetentionPages around currentPage keeps adjacent
+                // decoded pages warm for current UI scale. Re-decode
                 // after crossing past the retention edge runs at
                 // nice +10 (see media_image_provider.cpp) and is
                 // invisible to the renderer.
-                readonly property bool _coverInRange: !root.rapidRenderMode && cellPage >= root.currentPage && cellPage <= root.currentPage + 1
+                readonly property bool _coverInRange: root.coverRequestsEnabled && !root.rapidRenderMode && cellPage >= root.currentPage && cellPage <= root.currentPage + Math.max(0, root.coverLookaheadPages)
                 readonly property bool _coverInRetentionRange: !root.rapidRenderMode && Math.abs(cellPage - root.currentPage) <= (root.coverLoadingPaused ? 1 : root._coverRetentionPages)
                 property bool _coverEverRequested: false
                 Binding on _coverEverRequested {
@@ -692,77 +1044,153 @@ Item {
 
                 width: root.cellWidth
                 height: root.cellHeight
-                x: root.leftInset + cellCol * (root.cellWidth + root.cellSpacingX)
-                y: root.topInset + cellRow * (root.cellHeight + root.cellSpacingY)
-                // Selected tile draws on top so its scale-up tween isn't
-                // clipped by neighbours below/right of it.
+                x: root.leftInset + root._cellBlockOffsetX + cellCol * (root.cellWidth + root.cellSpacingX)
+                y: root.topInset + root._cellBlockOffsetY + cellRow * (root.cellHeight + root.cellSpacingY)
+                // Selected tile draws on top so its focus treatment remains
+                // authoritative at cell boundaries.
                 z: isSelected ? 1 : 0
-                visible: cellPage === root.currentPage
+                visible: root.cellsVisible && cellPage === root.currentPage
 
-                // Card-shaped placeholder painted behind the
-                // TileLoader. When the loader's `active` is false
-                // (cell is outside the retention window) or the Tile
-                // is still incubating asynchronously after a
-                // retention-edge crossing, the user sees this flat
-                // card slot instead of an empty pit. Once the Tile
-                // finishes incubating it paints opaque on top with
-                // the same color and radius, so the silhouette is
-                // hidden for free without an explicit visibility
-                // gate. The only selection-dependent work here is the
-                // focused placeholder ring below; it stays limited to
-                // the current page by the parent visibility gate.
-                Rectangle {
-                    id: placeholderCard
-
-                    anchors.fill: parent
-                    radius: Sizing.cornerRadius
-                    color: Theme.surfaceCard
-                    border.color: Theme.borderMid
-                    border.width: Sizing.stroke(1)
-                    // Track the loaded Tile's push-in scale so the card
-                    // silhouette and the Tile surface shrink together.
-                    // Falls back to 1.0 when no Tile is loaded (skeleton
-                    // state), so the placeholder stays full-size until
-                    // the Tile appears. `cardScale` is a readonly alias
-                    // for `_activateScale` exposed by Tile for exactly
-                    // this cross-sibling binding.
-                    transformOrigin: Item.Center
-                    // qmllint disable missing-property
-                    scale: tileLoader.status === Loader.Ready && tileLoader.item ? tileLoader.item.cardScale : 1.0
-                    // qmllint enable missing-property
-                }
-
-                // Standalone selected-cell ring for skeleton/rapid mode.
-                // Tile.qml owns the normal ring, but rapidRenderMode
-                // deliberately disables TileLoader to keep held d-pad
-                // navigation cheap. Draw the same filled-rect ring on
-                // the placeholder so selection never disappears while
-                // covers/delegates are paused.
-                Rectangle {
-                    id: placeholderFocusRingOuter
+                // Card-shaped placeholder painted behind the TileLoader,
+                // plus the selection ring it draws during rapidRenderMode
+                // (see the Loader's `active` comment below). Retention-gated
+                // the same way `tileLoader` is: unconditionally building this
+                // per row (a `PressableSurface` — 6 visual primitives, 2
+                // `Behavior` animations, `clip: true` — plus its own implicit
+                // MouseArea) for every model row, including the thousands a
+                // bulk jump/restore can insert far from `currentPage`, was
+                // the dominant residual cost behind a multi-second Qt-thread
+                // stall even though `TileLoader` itself was already
+                // retention-gated — see `games.rs::apply_append_page`'s
+                // `bulk` comment for the Rust-side half of this fix. Off-
+                // retention `cellItem`s now cost only the bare outer `Item`
+                // (role bindings + the `_coverEverRequested` latch).
+                //
+                // When the loader's `active` is false (cell is outside the
+                // retention window) or the Tile is still incubating
+                // asynchronously after a retention-edge crossing, the user
+                // sees this flat card slot instead of an empty pit. Once the
+                // Tile finishes incubating it paints opaque on top with the
+                // same color and radius, so the silhouette is hidden for
+                // free without an explicit visibility gate. The only
+                // selection-dependent work here is the focused placeholder
+                // ring below; it stays limited to the current page by the
+                // parent visibility gate.
+                //
+                // That "paints opaque on top" assumption is specific to
+                // `delegate` — an `emptyDelegate` (`EmptySlot.qml`) is
+                // deliberately NOT opaque (a genuinely blank slot, not a
+                // card with nothing on it), so this skeleton would stay
+                // permanently visible underneath it instead of being
+                // covered for free. `isEmpty` rows skip it outright: there
+                // is nothing to incubate for a structural placeholder.
+                Loader {
+                    id: placeholderCardLoader
 
                     anchors.fill: parent
-                    anchors.margins: Sizing.pctH(0.4)
-                    color: Theme.accent
-                    radius: Math.max(0, Sizing.cornerRadius - Sizing.pctH(0.4))
-                    antialiasing: true
-                    visible: cellItem.isSelected && root.focused && root.focusReady && (root.rapidRenderMode || tileLoader.status !== Loader.Ready)
-                }
+                    // Retention window, OR'd with "on the current page" —
+                    // NOT `&& !root.rapidRenderMode` the way `tileLoader`
+                    // below is. `_coverInRetentionRange` already bakes in
+                    // `!root.rapidRenderMode` internally (it's false for
+                    // every cell during rapidRenderMode), but the selected
+                    // cell's own placeholder + ring must survive
+                    // rapidRenderMode — `tileLoader` goes inactive on
+                    // purpose then, and this skeleton is what keeps
+                    // selection visible while it's torn down (see the ring
+                    // comment inside the loaded component). The selected
+                    // cell is always on `currentPage`, so OR-ing in
+                    // `cellPage === currentPage` keeps it (and the rest of
+                    // the current page, cheaply) alive through
+                    // rapidRenderMode without re-widening the window for
+                    // every other off-page cell this Loader exists to skip.
+                    active: cellItem._coverInRetentionRange || cellItem.cellPage === root.currentPage
+                    // Cross-boundary values, resolved once here (same scope
+                    // as `tileLoader`'s own property bindings below — not a
+                    // new boundary) rather than inside the loaded component.
+                    // A `Loader` never forwards its own properties onto the
+                    // item it loads, so the component below reads these via
+                    // `parent.X`, mirroring how `Tile.qml` reads
+                    // `TileLoader`'s properties.
+                    // `?? false`: only `Tile.qml` declares `cardPressed`.
+                    // `EmptySlot` (any `emptyDelegate`) is a face-less Item
+                    // with no press state, and reading a property it doesn't
+                    // have yields `undefined`, which QML refuses to assign
+                    // into a `bool` -- one warning per blank cell on every
+                    // boot (the Hub's bootstrap page pads to a full grid).
+                    property bool cardPressed: tileLoader.status === Loader.Ready && tileLoader.item ? (tileLoader.item.cardPressed ?? false) : false
+                    property real tileOpacity: tileLoader.status === Loader.Ready && tileLoader.item ? tileLoader.item.opacity : 1
+                    property bool ringVisible: cellItem.isSelected && root.focused && root.focusReady && (root.rapidRenderMode || tileLoader.status !== Loader.Ready)
+                    property bool cellIsEmpty: cellItem.isEmpty
 
-                Rectangle {
-                    anchors.fill: placeholderFocusRingOuter
-                    anchors.margins: Sizing.stroke(Sizing.pctH(0.6))
-                    color: placeholderCard.color
-                    radius: Math.max(0, placeholderFocusRingOuter.radius - Sizing.stroke(Sizing.pctH(0.6)))
-                    antialiasing: true
-                    visible: placeholderFocusRingOuter.visible
+                    sourceComponent: PressableSurface {
+                        id: placeholderCard
+
+                        // Local captures of the Loader's properties, taken
+                        // once here (mirrors Tile.qml's `delegateIsSelected:
+                        // parent.isSelected` pattern) so the nested ring
+                        // Rectangles below read plain same-component
+                        // properties instead of repeating `parent.X`.
+                        readonly property bool _cellIsEmpty: parent.cellIsEmpty
+                        readonly property bool _ringVisible: parent.ringVisible
+
+                        objectName: "pagedGridPlaceholderCard-" + cellItem.index
+                        anchors.fill: parent
+                        visible: !_cellIsEmpty
+                        radius: root._cardRadius
+                        faceColor: Theme.surfaceCard
+                        edgeColor: Theme.tileEdge
+                        // Track the loaded Tile's physical press so both opaque
+                        // surfaces leave the same top gap. At skeleton time the
+                        // placeholder stays raised until a real activation occurs.
+                        pressed: parent.cardPressed
+                        // Same tracking for the held blink (Hub Options -> Move,
+                        // see Tile.qml's `_heldOpacity`): the "paints opaque on
+                        // top" contract above only holds while the loaded Tile
+                        // actually stays opaque. Without this, the Tile blinking
+                        // to nothing left this skeleton (a blank card with no
+                        // art or name) showing through underneath instead of the
+                        // whole cell going with it.
+                        opacity: parent.tileOpacity
+
+                        // Standalone selected-cell ring for skeleton/rapid mode.
+                        // Tile.qml owns the normal ring, but rapidRenderMode
+                        // deliberately disables TileLoader to keep held d-pad
+                        // navigation cheap. Draw the same filled-rect ring on
+                        // the placeholder so selection never disappears while
+                        // covers/delegates are paused.
+                        Rectangle {
+                            id: placeholderFocusRingOuter
+
+                            anchors.fill: parent
+                            anchors.margins: Sizing.pctH(0.4)
+                            color: Theme.accent
+                            radius: Math.max(0, root._cardRadius - Sizing.pctH(0.4))
+                            antialiasing: Sizing.cornerAntialiasing
+                            visible: placeholderCard._ringVisible
+                        }
+
+                        Rectangle {
+                            anchors.fill: placeholderFocusRingOuter
+                            anchors.margins: Sizing.focusRingWidth
+                            color: placeholderCard.faceColor
+                            radius: Math.max(0, placeholderFocusRingOuter.radius - Sizing.focusRingWidth)
+                            antialiasing: Sizing.cornerAntialiasing
+                            visible: placeholderFocusRingOuter.visible
+                        }
+                    }
                 }
 
                 TileLoader {
                     id: tileLoader
 
                     anchors.fill: parent
-                    sourceComponent: root.delegate
+                    // A structural placeholder row (see `root.emptyDelegate`
+                    // above) resolves to that component instead of the
+                    // normal per-item delegate. `root.emptyDelegate === null`
+                    // (every caller but the Hub) falls straight through to
+                    // `root.delegate` regardless of `isEmpty` — unchanged
+                    // behavior for every existing PagedGrid caller.
+                    sourceComponent: cellItem.isEmpty && root.emptyDelegate ? root.emptyDelegate : root.delegate
                     // Bound delegate materialisation to the retention
                     // window. Cells outside +/-5 pages keep their
                     // cellItem (Repeater contract - it owns one item
@@ -785,137 +1213,77 @@ Item {
                     isFocused: root.focused
                     name: cellItem.name
                     coverKey: cellItem._gatedCoverKey
+                    topLabel: cellItem.topLabel
                     favorite: cellItem.favorite
                     hidden: cellItem.hidden
+                    disabled: cellItem.disabled
                     disambiguatingTags: cellItem.disambiguatingTags
+                    entryType: cellItem.entryType
+                    fileCount: cellItem.fileCount
                     activatePulse: root.activatePulse
                     releasePulse: root.releasePulse
                     settling: root.screenSettling
                     focusReady: root.focusReady
+                    loadFocusedCover: root.eagerFocusedCovers || cellItem.isSelected
+                    held: cellItem.index === root.heldIndex
+                    // Mirrors the `asynchronous` rule above, for the same
+                    // reason: only the current page's tints are worth spending
+                    // GUI-thread time on. Off-page retained delegates keep
+                    // decoding on the reader thread so retention-edge warmup
+                    // never blocks input, and held-d-pad rapidRenderMode does
+                    // no synchronous work at all.
+                    coverSynchronous: root.coverSynchronous && cellItem.cellPage === root.currentPage && !root.rapidRenderMode
                 }
 
-                MouseArea {
+                // Click/hover hit area. Retention-gated the same as
+                // `placeholderCardLoader` above, but WITHOUT the
+                // `cellPage === currentPage` OR-term's rapidRenderMode
+                // concern — a `MouseArea` was never rapidRenderMode-aware
+                // (only `enabled: cellItem.visible` gated it), and
+                // `cellItem.visible` already IS `cellPage === currentPage`
+                // (folded in below), so gating construction on `visible`
+                // directly reproduces the exact original condition: this
+                // hit area only ever did anything on the current page, and
+                // a disabled off-page MouseArea served no purpose anyway.
+                Loader {
+                    id: hitAreaLoader
+
                     anchors.fill: parent
-                    hoverEnabled: true
-                    acceptedButtons: Qt.LeftButton | Qt.RightButton
-                    cursorShape: Qt.PointingHandCursor
-                    enabled: cellItem.visible
+                    active: cellItem.visible
+                    property bool cellIsEmpty: cellItem.isEmpty
+                    property int cellIndex: cellItem.index
 
-                    onEntered: {
-                        if (root.currentIndex !== cellItem.index)
-                            root.currentIndex = cellItem.index;
-                        root.itemHovered(cellItem.index);
+                    sourceComponent: MouseArea {
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        acceptedButtons: Qt.LeftButton | Qt.RightButton
+                        cursorShape: Qt.PointingHandCursor
+
+                        onEntered: {
+                            // Mirrors the directional skip above: with
+                            // `skipEmptyCells` set, a blank is not a landing
+                            // spot for the mouse either.
+                            if (root.skipEmptyCells && parent.cellIsEmpty)
+                                return;
+                            if (root.currentIndex !== parent.cellIndex)
+                                root.currentIndex = parent.cellIndex;
+                            root.itemHovered(parent.cellIndex);
+                        }
+
+                        onClicked: mouse => {
+                            if (root.skipEmptyCells && parent.cellIsEmpty)
+                                return;
+                            if (root.currentIndex !== parent.cellIndex)
+                                root.currentIndex = parent.cellIndex;
+                            if (mouse.button === Qt.RightButton)
+                                root.itemRightClicked(parent.cellIndex);
+                            else
+                                root.itemClicked(parent.cellIndex);
+                        }
+
+                        onWheel: wheel => root._handleWheel(wheel)
                     }
-
-                    onClicked: mouse => {
-                        if (root.currentIndex !== cellItem.index)
-                            root.currentIndex = cellItem.index;
-                        if (mouse.button === Qt.RightButton)
-                            root.itemRightClicked(cellItem.index);
-                        else
-                            root.itemClicked(cellItem.index);
-                    }
-
-                    onWheel: wheel => root._handleWheel(wheel)
                 }
-            }
-        }
-    }
-
-    // ── Right-gutter scroll indicator ────────────────────────────────────
-    // Up arrow at the top, down arrow at the bottom, free-floating thumb
-    // in between. No painted track — the indicator is just the arrows
-    // and the thumb. Hidden when the dataset fits on a single page.
-    // The thumb snaps to each page position with no glide animation:
-    // scrolling is a hot path (cover prefetch + data load run on the same
-    // frames), so an animated thumb would repaint while the system is
-    // already busy.
-    // Sits after the cell `track` in the visual tree so the indicator
-    // paints on top of any brief scale-animation bleed at the right edge.
-    Item {
-        id: scrollGutter
-
-        x: root._scrollGutterX
-        anchors.top: parent.top
-        anchors.topMargin: root.topInset
-        anchors.bottom: parent.bottom
-        anchors.bottomMargin: root.bottomInset
-        width: root.gutterWidth
-        visible: root.totalPageCount > 1
-
-        Image {
-            id: upArrow
-            source: Resources.iconUrl("ScrollUp")
-            width: root.scrollArrowSize
-            height: root.scrollArrowSize
-            anchors.top: parent.top
-            anchors.horizontalCenter: parent.horizontalCenter
-            fillMode: Image.PreserveAspectFit
-            smooth: true
-            visible: root.hasPagesAbove
-
-            MouseArea {
-                anchors.fill: parent
-                acceptedButtons: Qt.LeftButton
-                cursorShape: Qt.PointingHandCursor
-                enabled: upArrow.visible
-                onClicked: root.pageWheelRequested(-1)
-            }
-        }
-
-        Image {
-            id: downArrow
-            source: Resources.iconUrl("ScrollDown")
-            width: root.scrollArrowSize
-            height: root.scrollArrowSize
-            anchors.bottom: parent.bottom
-            anchors.horizontalCenter: parent.horizontalCenter
-            fillMode: Image.PreserveAspectFit
-            smooth: true
-            visible: root.hasPagesBelow
-
-            MouseArea {
-                anchors.fill: parent
-                acceptedButtons: Qt.LeftButton
-                cursorShape: Qt.PointingHandCursor
-                enabled: downArrow.visible
-                onClicked: root.pageWheelRequested(1)
-            }
-        }
-
-        // Geometry-only Item between the arrows; nothing paints.
-        // `scrollThumb` derives its size and position from this region's
-        // height and the grid's `totalPageCount` / `currentPage`.
-        Item {
-            id: scrollRegion
-            anchors.top: parent.top
-            anchors.topMargin: root.scrollArrowSize + Sizing.pctH(1)
-            anchors.bottom: parent.bottom
-            anchors.bottomMargin: root.scrollArrowSize + Sizing.pctH(1)
-            anchors.right: root.scrollThumbRightAligned ? parent.right : undefined
-            anchors.rightMargin: root.scrollThumbRightAligned ? root.scrollThumbRightInset : 0
-            anchors.horizontalCenter: root.scrollThumbRightAligned ? undefined : parent.horizontalCenter
-            width: root.scrollThumbWidth
-
-            // Standard paginated-scrollbar formulas (cf. Qt
-            // `ScrollBar.size`/`position`, GTK `Gtk.Scrollbar`, Apple
-            // HIG): thumb length = trackLen * (visible / total) with one
-            // page visible at a time, position = (page / (total - 1)) *
-            // remaining range. Floor on thumb height keeps it visible
-            // when `totalPageCount` is large.
-            readonly property int _minThumbHeight: Sizing.pctH(4)
-            readonly property int _thumbHeight: Math.max(_minThumbHeight, Math.round(scrollRegion.height / root.totalPageCount))
-            readonly property int _thumbY: root.totalPageCount <= 1 ? 0 : Sizing.px((root.currentPage / (root.totalPageCount - 1)) * (scrollRegion.height - _thumbHeight))
-
-            Rectangle {
-                id: scrollThumb
-                width: root.scrollThumbWidth
-                height: scrollRegion._thumbHeight
-                anchors.right: root.scrollThumbRightAligned ? parent.right : undefined
-                anchors.horizontalCenter: root.scrollThumbRightAligned ? undefined : parent.horizontalCenter
-                y: scrollRegion._thumbY
-                color: Theme.textPrimary
-                radius: Sizing.half(width)
             }
         }
     }

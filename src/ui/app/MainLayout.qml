@@ -32,6 +32,7 @@ ApplicationWindow {
     readonly property string screenSystems: ScreenManager.screenSystems
     readonly property string screenGames: ScreenManager.screenGames
     readonly property string screenFavorites: ScreenManager.screenFavorites
+    readonly property string screenFavoriteSystems: ScreenManager.screenFavoriteSystems
     readonly property string screenRecents: ScreenManager.screenRecents
     readonly property string screenUpdate: ScreenManager.screenUpdate
     readonly property string screenSettings: ScreenManager.screenSettings
@@ -56,7 +57,12 @@ ApplicationWindow {
     // CRT region (visible as a whole-frame size snap on first paint).
     // Desktop preview sets fullScreen=false via initialProperties.
     property bool fullScreen: true
+    // Build-selected default used while Interface layout is "Device default".
+    // Generic builds use Standard; device vendors may compile Handheld.
+    property string defaultInterfaceProfile: "standard"
+    readonly property string effectiveInterfaceProfile: Browse.Settings.current_interface_profile === "device" ? root.defaultInterfaceProfile : Browse.Settings.current_interface_profile
     property bool crtNativePath: false
+    property bool bitmapType: false
     property bool debugCrtSafeAreaOverlay: false
     property string activeScreen: ScreenManager.activeScreen
     readonly property bool updateEnabled: Browse.BuildInfo.update_enabled
@@ -86,9 +92,19 @@ ApplicationWindow {
     property bool _headerMediaActivityEnabled: false
     property bool _firstFrameSeen: false
     readonly property bool _debugCrtSafeAreaGuideVisible: root.debugCrtSafeAreaOverlay && root.crtNativePath && Sizing.screenHeight <= 300
+
+    // Emitted for every presented frame. Main.qml uses this to close
+    // responsiveness timings on the first frame containing a destination
+    // screen; startup still uses `_firstFrameSeen` below.
+    signal framePresented
     property bool systemsScreenRequested: false
     property bool gamesScreenRequested: false
+    // Router-owned deep-page restoration gate. Keeps Games content hidden while
+    // cursor pages are appended until the persisted parent selection exists.
+    property bool gamesSelectionRestorePending: false
     property bool favoritesScreenRequested: false
+    property bool favoriteSystemsScreenRequested: false
+    property string favoritesSystemId: ""
     property bool recentsScreenRequested: false
     property bool settingsScreenRequested: false
     property bool aboutScreenRequested: false
@@ -109,21 +125,38 @@ ApplicationWindow {
     property bool contextMenuRequested: false
     property bool qrCodeModalRequested: false
     property bool gameInfoModalRequested: false
-    property bool firstRunIndexModalRequested: false
     property bool commercialNoticeModalRequested: false
     property bool coreVersionModalRequested: false
+    property bool actionErrorModalRequested: false
+    property bool randomFailedModalRequested: false
     property bool logUploadModalRequested: false
     property bool quitConfirmModalRequested: false
     property bool listPickerModalRequested: false
     property bool letterJumpModalRequested: false
     property bool crtCalibrationModalRequested: false
+    property bool scrapeSetupModalRequested: false
+    property bool indexSetupModalRequested: false
 
     function _startupTrace(): void {
         if (!root._startupTraceActive)
             return;
+        root._trace(arguments);
+    }
+
+    // Cover load events, deliberately outside the `_startupTraceActive` gate.
+    // That gate closes on the first Hub paint, which is before the Systems grid
+    // and the Settings tiles have drawn a single icon -- exactly where pop-in
+    // would still be hiding. `console.debug` is already silent unless
+    // `[logging] debug = true`, so there is no second gate to add.
+    // See docs/architecture.md -> "Measuring cover pop-in".
+    function _coverTrace(): void {
+        root._trace(arguments);
+    }
+
+    function _trace(args: var): void {
         const parts = [];
-        for (let i = 0; i < arguments.length; i++)
-            parts.push(String(arguments[i]));
+        for (let i = 0; i < args.length; i++)
+            parts.push(String(args[i]));
         console.debug(parts.join(" "));
     }
 
@@ -204,12 +237,13 @@ ApplicationWindow {
             root.applyCrtPreviewScale(root._crtPreviewEffectiveScale);
     }
     onFrameSwapped: {
-        if (root._firstFrameSeen)
-            return;
-        root._firstFrameSeen = true;
-        root._statusIconsEnabled = true;
-        root._headerMediaActivityEnabled = true;
-        root._startupTrace("startup/qml firstFrameSwapped", "statusIconsEnabled=" + root._statusIconsEnabled, "mediaActivityEnabled=" + root._headerMediaActivityEnabled);
+        root.framePresented();
+        if (!root._firstFrameSeen) {
+            root._firstFrameSeen = true;
+            root._statusIconsEnabled = true;
+            root._headerMediaActivityEnabled = true;
+            root._startupTrace("startup/qml firstFrameSwapped", "statusIconsEnabled=" + root._statusIconsEnabled, "mediaActivityEnabled=" + root._headerMediaActivityEnabled);
+        }
     }
 
     // When the window crosses to a different screen (e.g. dev drags
@@ -237,10 +271,63 @@ ApplicationWindow {
             root.applyCrtPreviewScale(fitScale);
     }
 
+    // Help-bar glyphs. "auto" defers the family to the connected controller
+    // (via the MiSTer input report, projected by Browse.ControllerReport);
+    // a manual pick pins the family. Confirm/cancel face glyphs always
+    // follow the live report regardless of which family is active -- which
+    // physical button accepts is a fact about the connected controller
+    // (Main's own OK/Cancel swap included), not an aesthetic choice, so a
+    // manually-pinned art style must not silently show the wrong button.
+    readonly property bool _autoButtonLayout: Browse.Settings.current_button_layout === "auto"
+    readonly property string _effectiveButtonLayout: root._autoButtonLayout ? Browse.ControllerReport.glyph_layout : Browse.Settings.current_button_layout
+    // Whether the keyboard is the *live* active input source, per the
+    // MiSTer input report -- deliberately read straight off
+    // Browse.ControllerReport.glyph_layout, not _effectiveButtonLayout, so a
+    // manual "Style E" pin (Settings lists it alongside A-D) doesn't get
+    // treated as keyboard input just because a controller player likes its
+    // look. Enter/Escape are fixed keys, so "Swap controller confirm/cancel"
+    // (Settings > Controls & Input) never applies while a real keyboard is
+    // active -- see Main.qml's `_swapConfirmCancelAction`, which uses this
+    // same property to guard the action-dispatch side of the same swap.
+    readonly property bool _keyboardActive: Browse.ControllerReport.glyph_layout === "style_e"
+    readonly property bool _swapConfirmCancel: Browse.Settings.current_swap_confirm_cancel && !root._keyboardActive
+    // "Swap controller options/view" -- same idea as confirm/cancel above,
+    // but for ButtonX/ButtonY. Unlike confirm/cancel, Main_MiSTer never
+    // reverse-maps these, so with the swap off they're always the fixed
+    // FaceNorth/FaceWest position -- this setting exists purely to
+    // compensate for a controller whose own X/Y mapping is backwards. Same
+    // keyboard exemption as confirm/cancel (Tab/Space are fixed keys); see
+    // Main.qml's `_swapOptionsViewAction`.
+    readonly property bool _swapOptionsView: Browse.Settings.current_swap_options_view && !root._keyboardActive
+
     Binding {
         target: Resources
         property: "buttonLayout"
-        value: Browse.Settings.current_button_layout
+        value: root._effectiveButtonLayout
+    }
+
+    Binding {
+        target: Resources
+        property: "confirmButton"
+        value: root._swapConfirmCancel ? Browse.ControllerReport.cancel_button : Browse.ControllerReport.accept_button
+    }
+
+    Binding {
+        target: Resources
+        property: "cancelButton"
+        value: root._swapConfirmCancel ? Browse.ControllerReport.accept_button : Browse.ControllerReport.cancel_button
+    }
+
+    Binding {
+        target: Resources
+        property: "optionsButton"
+        value: root._swapOptionsView ? "FaceWest" : "FaceNorth"
+    }
+
+    Binding {
+        target: Resources
+        property: "viewButton"
+        value: root._swapOptionsView ? "FaceNorth" : "FaceWest"
     }
 
     Binding {
@@ -262,15 +349,27 @@ ApplicationWindow {
     }
 
     Binding {
-        target: Motion
-        property: "crtNativePath"
-        value: root.crtNativePath
+        target: Theme
+        property: "bitmapType"
+        value: root.bitmapType
+    }
+
+    Binding {
+        target: Sizing
+        property: "bitmapType"
+        value: root.bitmapType
     }
 
     Binding {
         target: Sizing
         property: "swapPercentageAxes"
         value: root._sceneRotated
+    }
+
+    Binding {
+        target: Sizing
+        property: "interfaceProfile"
+        value: root.effectiveInterfaceProfile
     }
 
     // Screen plumbing exposed for Main.qml's orchestration. Anything
@@ -281,6 +380,7 @@ ApplicationWindow {
     property var systemsScreen: systemsScreenLoader.item
     property var gamesScreen: gamesScreenLoader.item
     property var favoritesScreen: favoritesScreenLoader.item
+    property var favoriteSystemsScreen: favoriteSystemsScreenLoader.item
     property var recentsScreen: recentsScreenLoader.item
     property var updateScreen: updateScreenLoader.item
     property var settingsScreen: settingsScreenLoader.item
@@ -297,7 +397,7 @@ ApplicationWindow {
     property var qrCodeModal: qrCodeModalLoader.item
     property var commercialNoticeModal: commercialNoticeModalLoader.item
     property var coreVersionModal: coreVersionModalLoader.item
-    property var firstRunIndexModal: firstRunIndexModalLoader.item
+    property var actionErrorModal: actionErrorModalLoader.item
     property var gameInfoModal: gameInfoModalLoader.item
     property var logUploadModal: logUploadModalLoader.item
     property var quitConfirmModal: quitConfirmModalLoader.item
@@ -305,6 +405,11 @@ ApplicationWindow {
     property var listPickerModal: listPickerModalLoader.item
     property var letterJumpModal: letterJumpModalLoader.item
     property var crtCalibrationModal: crtCalibrationModalLoader.item
+    property var scrapeSetupModal: scrapeSetupModalLoader.item
+    property var indexSetupModal: indexSetupModalLoader.item
+    // The help bar's resolved rows, for tests that assert which surface
+    // the bar is describing (it branches on the modal flags above).
+    readonly property var helpEntries: instructionsBar.helpEntries
     property alias headerBar: headerBar
     property alias screensaverOverlay: screensaverOverlay
     // Exposed so Main.qml binds Sizing.screenWidth/Height to the
@@ -317,9 +422,22 @@ ApplicationWindow {
     property bool qrCodeModalVisible: false
     property bool commercialNoticeModalVisible: false
     property bool coreVersionModalVisible: false
-    property bool firstRunIndexModalVisible: false
+    property bool actionErrorModalVisible: false
+    property string actionErrorKey: ""
+    property string actionErrorTitle: ""
+    property string actionErrorBody: ""
+    property string actionErrorButtonLabel: qsTr("OK")
+    property bool randomFailedModalVisible: false
     property bool gameInfoModalVisible: false
+    // QR modal wording, set by Main.qml before opening. The shared
+    // Browse.QrCode singleton is a single slot, so the payload and the
+    // copy describing it are always set together at the call site.
+    property string qrCodeModalTitle: ""
+    property string qrCodeModalInstruction: ""
+    property string qrCodeModalUrlText: ""
     property bool logUploadModalVisible: false
+    property bool scrapeSetupModalVisible: false
+    property bool indexSetupModalVisible: false
     property bool quitConfirmModalVisible: false
     property bool listPickerModalVisible: false
     property bool settingNeedsRestartModalVisible: false
@@ -340,6 +458,10 @@ ApplicationWindow {
     property string listPickerFieldId: ""
     property bool contextMenuVisible: false
     property rect contextMenuAnchor: Qt.rect(0, 0, 0, 0)
+    // Corner radius of the anchored tile/row, for ContextMenu's rounded
+    // scrim hole. 0 keeps the square hole (e.g. hub_favorites' action
+    // tile, which isn't yet known to be a PressableSurface).
+    property int contextMenuAnchorRadius: 0
     // Owner-aware. Written by Main.qml at openContextMenu time; each entry
     // is `{ id: string, label: string }`. The router switches on `id`, not
     // position, so adding/removing entries can't silently re-map actions.
@@ -363,6 +485,15 @@ ApplicationWindow {
     readonly property int loadingIndicatorDelayMs: 300
     readonly property int minimumLoadingVisibleMs: 200
     property bool transitionCueVisible: false
+    // Games uses same progressive reveal for screen entry and in-screen folder
+    // replacement: model/card frame first, raster covers from following frame.
+    property bool gamesCoverRevealReady: true
+    // Folder navigation timing spans user input through model readiness and
+    // first presentation. Main.qml owns lifecycle; GamesScreen supplies input
+    // timestamp before synchronous state persistence.
+    property double gamesNavigationInputAt: 0
+    property double gamesNavigationModelReadyAt: 0
+    property string gamesNavigationAction: ""
 
     // Cold-launch boot gate. Non-Hub restores stay behind BootOverlay /
     // startupRestoreCurtain until the target can paint; Hub restores take the
@@ -386,47 +517,61 @@ ApplicationWindow {
 
     readonly property string favoritesScreenState: root.activeScreen !== root.screenFavorites ? "" : ((Browse.FavoritesModel.loading || root.catalogStillBooting) ? "loading" : ((Browse.FavoritesModel.error_message ?? "") !== "" ? "error" : (Browse.FavoritesModel.count === 0 ? "empty" : "ready")))
 
+    readonly property string favoriteSystemsScreenState: root.activeScreen !== root.screenFavoriteSystems ? "" : ((Browse.FavoriteSystemsModel.loading || root.catalogStillBooting) ? "loading" : ((Browse.FavoriteSystemsModel.error_message ?? "") !== "" ? "error" : (Browse.FavoriteSystemsModel.count === 0 ? "empty" : "ready")))
+
     readonly property string hubScreenState: (Browse.CategoriesModel.error_message ?? "") !== "" ? "error" : (Browse.CategoriesModel.count === 0 ? "empty" : "ready")
 
     readonly property string recentsScreenState: root.activeScreen !== root.screenRecents ? "" : ((Browse.RecentsModel.loading || root.catalogStillBooting) ? "loading" : ((Browse.RecentsModel.error_message ?? "") !== "" ? "error" : (Browse.RecentsModel.count === 0 ? "empty" : "ready")))
     readonly property string displayOrientation: Browse.Settings.current_orientation
     readonly property bool _sceneRotated: root.displayOrientation === "cw" || root.displayOrientation === "ccw"
-    readonly property bool _browseListLayout: Browse.Settings.current_browse_layout === "list"
-    readonly property bool _browseTateListLayout: root._browseListLayout && root.displayOrientation !== "horizontal"
+    // Round 10: split into per-family properties -- Systems/FavoriteSystems
+    // follow the systems layout preference, Games/Favorites/Recents follow
+    // the games one. `_browseViewId` below already branches on screen
+    // family for exactly this reason; only the boolean it reads needed to
+    // stop being shared.
+    readonly property bool _systemsBrowseListLayout: Browse.Settings.current_systems_browse_layout === "list"
+    readonly property bool _gamesBrowseListLayout: Browse.Settings.current_games_browse_layout === "list"
+    readonly property bool _systemsBrowseTateListLayout: root._systemsBrowseListLayout && root.displayOrientation !== "horizontal"
+    readonly property bool _gamesBrowseTateListLayout: root._gamesBrowseListLayout && root.displayOrientation !== "horizontal"
     readonly property string _browseViewId: {
-        if (root.activeScreen === root.screenSystems)
-            return root._browseListLayout ? (root._browseTateListLayout ? "systemsListTate" : "systemsList") : "systemsGrid";
+        if (root.activeScreen === root.screenSystems || root.activeScreen === root.screenFavoriteSystems)
+            return root._systemsBrowseListLayout ? (root._systemsBrowseTateListLayout ? "systemsListTate" : "systemsList") : "systemsGrid";
         if (root.activeScreen === root.screenGames || root.activeScreen === root.screenFavorites || root.activeScreen === root.screenRecents)
-            return root._browseListLayout ? (root._browseTateListLayout ? "gamesListTate" : "gamesList") : "gamesGrid";
+            return root._gamesBrowseListLayout ? (root._gamesBrowseTateListLayout ? "gamesListTate" : "gamesList") : "gamesGrid";
         return "gamesGrid";
     }
     readonly property string _browseThemeId: BrowseLayouts.currentThemeId
     readonly property var _browseViewProfile: BrowseLayouts.themeProfile(root._browseThemeId, root._browseViewId)
-    readonly property string _crtGamesHeaderTitle: {
+    // Same resolution as GamesScreen's own `_systemDisplayName` -- see the
+    // comment there for why the category-scoped `index_for_system_id` lookup
+    // this used to do disagreed with the Systems grid, and why the two `void`
+    // reads are load-bearing.
+    readonly property string _gamesHeaderTitle: {
         if (root.activeScreen !== root.screenGames)
             return "";
         const sid = Browse.GamesModel.current_system_id;
         if (sid === "")
             return "";
-        const idx = Browse.SystemsModel.index_for_system_id(sid);
-        return idx >= 0 ? Browse.SystemsModel.system_name_at(idx) : sid;
+        void Browse.SystemsModel.count;
+        void Browse.Settings.current_region;
+        const resolved = Browse.SystemsModel.system_name_for_id(sid);
+        return resolved !== "" ? resolved : sid;
     }
     readonly property string browseHeaderTitle: {
-        if (!root.crtNativePath)
+        if (!root._browseViewProfile || !root._browseViewProfile.header || !root._browseViewProfile.header.titleInHeader)
             return "";
-        if (Browse.Settings.current_browse_layout === "list")
-            return "";
+        if (root.activeScreen === root.screenSettings)
+            return settingsScreenLoader.item ? settingsScreenLoader.item.pageTitle : qsTr("Settings");
         if (root.activeScreen === root.screenSystems)
             return CategoryIds.displayName(Browse.SystemsModel.current_category);
         if (root.activeScreen === root.screenGames)
-            return root._crtGamesHeaderTitle;
+            return root._gamesHeaderTitle;
         if (root.activeScreen === root.screenFavorites)
             return qsTr("Favorites");
+        if (root.activeScreen === root.screenFavoriteSystems)
+            return qsTr("Favorites");
         if (root.activeScreen === root.screenRecents)
-            return qsTr("Recently Played");
-        return "";
-    }
-    readonly property string browseHeaderProgressText: {
+            return qsTr("Recently played");
         return "";
     }
 
@@ -434,8 +579,11 @@ ApplicationWindow {
     signal closeQrCodeRequested
     signal closeCommercialNoticeRequested
     signal closeCoreVersionRequested
-    signal closeFirstRunIndexRequested
+    signal actionErrorAccepted
+    signal closeRandomFailedRequested
     signal closeLogUploadRequested
+    signal closeScrapeSetupRequested
+    signal closeIndexSetupRequested
     signal closeQuitConfirmRequested
     signal quitConfirmAccepted
     signal listPickerAccepted(string fieldId, string selectedId)
@@ -554,55 +702,13 @@ ApplicationWindow {
                 color: Theme.bgDeep
             }
 
-            // Faint circuit-trace texture, tiled across the whole window. The
-            // PNG is pre-rendered from resources/images/bg-circuit.svg at the
-            // source pattern's native 304×304 size, with white at ~8 % alpha
-            // baked into the pixmap so QtSvg isn't needed at runtime. Sits
-            // between bgDeep and the rest of the tree so logos, captions, and
-            // selection cards stay fully legible. `Image.Tile` is software-
-            // rendered, so this is MiSTer-safe; `cache: true` keeps the
-            // pixmap in QPixmapCache after first decode.
-            Image {
-                id: backgroundTexture
-
-                anchors.fill: parent
-                // Full bleed past the safe-area inset, same as bgDeep.
-                anchors.margins: -Math.max(root._crtInsetW, root._crtInsetH)
-                source: "qrc:/qt/qml/Zaparoo/App/resources/images/bg-circuit.png"
-                fillMode: Image.Tile
-                cache: true
-                smooth: false        // 1:1 tile — filtering would just blur the lines
-                // Synchronous so the first frame paints with the texture instead
-                // of flashing the bare bgDeep underneath. One small PNG decode
-                // at startup is cheap.
-                asynchronous: false
-
-                property double _startupTraceLoadStartedAt: 0
-
-                onStatusChanged: {
-                    if (!root._startupTraceActive && !root._firstFrameSeen)
-                        return;
-                    if (status === Image.Loading) {
-                        backgroundTexture._startupTraceLoadStartedAt = Date.now();
-                        root._startupTrace("startup/qml resource load start", "coverKey=background/bg-circuit", "source=" + source);
-                    } else if (status === Image.Ready) {
-                        const durMs = backgroundTexture._startupTraceLoadStartedAt > 0 ? Math.max(0, Date.now() - backgroundTexture._startupTraceLoadStartedAt) : 0;
-                        root._startupTrace("startup/qml resource load ready", "coverKey=background/bg-circuit", "source=" + source, "dur_ms=" + durMs, "tileWidth=" + sourceSize.width, "tileHeight=" + sourceSize.height);
-                        backgroundTexture._startupTraceLoadStartedAt = 0;
-                    } else if (status === Image.Error) {
-                        const durMs = backgroundTexture._startupTraceLoadStartedAt > 0 ? Math.max(0, Date.now() - backgroundTexture._startupTraceLoadStartedAt) : 0;
-                        root._startupTrace("startup/qml resource load error", "coverKey=background/bg-circuit", "source=" + source, "dur_ms=" + durMs);
-                        backgroundTexture._startupTraceLoadStartedAt = 0;
-                    }
-                }
-            }
-
-            // ── Top header (logo + status row + status pill) ───────────────────────────
+            // ── Top header (logo + status row + status line) ───────────────────────────
 
             // Single component owning the brand mark, host status icons +
-            // clock, and Core status pill. Height is fixed (Sizing.headerHeight)
-            // so the pill's slot stays reserved when idle and the logo always
-            // matches the stacked rows. Screens clear `Sizing.headerBottom`.
+            // clock, and the Core/task status line. Height is fixed
+            // (Sizing.headerHeight) so the status line's slot stays reserved
+            // when idle and the logo always matches the stacked rows.
+            // Screens clear `Sizing.headerBottom`.
             HeaderBar {
                 id: headerBar
 
@@ -612,7 +718,6 @@ ApplicationWindow {
                 anchors.topMargin: Sizing.headerTopMargin
                 layoutProfile: root._browseViewProfile
                 browseTitle: root.browseHeaderTitle
-                browseProgressText: root.browseHeaderProgressText
                 statusIconsEnabled: root._statusIconsEnabled
                 mediaActivityEnabled: root._headerMediaActivityEnabled
                 z: 200
@@ -638,8 +743,9 @@ ApplicationWindow {
             //
             // Transition feedback is a delayed static LoadingIndicator, not
             // an animated screen effect. Quick swaps cut directly; slower
-            // model fills hide source content only after the loading cue is
-            // visible, avoiding both spinner flashes and pre-feedback freezes.
+            // model fills hide source rows/grids only after the loading cue is
+            // visible. Bottom selection context and help stay frozen until the
+            // destination cut so the source screen does not dismantle itself.
             //
             // The wrapper `Item` stays for grouping clarity; with no fade
             // machinery it carries no buffered state. Model bindings stay
@@ -672,10 +778,12 @@ ApplicationWindow {
                     anchors.fill: parent
                     active: root.systemsScreenRequested
                     visible: status === Loader.Ready && root.activeScreen === root.screenSystems
+                    onLoaded: console.debug("responsiveness systems screen mounted")
                     sourceComponent: Component {
                         SystemsScreen {
                             anchors.fill: parent
                             transitioning: root.transitionCueVisible
+                            preparingTransition: root.pendingTransition === "systems"
                             active: root.activeScreen === root.screenSystems
                             optimisticLoading: root.activeScreen === root.screenSystems && root.catalogStillBooting
                         }
@@ -692,7 +800,8 @@ ApplicationWindow {
                             anchors.fill: parent
                             transitioning: root.transitionCueVisible
                             active: root.activeScreen === root.screenGames
-                            optimisticLoading: root.activeScreen === root.screenGames && root.catalogStillBooting
+                            coverRevealReady: root.gamesCoverRevealReady
+                            optimisticLoading: root.activeScreen === root.screenGames && (root.catalogStillBooting || root.gamesSelectionRestorePending)
                         }
                     }
                 }
@@ -707,6 +816,21 @@ ApplicationWindow {
                             anchors.fill: parent
                             transitioning: root.transitionCueVisible
                             optimisticLoading: root.activeScreen === root.screenFavorites && root.catalogStillBooting
+                            selectedSystemId: root.favoritesSystemId
+                        }
+                    }
+                }
+
+                Loader {
+                    id: favoriteSystemsScreenLoader
+                    anchors.fill: parent
+                    active: root.favoriteSystemsScreenRequested
+                    visible: status === Loader.Ready && root.activeScreen === root.screenFavoriteSystems
+                    sourceComponent: Component {
+                        FavoriteSystemsScreen {
+                            anchors.fill: parent
+                            transitioning: root.transitionCueVisible
+                            optimisticLoading: root.activeScreen === root.screenFavoriteSystems && root.catalogStillBooting
                         }
                     }
                 }
@@ -857,13 +981,23 @@ ApplicationWindow {
             Loader {
                 id: cardWriteModalLoader
                 anchors.fill: parent
+                // Round 10: every modal Loader here needs an explicit z
+                // above HeaderBar's 200 -- `z` only resolves among
+                // siblings, and each modal's own root Item declares a
+                // z (300, or 310 for commercialNotice) that only applies
+                // INSIDE its own Loader, never reaching `scene`'s actual
+                // stacking context where it sits alongside HeaderBar.
+                // Without this, a modal tall enough to reach into the
+                // header band (GameInfoModal was the only one that did)
+                // paints BEHIND the logo instead of in front of it.
+                z: 300
                 active: root.cardWriteModalRequested
                 sourceComponent: Component {
                     Modal {
                         open: root.cardWriteModalVisible
                         kind: "transient"
                         failed: root.cardWriteFailed
-                        title: root.cardWriteFailed ? qsTr("Writing failed") : qsTr("Put a writable card near the reader")
+                        title: root.cardWriteFailed ? qsTr("Writing failed") : qsTr("Hold a writable token near the reader")
                         onCancelRequested: root.cancelCardWriteRequested()
                     }
                 }
@@ -874,6 +1008,7 @@ ApplicationWindow {
             Loader {
                 id: settingNeedsRestartModalLoader
                 anchors.fill: parent
+                z: 300
                 active: root.settingNeedsRestartModalRequested
                 sourceComponent: Component {
                     Modal {
@@ -893,6 +1028,7 @@ ApplicationWindow {
             Loader {
                 id: coreVersionModalLoader
                 anchors.fill: parent
+                z: 300
                 active: root.coreVersionModalRequested
                 sourceComponent: Component {
                     Modal {
@@ -909,13 +1045,15 @@ ApplicationWindow {
             Loader {
                 id: contextMenuLoader
                 anchors.fill: parent
+                z: 300
                 active: root.contextMenuRequested
                 sourceComponent: Component {
                     ContextMenu {
                         open: root.contextMenuVisible
                         anchorRect: root.contextMenuAnchor
+                        anchorRadius: root.contextMenuAnchorRadius
                         entries: root.contextMenuEntries
-                        bottomUnsafeHeight: BrowseLayouts.numberValue(root._browseViewProfile, "footer.bottomUnsafeHeight", Sizing.pctH(6) + Sizing.pctH(2))
+                        bottomUnsafeHeight: Math.max(BrowseLayouts.numberValue(root._browseViewProfile, "footer.bottomUnsafeHeight", Sizing.helpBarClearance), Sizing.helpBarClearance)
                         onAccepted: id => root.contextMenuAccepted(id)
                         onCloseRequested: root.contextMenuCloseRequested()
                     }
@@ -925,11 +1063,15 @@ ApplicationWindow {
             Loader {
                 id: qrCodeModalLoader
                 anchors.fill: parent
+                z: 300
                 active: root.qrCodeModalRequested
                 sourceComponent: Component {
                     QrCodeModal {
                         anchors.fill: parent
                         open: root.qrCodeModalVisible
+                        title: root.qrCodeModalTitle
+                        instructionText: root.qrCodeModalInstruction
+                        urlText: root.qrCodeModalUrlText
                     }
                 }
             }
@@ -937,6 +1079,7 @@ ApplicationWindow {
             Loader {
                 id: gameInfoModalLoader
                 anchors.fill: parent
+                z: 300
                 active: root.gameInfoModalRequested
                 sourceComponent: Component {
                     GameInfoModal {
@@ -947,30 +1090,16 @@ ApplicationWindow {
                 }
             }
 
-            // First-run mediadb index modal. Pushed by Main.qml the first time
-            // we connect to a Core whose mediadb is empty. Blocks the screens
-            // beneath until the initial scan completes (or the user cancels and
-            // tries again).
-            Loader {
-                id: firstRunIndexModalLoader
-                anchors.fill: parent
-                active: root.firstRunIndexModalRequested
-                sourceComponent: Component {
-                    FirstRunIndexModal {
-                        anchors.fill: parent
-                        open: root.firstRunIndexModalVisible
-                        onCloseRequested: root.closeFirstRunIndexRequested()
-                    }
-                }
-            }
-
             // Commercial-use notice. Sits above every other modal (z: 310) so
             // it always paints first on a fresh install. Once the user acks,
             // `Browse.Notice.commercial_ack` flips to true on disk and the
-            // modal stays closed for the rest of this install.
+            // modal stays closed for the rest of this install. The Loader
+            // itself (not just CommercialNoticeModal's own internal z)
+            // needs to carry this -- see cardWriteModalLoader's comment.
             Loader {
                 id: commercialNoticeModalLoader
                 anchors.fill: parent
+                z: 310
                 active: root.commercialNoticeModalRequested
                 sourceComponent: Component {
                     CommercialNoticeModal {
@@ -987,12 +1116,50 @@ ApplicationWindow {
             Loader {
                 id: logUploadModalLoader
                 anchors.fill: parent
+                z: 300
                 active: root.logUploadModalRequested
                 sourceComponent: Component {
                     LogUploadModal {
                         anchors.fill: parent
                         open: root.logUploadModalVisible
                         onCloseRequested: root.closeLogUploadRequested()
+                    }
+                }
+            }
+
+            // Scrape setup modal (round 10). Pushed by Main.qml when the
+            // user triggers the "Update metadata" action in Settings while
+            // idle. Scraper choice + re-scrape toggle + Start, replacing
+            // the hardcoded "gamelist.xml" every other scrape call site
+            // still uses.
+            Loader {
+                id: scrapeSetupModalLoader
+                anchors.fill: parent
+                z: 300
+                active: root.scrapeSetupModalRequested
+                sourceComponent: Component {
+                    ScrapeSetupModal {
+                        anchors.fill: parent
+                        open: root.scrapeSetupModalVisible
+                        onCloseRequested: root.closeScrapeSetupRequested()
+                    }
+                }
+            }
+
+            // Update-media-database setup modal (round 11) — same shell as
+            // ScrapeSetupModal, trimmed to Systems + Start. Pushed by
+            // Main.qml when the user triggers "Update media database" in
+            // Settings while idle.
+            Loader {
+                id: indexSetupModalLoader
+                anchors.fill: parent
+                z: 300
+                active: root.indexSetupModalRequested
+                sourceComponent: Component {
+                    IndexSetupModal {
+                        anchors.fill: parent
+                        open: root.indexSetupModalVisible
+                        onCloseRequested: root.closeIndexSetupRequested()
                     }
                 }
             }
@@ -1004,6 +1171,7 @@ ApplicationWindow {
             Loader {
                 id: quitConfirmModalLoader
                 anchors.fill: parent
+                z: 300
                 active: root.quitConfirmModalRequested
                 sourceComponent: Component {
                     Modal {
@@ -1018,13 +1186,14 @@ ApplicationWindow {
             }
 
             // List-picker modal. Settings opens this for picker rows
-            // (Language, Browsing layout, Button style, Resolution). The
+            // (Language, Browsing layout, Button style, and others). The
             // fieldId round-trip lets the router dispatch the chosen id
             // back to the matching Browse.Settings.set_X without parsing
             // the title.
             Loader {
                 id: listPickerModalLoader
                 anchors.fill: parent
+                z: 300
                 active: root.listPickerModalRequested
                 sourceComponent: Component {
                     ListPickerModal {
@@ -1033,6 +1202,10 @@ ApplicationWindow {
                         title: root.listPickerTitle
                         entries: root.listPickerEntries
                         initialId: root.listPickerInitialId
+                        // A launcher save in flight locks the picker on
+                        // its "Saving…" row -- see ListPickerModal's own
+                        // `locked` doc comment.
+                        locked: root.listPickerFieldId === "system_launcher_pending" || root.listPickerFieldId === "game_launcher_pending"
                         onAccepted: id => root.listPickerAccepted(root.listPickerFieldId, id)
                         onCloseRequested: root.listPickerCloseRequested(root.listPickerFieldId)
                     }
@@ -1044,6 +1217,7 @@ ApplicationWindow {
             Loader {
                 id: letterJumpModalLoader
                 anchors.fill: parent
+                z: 300
                 active: root.letterJumpModalRequested
                 sourceComponent: Component {
                     LetterJumpModal {
@@ -1053,6 +1227,30 @@ ApplicationWindow {
                         loading: root.letterJumpLoading
                         onAccepted: offset => root.letterJumpAccepted(offset)
                         onCloseRequested: root.letterJumpCloseRequested()
+                    }
+                }
+            }
+
+            // Action-error alert. The one surface allowed above another
+            // modal (docs/style.md -> "Modal depth"): an async failure can
+            // land while a dialog or the context menu is open, so this
+            // Loader is declared after every other modal Loader and sits
+            // above the commercial notice's 310. Sibling `z` ties resolve by
+            // declaration order, which used to leave this alert painted
+            // behind the dialog it interrupted while owning input.
+            Loader {
+                id: actionErrorModalLoader
+                anchors.fill: parent
+                z: 320
+                active: root.actionErrorModalRequested
+                sourceComponent: Component {
+                    Modal {
+                        open: root.actionErrorModalVisible
+                        kind: "action_error"
+                        title: root.actionErrorTitle
+                        body: root.actionErrorBody
+                        buttonLabel: root.actionErrorButtonLabel
+                        onAccepted: root.actionErrorAccepted()
                     }
                 }
             }
@@ -1114,16 +1312,39 @@ ApplicationWindow {
                 anchors.left: parent.left
                 anchors.right: parent.right
                 anchors.bottom: parent.bottom
-                height: Sizing.pctH(6)
+                height: Sizing.helpBarHeight
                 // Sits above every modal scrim (modals max out at z: 310 — see
                 // CommercialNoticeModal) so the help cue stays readable while a
                 // dialog is open. The bar's content is already modal-aware
                 // (helpEntries above branches per topModal), so the cue under
                 // the modal is the right one.
                 z: 400
-                color: Theme.bgBar
-                border.width: Sizing.stroke(1)
-                border.color: Theme.borderSubtle
+                // No fill or border of its own — a bordered box reads as a
+                // floating bar. The two children below paint a background and
+                // a single top keyline instead, both full-bleed past the CRT
+                // safe-area inset (the same trick the scene background uses
+                // at L582-588) so on the CRT path the fill reaches the true
+                // framebuffer edge and covers the whole bottom overscan band,
+                // with the keyline landing exactly on the safe-area line.
+                color: "transparent"
+
+                Rectangle {
+                    anchors.fill: parent
+                    anchors.leftMargin: -Math.max(root._crtInsetW, root._crtInsetH)
+                    anchors.rightMargin: -Math.max(root._crtInsetW, root._crtInsetH)
+                    anchors.bottomMargin: -Math.max(root._crtInsetW, root._crtInsetH)
+                    color: Theme.bgBar
+                }
+
+                Rectangle {
+                    anchors.left: parent.left
+                    anchors.leftMargin: -Math.max(root._crtInsetW, root._crtInsetH)
+                    anchors.right: parent.right
+                    anchors.rightMargin: -Math.max(root._crtInsetW, root._crtInsetH)
+                    anchors.top: parent.top
+                    height: Sizing.stroke(1)
+                    color: Theme.borderSubtle
+                }
 
                 // (activeScreen, screenState, modal?)-keyed lookup. The modal
                 // row wins outright; otherwise per-screen entries vary with
@@ -1136,11 +1357,11 @@ ApplicationWindow {
                 // Retry entry rather than promising behavior the screen
                 // doesn't implement.
                 //
-                // During a forward transition (`pendingTransition !== ""`)
-                // the router's input gate swallows every press — including
-                // cancel — so the bar blanks rather than advertising
-                // buttons that won't respond. Modals still win outright;
-                // they run on top of the input gate.
+                // During a forward transition the router's input gate still
+                // swallows presses, but the source help row stays frozen until
+                // the destination cut. Removing it early made the otherwise
+                // static source screen look as though it was dismantling while
+                // work continued. Modals still win outright.
                 //
                 // Each entry resolves to a button glyph (Dpad / ButtonA /
                 // ButtonB / ButtonX) plus a label. The button names are routed
@@ -1149,9 +1370,26 @@ ApplicationWindow {
                 // Label vocabulary is deliberately minimal: D-pad is always
                 // "Move"; A is "Open" for both drill-downs and launches (the
                 // tile and screen title carry the specific identity, so the
-                // verb doesn't need to repeat that); B is "Back" except on
-                // the Hub root, where it's "Quit". Sentence case throughout.
+                // verb doesn't need to repeat that); B is "Back" on every
+                // screen with one to go back to. The Hub root has none — B
+                // is unbound there, and Quit lives in the View menu instead
+                // (see HubScreen.qml's routing comment). Sentence case
+                // throughout.
                 readonly property var helpEntries: {
+                    // First: an alert can sit above any other modal and it
+                    // owns input while it does, so its row must win over the
+                    // surface underneath it.
+                    if (root.actionErrorModalVisible)
+                        return [
+                            {
+                                button: "ButtonA",
+                                label: root.actionErrorButtonLabel
+                            },
+                            {
+                                button: "ButtonB",
+                                label: qsTr("Close")
+                            }
+                        ];
                     if (root.contextMenuVisible)
                         return [
                             {
@@ -1163,11 +1401,7 @@ ApplicationWindow {
                                 label: qsTr("Select")
                             },
                             {
-                                button: "ButtonB",
-                                label: qsTr("Close")
-                            },
-                            {
-                                button: "ButtonX",
+                                buttons: ["ButtonB", "ButtonX"],
                                 label: qsTr("Close")
                             }
                         ];
@@ -1178,13 +1412,40 @@ ApplicationWindow {
                                 label: qsTr("Cancel")
                             }
                         ];
-                    if (root.qrCodeModalVisible || root.gameInfoModalVisible)
+                    if (root.qrCodeModalVisible)
                         return [
                             {
                                 button: "ButtonB",
                                 label: qsTr("Close")
                             }
                         ];
+                    // The details modal used to share the QR modal's row
+                    // above, which advertises Close and nothing else -- but
+                    // GameInfoModal's `handleAction` scrolls on up/down and
+                    // page keys AND cycles the artwork on left/right, so
+                    // the carousel was undiscoverable and the scroll only
+                    // findable by trying it. Both cues are conditional on
+                    // there being somewhere to go, matching how the modal's
+                    // own chevrons and nav arrows gate themselves.
+                    if (root.gameInfoModalVisible) {
+                        const details = root.gameInfoModal;
+                        const entries = [];
+                        if (details !== null && details._scrollable)
+                            entries.push({
+                                button: "Dpad",
+                                label: qsTr("Scroll")
+                            });
+                        if (Browse.GameInfo.image_count > 1)
+                            entries.push({
+                                buttons: ["DpadLeft", "DpadRight"],
+                                label: qsTr("Image")
+                            });
+                        entries.push({
+                            button: "ButtonB",
+                            label: qsTr("Close")
+                        });
+                        return entries;
+                    }
                     if (root.logUploadModalVisible) {
                         const phase = root.logUploadModal ? root.logUploadModal.phase : "";
                         const success = root.logUploadModal ? root.logUploadModal._stateSuccess : "__none__";
@@ -1226,11 +1487,22 @@ ApplicationWindow {
                                 label: qsTr("I understand")
                             }
                         ];
-                    if (root.coreVersionModalVisible)
+                    if (root.coreVersionModalVisible || root.randomFailedModalVisible)
                         return [
                             {
                                 button: "ButtonA",
                                 label: qsTr("OK")
+                            }
+                        ];
+                    // A launcher save in flight locks the list picker on its
+                    // "Saving…" row (Main.qml's modalListPicker routing
+                    // branch swallows every action while this is true) --
+                    // Move/Select/Cancel would be false advertising, so swap
+                    // them for the same status text the row itself shows.
+                    if (root.listPickerModalVisible && (root.listPickerFieldId === "system_launcher_pending" || root.listPickerFieldId === "game_launcher_pending"))
+                        return [
+                            {
+                                label: qsTr("Saving…")
                             }
                         ];
                     if (root.quitConfirmModalVisible || root.settingNeedsRestartModalVisible || root.listPickerModalVisible || root.letterJumpModalVisible)
@@ -1248,6 +1520,29 @@ ApplicationWindow {
                                 label: qsTr("Cancel")
                             }
                         ];
+                    // The setup modals' own row: A is the focused row's verb
+                    // ("Select" on their in-panel picker page, see
+                    // ScrapeSetupModal.qml's `page`), B backs out one level
+                    // (page -> form -> closed). Without this branch the bar
+                    // fell through to the Settings screen underneath and
+                    // advertised its rows while a modal owned input.
+                    if (root.indexSetupModalVisible || root.scrapeSetupModalVisible) {
+                        const setupModal = root.indexSetupModalVisible ? root.indexSetupModal : root.scrapeSetupModal;
+                        return [
+                            {
+                                button: "Dpad",
+                                label: qsTr("Move")
+                            },
+                            {
+                                button: "ButtonA",
+                                label: setupModal !== null ? setupModal.focusedActionLabel : qsTr("Select")
+                            },
+                            {
+                                button: "ButtonB",
+                                label: qsTr("Back")
+                            }
+                        ];
+                    }
                     if (root.crtCalibrationModalVisible)
                         return [
                             {
@@ -1259,58 +1554,87 @@ ApplicationWindow {
                                 label: qsTr("Save")
                             }
                         ];
-                    if ((!root.bootComplete && !root.coreIndependentStartupVisible) || root.startupRestoreCurtainVisible)
+                    // The Hub's optimistic pre-connect paint (see
+                    // MainLayout's `optimisticHubVisible`) renders real
+                    // tiles with a fully-computed help bar below — Options/
+                    // View availability doesn't depend on Core being
+                    // connected, so falling through to the Hub branch below
+                    // one frame earlier than `bootComplete` is exposing an
+                    // existing computation, not inventing new logic. Without
+                    // this carve-out the optimistic Hub painted with zero
+                    // button hints, which was the biggest "looks unfinished"
+                    // cue on cold start.
+                    if ((!root.bootComplete && !root.coreIndependentStartupVisible && !root.optimisticHubVisible) || root.startupRestoreCurtainVisible)
                         return [];
-                    if (root.firstRunIndexModalVisible) {
-                        const phase = root.firstRunIndexModal ? root.firstRunIndexModal.phase : "";
-                        if (phase === "running")
+                    if (root.activeScreen === root.screenHub) {
+                        // Mid-reorder (Options -> Move armed): D-pad
+                        // repositions the held tile, Accept places it,
+                        // Cancel reverts — nothing else is live (see
+                        // HubScreen.qml's `_handleMoveAction`).
+                        if (root.hubScreen !== null && root.hubScreen.moveArmed)
                             return [
+                                {
+                                    button: "Dpad",
+                                    label: qsTr("Reposition")
+                                },
+                                {
+                                    button: "ButtonA",
+                                    label: qsTr("Place")
+                                },
                                 {
                                     button: "ButtonB",
                                     label: qsTr("Cancel")
                                 }
                             ];
-                        if (phase === "completed")
-                            return [];
-                        return [
-                            {
-                                button: "ButtonA",
-                                label: qsTr("Start")
-                            }
-                        ];
-                    }
-                    if (root.pendingTransition !== "" || root.transitionCueVisible)
-                        return [];
-                    if (root.activeScreen === root.screenHub) {
                         // Hub always has the actions row (Recently Played /
-                        // Settings), so Move/Open/Quit applies even when the
+                        // Settings), so Move/Open applies even when the
                         // categories row is empty (0 systems indexed) — the
                         // help bar must reflect that the actions row is
-                        // navigable, otherwise the user reads "Quit only"
-                        // and misses the Settings tile entirely. Category
-                        // tiles also expose an options menu for hide/scrape
-                        // actions; placeholders do not.
-                        // `hide_exit` kiosk flag: drop the ButtonB/Quit
-                        // entry so the help bar doesn't advertise a
-                        // no-op button. HubScreen.qml gates the actual
-                        // cancel handler on the same flag — keep the
-                        // two in sync.
-                        const categoryOptionsAvailable = root.hubScreen !== null && root.hubScreen.currentRow === 0 && Browse.CategoriesModel.count > 0;
+                        // navigable, otherwise the user reads "nothing to
+                        // move to" and misses the Settings tile entirely.
+                        // Options (Move/Hide-or-Delete, plus category- or
+                        // Favorites-specific entries) is available on any
+                        // tile with a real `Browse.HubLayout` backing —
+                        // placeholders and any `kind === "empty"` entry
+                        // (a real persisted blank, or the trailing empty
+                        // slot — see HubScreen.qml's `_blankEntry`) do not.
+                        // A blank is an implementation detail, not
+                        // something the user picks up and moves on its own.
+                        // ArtCade-fork: the ButtonB/Quit entry appended
+                        // below is gated on the `hide_exit` kiosk flag so
+                        // the help bar doesn't advertise a no-op button.
+                        // HubScreen.qml gates the actual cancel handler
+                        // on the same flag — keep the two in sync.
+                        const hubEntry = root.hubScreen !== null ? root.hubScreen.items[root.hubScreen.currentIndex] : null;
+                        const onCategoryTile = hubEntry != null && hubEntry.kind === "category";
+                        const categoryErrorFocused = onCategoryTile && (Browse.CategoriesModel.error_message ?? "") !== "";
+                        const hubOptionsAvailable = hubEntry != null && hubEntry.kind !== "empty" && !categoryErrorFocused && hubEntry.hubIndex >= 0;
+                        // D-pad moves; L/R shoulders page-jump, shown only
+                        // when there's a second page to jump to — same
+                        // "Move" fold Systems already uses.
+                        const hubPages = root.hubScreen !== null ? root.hubScreen.pageCount : 1;
                         let row = [
                             {
-                                button: "Dpad",
+                                buttons: hubPages > 1 ? ["ButtonL", "ButtonR", "Dpad"] : ["Dpad"],
                                 label: qsTr("Move")
                             },
                             {
                                 button: "ButtonA",
-                                label: qsTr("Open")
+                                label: categoryErrorFocused ? qsTr("Retry") : qsTr("Open")
                             }
                         ];
-                        if (categoryOptionsAvailable)
+                        if (hubOptionsAvailable)
                             row.push({
                                 button: "ButtonX",
                                 label: qsTr("Options")
                             });
+                        row.push({
+                            button: "ButtonY",
+                            label: qsTr("View")
+                        });
+                        // ArtCade-fork: kiosk `hide_exit` flag drops the
+                        // ButtonB/Quit affordance. HubScreen.qml gates the
+                        // matching cancel handler on the same setting.
                         if (!Browse.Settings.current_hide_exit)
                             row.push({
                                 button: "ButtonB",
@@ -1363,13 +1687,14 @@ ApplicationWindow {
                             }
                         ];
                     }
-                    if (root.activeScreen === root.screenFavorites || root.activeScreen === root.screenRecents) {
+                    if (root.activeScreen === root.screenFavorites || root.activeScreen === root.screenFavoriteSystems || root.activeScreen === root.screenRecents) {
                         const isFavorites = root.activeScreen === root.screenFavorites;
-                        const state = isFavorites ? root.favoritesScreenState : root.recentsScreenState;
-                        const screen = isFavorites ? root.favoritesScreen : root.recentsScreen;
+                        const isFavoriteSystems = root.activeScreen === root.screenFavoriteSystems;
+                        const state = isFavorites ? root.favoritesScreenState : (isFavoriteSystems ? root.favoriteSystemsScreenState : root.recentsScreenState);
+                        const screen = isFavorites ? root.favoritesScreen : (isFavoriteSystems ? root.favoriteSystemsScreen : root.recentsScreen);
                         if (screen === null)
                             return [];
-                        const grid = isFavorites ? screen.favoritesGrid : screen.recentsGrid;
+                        const grid = isFavorites ? screen.favoritesGrid : (isFavoriteSystems ? screen.favoriteSystemsGrid : screen.recentsGrid);
                         if (state === "loading")
                             return [
                                 {
@@ -1392,10 +1717,15 @@ ApplicationWindow {
                                 button: "ButtonA",
                                 label: qsTr("Open")
                             });
-                            if (isFavorites)
+                            if (isFavorites || isFavoriteSystems)
                                 row.push({
                                     button: "ButtonX",
                                     label: qsTr("Options")
+                                });
+                            if (isFavorites || isFavoriteSystems)
+                                row.push({
+                                    button: "ButtonY",
+                                    label: qsTr("View")
                                 });
                             row.push({
                                 button: "ButtonB",
@@ -1403,16 +1733,23 @@ ApplicationWindow {
                             });
                             return row;
                         }
-                        return [
+                        // Empty/error.
+                        const fallback = [
                             {
                                 button: "ButtonA",
                                 label: qsTr("Retry")
-                            },
-                            {
-                                button: "ButtonB",
-                                label: qsTr("Back")
                             }
                         ];
+                        if (isFavorites || isFavoriteSystems)
+                            fallback.push({
+                                button: "ButtonY",
+                                label: qsTr("View")
+                            });
+                        fallback.push({
+                            button: "ButtonB",
+                            label: qsTr("Back")
+                        });
+                        return fallback;
                     }
                     if (root.activeScreen === root.screenSettings) {
                         if (root.settingsScreen === null)
@@ -1510,11 +1847,16 @@ ApplicationWindow {
                             return [];
                         const pages = root.gamesScreen.gamesGrid.pageCount;
                         // Mirror the real context-menu gate used by
-                        // GamesScreen/openContextMenu. Singleton folders
-                        // with media identity can launch and be favorited,
-                        // so they should advertise Options too.
+                        // GamesScreen's `contextMenuEnabledAt`. Singleton
+                        // folders with media identity can launch and be
+                        // favorited; a plain directory and a filesystem `root`
+                        // both get the folder shortcut action. All of them
+                        // open a menu, so all of them must advertise Options
+                        // -- this used to test media capability alone, which
+                        // left every folder row with a working Options button
+                        // and no cue saying so. Keep the two in step.
                         const idx = root.gamesScreen.gamesGrid.currentIndex;
-                        const mediaCapable = Browse.GamesModel.is_media_capable_at(idx);
+                        const hasContextMenu = Browse.GamesModel.is_media_capable_at(idx) || Browse.GamesModel.entry_type_at(idx) === "directory" || Browse.GamesModel.is_filesystem_root_at(idx);
                         // D-pad moves; L/R shoulders page-jump. Folded into one
                         // "Move" cue; shoulder glyphs appear only with a second
                         // page.
@@ -1528,7 +1870,7 @@ ApplicationWindow {
                             button: "ButtonA",
                             label: qsTr("Open")
                         });
-                        if (mediaCapable)
+                        if (hasContextMenu)
                             row.push({
                                 button: "ButtonX",
                                 label: qsTr("Options")
@@ -1546,65 +1888,33 @@ ApplicationWindow {
                         });
                         return row;
                     }
-                    return [
+                    const fallback = [
                         {
                             button: "ButtonA",
                             label: qsTr("Retry")
-                        },
-                        {
-                            button: "ButtonB",
-                            label: qsTr("Back")
                         }
                     ];
+                    // Empty favorites-only scope must keep View reachable so
+                    // user can clear filter. Errors retain Retry/Back only.
+                    if (root.gamesScreenState === "empty")
+                        fallback.push({
+                            button: "ButtonY",
+                            label: qsTr("View")
+                        });
+                    fallback.push({
+                        button: "ButtonB",
+                        label: qsTr("Back")
+                    });
+                    return fallback;
                 }
 
-                Row {
-                    x: Sizing.center(parent.width, width)
-                    y: Sizing.center(parent.height, height)
-                    spacing: Sizing.pctW(2)
-
-                    Repeater {
-                        model: instructionsBar.helpEntries
-
-                        // Each entry is either a single-glyph cue
-                        // (`{ button: "ButtonA", label: "Open" }`) or a
-                        // multi-glyph cue rendered as N icons in a row before
-                        // the label (`{ buttons: ["DpadLeft", "DpadRight"],
-                        // label: "Change" }`). The Settings screen uses the
-                        // multi-glyph form to disambiguate "left/right cycles
-                        // the value" from "up/down moves between fields".
-                        delegate: Row {
-                            id: helpEntry
-                            required property var modelData
-                            spacing: Sizing.pctW(0.6)
-
-                            readonly property var buttonList: helpEntry.modelData.buttons !== undefined ? helpEntry.modelData.buttons : [helpEntry.modelData.button]
-
-                            Repeater {
-                                model: helpEntry.buttonList
-                                delegate: Image {
-                                    required property string modelData
-                                    anchors.verticalCenter: helpEntry.verticalCenter
-                                    height: Sizing.pctH(4)
-                                    width: height
-                                    fillMode: Image.PreserveAspectFit
-                                    sourceSize.height: Sizing.px(height)
-                                    sourceSize.width: Sizing.px(width)
-                                    source: Resources.iconUrl(modelData)
-                                    smooth: true
-                                }
-                            }
-
-                            Text {
-                                anchors.verticalCenter: helpEntry.verticalCenter
-                                text: helpEntry.modelData.label
-                                font.family: Theme.fontUi
-                                font.pixelSize: Sizing.fontSize(2.6)
-                                color: Theme.textPrimary
-                                renderType: Text.NativeRendering
-                            }
-                        }
-                    }
+                // At 240p the available safe width can be narrower than the
+                // full control vocabulary. Wrap between atomic glyph+label
+                // groups so no label becomes detached from its button.
+                HelpRow {
+                    objectName: "instructionsHelpRow"
+                    anchors.fill: parent
+                    entries: instructionsBar.helpEntries
                 }
             }
 

@@ -21,8 +21,13 @@ MediaListScreen {
 
     mediaModel: Browse.RecentsModel
     mediaState: Browse.RecentsState
-    screenTitle: qsTr("Recently Played")
+    screenTitle: qsTr("Recently played")
     emptyText: qsTr("Nothing played yet")
     loadingText: qsTr("Loading recently played…")
     detailShowTitle: false
+    gridHasMorePages: Browse.RecentsModel.has_next_page
+    gridLoadingMore: Browse.RecentsModel.loading_more
+    paginationTotalKnown: false
+    gridTileTopLabelProvider: index => Browse.RecentsModel.system_name_at(index)
+    retryAction: () => Browse.RecentsModel.retry()
 }

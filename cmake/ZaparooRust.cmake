@@ -12,9 +12,9 @@ include_guard(GLOBAL)
 
 include(FetchContent)
 
-# Tell Corrosion the Rust target triple explicitly for cross-builds. CMake's
-# processor names are not enough for Rust target selection: MiSTer is ARMv7
-# hard-float, while ARM64 builds use aarch64 Linux.
+# Tell Corrosion the Rust target triple explicitly for cross-builds. CMake's processor names are not
+# enough for Rust target selection: MiSTer is ARMv7 hard-float, while ARM64 builds use aarch64
+# Linux.
 if(CMAKE_CROSSCOMPILING AND NOT Rust_CARGO_TARGET)
     if(CMAKE_SYSTEM_PROCESSOR STREQUAL "arm")
         set(Rust_CARGO_TARGET
@@ -48,8 +48,8 @@ if(ZAPAROO_WITH_UPDATE)
 endif()
 
 # ── Environment variables for cxx_qt_build's build.rs ─────────────────────── QMAKE: cxx_qt_build
-# (via qt-build-utils) uses qmake to locate Qt headers and libraries. For static
-# cross-builds the system qmake points to x86_64 Qt; override with the target qmake.
+# (via qt-build-utils) uses qmake to locate Qt headers and libraries. For static cross-builds the
+# system qmake points to x86_64 Qt; override with the target qmake.
 get_target_property(_rs_qt6_core_type Qt6::Core TYPE)
 if(_rs_qt6_core_type STREQUAL "STATIC_LIBRARY")
     if(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
@@ -83,21 +83,47 @@ endif()
 qt_add_executable(
     frontend
     "${CMAKE_SOURCE_DIR}/src/app/main.cpp"
+    "${CMAKE_SOURCE_DIR}/src/app/frontend_arguments.h"
+    "${CMAKE_SOURCE_DIR}/src/app/frontend_arguments.cpp"
     "${CMAKE_SOURCE_DIR}/src/app/media_image_provider.h"
     "${CMAKE_SOURCE_DIR}/src/app/media_image_provider.cpp"
+    "${CMAKE_SOURCE_DIR}/src/app/baked_icon_atlas.h"
+    "${CMAKE_SOURCE_DIR}/src/app/baked_icon_atlas.cpp"
+    "${CMAKE_SOURCE_DIR}/src/app/baked_icon_format.h"
+    "${CMAKE_SOURCE_DIR}/src/app/svg_render_size.h"
+    "${CMAKE_SOURCE_DIR}/src/app/tint_lut.h"
+    "${CMAKE_SOURCE_DIR}/src/app/tint_lut.cpp"
     "${CMAKE_SOURCE_DIR}/src/app/tinted_svg_image_provider.h"
     "${CMAKE_SOURCE_DIR}/src/app/tinted_svg_image_provider.cpp"
     "${CMAKE_SOURCE_DIR}/src/app/custom_image_provider.h"
     "${CMAKE_SOURCE_DIR}/src/app/custom_image_provider.cpp"
     "${CMAKE_SOURCE_DIR}/src/app/native_video_writer.h"
     "${CMAKE_SOURCE_DIR}/src/app/native_video_writer.cpp"
+    "${CMAKE_SOURCE_DIR}/src/app/fb_mmap_fallback.h"
+    "${CMAKE_SOURCE_DIR}/src/app/fb_mmap_fallback.cpp"
 )
 target_include_directories(
     frontend
     PRIVATE "${CMAKE_SOURCE_DIR}/src/app"
 )
 
-target_compile_definitions(frontend PRIVATE ZAPAROO_VERSION="${CMAKE_PROJECT_VERSION}")
+target_compile_definitions(
+    frontend PRIVATE ZAPAROO_VERSION="${CMAKE_PROJECT_VERSION}"
+                     ZAPAROO_DEFAULT_INTERFACE_PROFILE="${ZAPAROO_DEFAULT_INTERFACE_PROFILE}"
+)
+
+# MiSTer kernels from 6.18 carry a MiSTer_fb driver with no `fb_mmap`, so mmap() on /dev/fb0 returns
+# ENODEV and Qt's linuxfb plugin aborts startup with "no screens available". --wrap redirects the
+# mmap/munmap calls made from Qt's statically linked linuxfb plugin (and from
+# native_video_writer.cpp) into src/app/fb_mmap_fallback.cpp, which reaches the same physical pixels
+# through /dev/mem. This keeps the workaround in our tree instead of forking Qt. glibc is linked
+# dynamically, so libc's internal mmap calls resolve inside libc.so and are not affected. See
+# src/app/fb_mmap_fallback.h.
+if(ZAPAROO_EMBEDDED)
+    target_link_options(
+        frontend PRIVATE "LINKER:--wrap=mmap" "LINKER:--wrap=mmap64" "LINKER:--wrap=munmap"
+    )
+endif()
 
 # For static Qt (ARM32): define QT_STATIC so main.cpp's #ifdef fires. Qt itself defines this in its
 # headers, but the compiler may not see it before the first #include unless we make it explicit here
@@ -122,7 +148,9 @@ if(_rs_qt6_core_type STREQUAL "STATIC_LIBRARY")
     endforeach()
     include("${_rs_qt_prefix}/lib/cmake/Qt6Gui/Qt6QLinuxFbIntegrationPluginConfig.cmake" OPTIONAL)
     include("${_rs_qt_prefix}/lib/cmake/Qt6Gui/Qt6QEglFSIntegrationPluginConfig.cmake" OPTIONAL)
-    include("${_rs_qt_prefix}/lib/cmake/Qt6Gui/Qt6QEglFSKmsGbmIntegrationPluginConfig.cmake" OPTIONAL)
+    include("${_rs_qt_prefix}/lib/cmake/Qt6Gui/Qt6QEglFSKmsGbmIntegrationPluginConfig.cmake"
+            OPTIONAL
+    )
     include("${_rs_qt_prefix}/lib/cmake/Qt6Gui/Qt6QWebpPluginConfig.cmake" OPTIONAL)
     foreach(_rs_qml_plugin IN ITEMS qtquickcontrols2plugin qtquickcontrols2basicstyleplugin
                                     qtquickcontrols2implplugin qtquicktemplates2plugin quickwindow

@@ -33,6 +33,14 @@ TestCase {
         showTitle: true
     }
 
+    // Reference metrics for the tag row height floor test below — same
+    // font/size the pane's own internal `tagFontMetrics` measures.
+    FontMetrics {
+        id: tagRowRefMetrics
+        font.family: Theme.fontUi
+        font.pixelSize: Sizing.fontSmall
+    }
+
     // Auxiliary panes created per-test to exercise non-default property
     // combinations. Stored here so cleanup() can destroy them even when a
     // compare() or verify() aborts the test function early.
@@ -63,8 +71,10 @@ TestCase {
         pane.loadingDelayMs = 150;
         pane.title = "";
         pane.detailTags = "";
+        pane.identity = "";
         pane.coverKey = "";
         pane._lastGoodCoverSource = "";
+        pane._lastGoodCoverIdentity = "";
         wait(1);
     }
 
@@ -87,25 +97,82 @@ TestCase {
         pane.loading = true;
         wait(1);
 
-        // Title and tags are visible immediately.
+        // Title and tags are visible immediately, even while the cover and
+        // pane are both still resolving.
         verify(findChild(pane, "detailTitleText").visible);
         verify(findChild(pane, "detailTagTable").visible);
-        // The loading placeholder is gated behind the grace delay so it does
-        // not flash on fast warm navigations. Wait for the timer to fire.
-        tryVerify(() => findChild(pane, "detailPlaceholderIcon").visible, pane.loadingDelayMs + 50);
+        // Round 11: no hourglass overlay -- the cover slot stays blank while
+        // pending, matching how the grid tiles handle the same sentinel
+        // (Tile.qml's `_coverPending` swallows it to an empty source).
+        verify(!findChild(pane, "detailPlaceholderIcon").visible, "no hourglass placeholder while a cover fetch is pending");
         verify(!findChild(pane, "detailLoadingIndicator").visible);
     }
 
-    function test_loading_icon_survives_media_image_handoff(): void {
-        // The icons/Loading placeholder is gated behind the grace delay; wait
-        // for it rather than checking immediately after the key flip.
+    // Round 11: the `icons/Loading` sentinel must never paint a placeholder
+    // -- the slot stays blank (coverHold showing any prior art, or nothing)
+    // for as long as the fetch is pending, with no grace-delay flip to an
+    // hourglass the way round 9/10 handled it.
+    function test_cover_stays_blank_while_pending_no_hourglass(): void {
         pane.coverKey = "icons/Loading";
-        tryVerify(() => findChild(pane, "detailPlaceholderIcon").visible, pane.loadingDelayMs + 50);
+        wait(pane.loadingDelayMs + 50);
+        verify(!findChild(pane, "detailPlaceholderIcon").visible, "no hourglass while pending, even after a delay");
+        verify(!findChild(pane, "detailCoverImage").visible, "no cover image paints from an empty pending source");
+    }
 
-        // Transitioning to a media-image key also gates the placeholder behind
-        // the grace delay (every busy signal is now debounced uniformly).
+    function test_held_cover_never_crosses_focused_identity(): void {
+        pane.identity = "Arcade\nold-game";
+        pane._lastGoodCoverIdentity = pane.identity;
+        pane._lastGoodCoverSource = "image://media-image/old-cover";
+        pane.coverKey = "icons/Loading";
+        compare(String(pane._coverSource), "image://media-image/old-cover");
+
+        pane.identity = "Arcade\nnew-game";
+        compare(String(pane._coverSource), "", "new row must not inherit previous row cover");
+        verify(!findChild(pane, "detailCoverHold").visible, "previous row cover hold must stop immediately");
+        verify(!findChild(pane, "detailPlaceholderIcon").visible, "pending row remains blank rather than flashing stale art or placeholder");
+    }
+
+    function test_current_held_cover_is_not_overpainted_by_placeholder(): void {
+        pane.identity = "Arcade\nsame-game";
+        pane._lastGoodCoverIdentity = pane.identity;
+        pane._lastGoodCoverSource = "image://media-image/held-cover";
+        pane.coverKey = "";
+        verify(!findChild(pane, "detailPlaceholderIcon").visible);
+    }
+
+    // A cover key that resolves to a terminal decode error (the harness's
+    // media-image provider isn't registered, so any media-image/ key errors
+    // out) is a *confirmed* no-cover state, distinct from merely pending --
+    // the File chip is correct to show here, same as before round 11.
+    function test_confirmed_decode_error_still_shows_the_file_chip(): void {
         pane.coverKey = "media-image/not-ready";
-        tryVerify(() => findChild(pane, "detailPlaceholderIcon").visible, pane.loadingDelayMs + 50);
+        tryVerify(() => findChild(pane, "detailPlaceholderIcon").visible, 500);
+    }
+
+    // Round 11: only fetched raster art (media-image/, custom-image/) is
+    // eligible for the reveal fade -- bundled glyphs and system logos show
+    // instantly. This is a pure classification check, independent of any
+    // Image reaching Ready.
+    function test_cover_is_real_art_classifies_media_and_custom_image_keys(): void {
+        pane.coverKey = "media-image/SNES/some-game";
+        compare(pane._coverIsRealArt, true);
+        pane.coverKey = "custom-image/some/path.png";
+        compare(pane._coverIsRealArt, true);
+        pane.coverKey = "icons/File";
+        compare(pane._coverIsRealArt, false);
+        pane.coverKey = "systems/NES";
+        compare(pane._coverIsRealArt, false);
+    }
+
+    // A bundled glyph key resolves through the registered tinted-svg
+    // provider (see this file's header comment), so it can reach Ready in
+    // this harness -- confirms `updateReveal()` leaves non-real-art at full
+    // opacity rather than fading it in.
+    function test_bundled_glyph_cover_shows_instantly_without_a_fade(): void {
+        pane.coverKey = "icons/File";
+        const img = findChild(pane, "detailCoverImage");
+        tryVerify(() => img.status === Image.Ready, 500);
+        compare(img.revealOpacity, 1, "bundled glyph keys must not fade -- they show at full opacity as soon as ready");
     }
 
     // Regression: when showTitle is false (Games / Recents / Favorites), the
@@ -246,5 +313,75 @@ TestCase {
         pane.coverKey = "icons/File";
         wait(1);
         verify(img.source.toString().indexOf("image://media-image/") < 0, "source should no longer be a media-image URL after switching to chip key");
+    }
+
+    // Round 11 regression (reported as "the g in Rating gets cut off"): a
+    // tag row's height must never be shorter than the label/value text's
+    // own real line height, or the last row's descender crosses
+    // `detailTagTable`'s clip boundary. The per-theme profile value alone
+    // used to win even when it was a few px short of Noto Sans's real
+    // ascent+descent at this font size.
+    function test_tag_row_height_covers_the_full_font_metrics_line(): void {
+        verify(pane._tagRowHeight >= Math.ceil(tagRowRefMetrics.height), "row height (" + pane._tagRowHeight + ") must cover the text's real line height (" + Math.ceil(tagRowRefMetrics.height) + ")");
+    }
+
+    // Round 11 regression: `_compactMetadataHeight` used to be a flat 38%
+    // of the pane's *total* height, disconnected from how much space the
+    // metadata slot actually has below the cover -- letting `detailBody`
+    // size itself taller than `metadataSlot` (its own clipping ancestor)
+    // and clipping the last row. It must now never exceed the slot's real
+    // height, however many rows are asked to fit.
+    function test_compact_metadata_height_never_exceeds_the_real_metadata_slot(): void {
+        pane.title = "";
+        pane.detailTags = "Year\t1990\nGenre\tAction\nPlayers\t2\nDeveloper\tX\nPublisher\tY\nRating\tE";
+        wait(1);
+        const table = findChild(pane, "detailTagTable");
+        verify(table !== null);
+        // detailTagTable -> detailBody -> metadataInner -> metadataSlot.
+        const metadataSlotHeight = table.parent.parent.parent.height;
+        verify(pane._compactMetadataHeight <= metadataSlotHeight, "compact metadata height (" + pane._compactMetadataHeight + ") must not exceed the real metadata slot (" + metadataSlotHeight + ")");
+    }
+
+    // The pane and the details modal render the same tag types, so they
+    // must resolve to the same strings. The vocabulary used to be a
+    // private ladder in this file, which is why the modal shipped its own
+    // untranslated labels for the same data.
+    function test_tag_labels_come_from_the_shared_vocabulary(): void {
+        pane.detailTags = "Year\t1994\nrelease_date\t1994-03-19\ncheevos\tyes";
+        const rows = pane._detailRows;
+        compare(rows.length, 3);
+        compare(rows[0].measureLabel, Format.metadataLabel("year"), "the legacy English label must resolve to the shared label");
+        compare(rows[1].measureLabel, Format.metadataLabel("release_date"), "the canonical type must resolve to the same label");
+        compare(rows[2].measureLabel, "Cheevos", "an unknown passthrough type still reads as a label");
+        pane.detailTags = "";
+    }
+
+    // U+009C is Qt's alternative-text separator: an eliding Text renders
+    // the short form rather than truncating the long one. Types with no
+    // abbreviation must pack nothing so they elide normally.
+    function test_short_labels_are_packed_for_narrow_columns(): void {
+        pane.detailTags = "Year\t1994\ncheevos\tyes";
+        const rows = pane._detailRows;
+        compare(rows[0].label, Format.metadataLabel("year") + "\u009C" + Format.metadataShortLabel("year"));
+        verify(Format.metadataShortLabel("year").length > 0);
+        compare(rows[1].label, "Cheevos", "a type with no short form packs nothing");
+        compare(Format.metadataShortLabel("cheevos"), "");
+        pane.detailTags = "";
+    }
+
+    // The column used to be a session-long `Math.max` with no reset, so
+    // browsing a systems table (which carries `Manufacturer`) and then a
+    // media table left the narrower table paying for a width no label in
+    // it needs. It now tracks the rows actually on screen.
+    function test_label_column_shrinks_back_for_a_narrower_table(): void {
+        pane.detailTags = "Manufacturer\tNintendo";
+        const wide = pane._labelColumnNaturalWidth;
+        verify(wide > 0);
+        pane.detailTags = "Yr\t1994";
+        const narrow = pane._labelColumnNaturalWidth;
+        verify(narrow > 0);
+        verify(narrow < wide, "a narrower label set (" + narrow + ") must not keep the wider column (" + wide + ")");
+        pane.detailTags = "";
+        compare(pane._labelColumnNaturalWidth, 0, "no rows means no column");
     }
 }

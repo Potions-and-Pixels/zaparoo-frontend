@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Wizzo Pty Ltd and the Zaparoo Project contributors.
 // SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0
 
+use crate::models::action_error::report_action_error;
 use crate::models::{global_handle, global_store};
 use cxx_qt::{CxxQtType, Initialize, Threading};
 use cxx_qt_lib::QString;
@@ -111,6 +112,7 @@ impl ffi::AlternateVersions {
                     }
                     Err(message) => {
                         warn!("discover alternate versions failed: {message}");
+                        report_action_error("alternate_discovery", "");
                         model.as_mut().rust_mut().entries.clear();
                         model.as_mut().rust_mut().count = 0;
                         model.as_mut().count_changed();
@@ -151,6 +153,7 @@ impl ffi::AlternateVersions {
         global_handle().spawn(async move {
             if let Err(e) = store.run_mutation::<RunMutation>(RunParams { text }).await {
                 warn!("run failed for alternate {name}: {}", e.message);
+                report_action_error("launch", name);
             }
         });
     }
@@ -265,6 +268,7 @@ fn media_item_from_browse_entry(entry: BrowseEntry) -> MediaItem {
         },
         tags: entry.tags,
         disambiguating_tags: entry.disambiguating_tags,
+        has_cover: entry.has_cover,
         relative_path: if entry.relative_path.is_empty() {
             None
         } else {
