@@ -405,6 +405,13 @@ Item {
     function _resolveCategoryEntry(id: string): var {
         const canonicalId = CategoryIds.canonicalize(id);
         const unconfirmed = Browse.CategoriesModel.loaded && Browse.CategoriesModel.index_for_category(canonicalId) < 0;
+        // ArtCade fork: on kiosk cabinets (`hide_empty_categories`) a saved
+        // category tile whose category has no indexed media is dropped
+        // rather than shown as "Not available" — e.g. Arcade after the
+        // operator turns the stock arcade library off. Same null-return
+        // as the `hide_*` action gates in `_resolveActionEntry`.
+        if (unconfirmed && Browse.Settings.current_hide_empty_categories)
+            return null;
         return {
             kind: "category",
             id: canonicalId,
