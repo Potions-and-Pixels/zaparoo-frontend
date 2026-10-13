@@ -2264,7 +2264,7 @@ TestCase {
         main.creditsScreen.handleAction("accept");
         tryCompare(main, "activeScreen", main.screenAbout);
         tryVerify(function () { return main.aboutScreen !== null; }, 5000, "aboutScreen Loader must materialize even on first entry from Credits");
-        tryCompare(main.aboutScreen, "openedFromCredits", true, "deferred-set path must land the flag on the Loader-materialized item");
+        tryCompare(main.aboutScreen, "openedFromCredits", true, 5000, "deferred-set path must land the flag on the Loader-materialized item");
         // Reset for downstream tests -- cleanup() doesn't touch this
         // property and a leaked `true` would misroute a subsequent
         // Settings → About cancel.
@@ -2291,7 +2291,86 @@ TestCase {
         // resets the flag before navigating.
         main.aboutScreen.handleAction("cancel");
         tryCompare(main, "activeScreen", main.screenCredits);
-        tryCompare(main.aboutScreen, "openedFromCredits", false, "flag must reset so a subsequent Settings → About cancel returns to Settings");
+        tryCompare(main.aboutScreen, "openedFromCredits", false, 5000, "flag must reset so a subsequent Settings → About cancel returns to Settings");
+    }
+
+    // ── ArtCade fork: Hub → Credits tile routing ─────────────────────────
+    // The 2026-09-30 upstream v1.3.1 merge collapsed the Hub's per-action
+    // signals into `requestAccept(kind, id, system)`; HubScreen kept
+    // resolving a Credits tile, but Main.qml's router never got an
+    // `id === "credits"` arm (and Rust never seeded the action), so the
+    // Credits menu became unreachable from the Hub. These lock both halves.
+    function test_hub_accept_signal_for_credits_routes_to_credits(): void {
+        main.hubScreen.requestAccept("action", "credits", "");
+        tryCompare(main, "activeScreen", main.screenCredits);
+        tryVerify(function () {
+            return main.creditsScreen !== null;
+        }, 5000);
+    }
+
+    function test_hub_enter_on_credits_tile_opens_credits(): void {
+        const idx = main.hubScreen._actionIndexForId("credits");
+        compare(main.hubScreen.items[idx].id, "credits", "the Hub must carry a Credits tile to focus");
+        compare(main.hubScreen.items[idx].coverKey, "icons/Heart", "Credits draws the filled Heart (Favorites keeps HeartOutline)");
+        main.hubScreen.currentIndex = idx;
+        main.handleKey(Qt.Key_Return);
+        tryCompare(main, "activeScreen", main.screenCredits);
+    }
+
+    function test_credits_tile_survives_every_hub_kiosk_gate(): void {
+        // Credits has no hide_* gate and no live-data gate -- it is the
+        // only kiosk path to About/License once hide_settings is on.
+        const entry = main.hubScreen._resolveActionEntry("credits");
+        verify(entry !== null, "Credits must always resolve to a tile");
+        compare(entry.name, qsTr("Credits"));
+        compare(entry.disabled, false);
+        compare(main.hubScreen._builtInActionIds[main.hubScreen._builtInActionIds.length - 1], "credits", "credits seeds last, mirroring hub_layout::BUILT_IN_ACTIONS");
+        compare(main.hubScreen._builtInActionIds[0], "resume", "resume must stay first (seed-order contract)");
+    }
+
+    function test_credits_cancel_returns_to_hub(): void {
+        main._navigateToCredits();
+        tryCompare(main, "activeScreen", main.screenCredits);
+        tryVerify(function () {
+            return main.creditsScreen !== null;
+        }, 5000);
+        main.handleAction("cancel");
+        tryCompare(main, "activeScreen", main.screenHub);
+    }
+
+    // Every Credits row opens its own screen, and Back from that screen
+    // lands on Credits again -- driven through Main.qml's real dispatcher
+    // (`handleAction`) so the per-screen routing table is covered too.
+    function test_every_credits_row_opens_its_screen_and_back_returns_to_credits(): void {
+        const targets = {
+            sponsors: [main.screenSponsors, "sponsorsScreen"],
+            devTeam: [main.screenDevTeam, "devTeamScreen"],
+            artists: [main.screenArtists, "artistsScreen"],
+            potionsPixels: [main.screenPotionsPixels, "potionsPixelsScreen"],
+            aboutLicense: [main.screenAbout, "aboutScreen"]
+        };
+        main._navigateToCredits();
+        tryVerify(function () {
+            return main.creditsScreen !== null;
+        }, 5000);
+        const menu = main.creditsScreen._menu;
+        verify(menu.length > 0);
+        for (let i = 0; i < menu.length; ++i) {
+            const target = targets[menu[i].action];
+            verify(target !== undefined, "test bug: no expected screen for Credits row " + menu[i].action);
+            main._navigateToCredits();
+            tryCompare(main, "activeScreen", main.screenCredits);
+            main.creditsScreen.focusIndex = i;
+            main.handleAction("accept");
+            tryCompare(main, "activeScreen", target[0], 5000, menu[i].action + " must open its screen");
+            tryVerify(function () {
+                return main[target[1]] !== null;
+            }, 5000);
+            main.handleAction("cancel");
+            tryCompare(main, "activeScreen", main.screenCredits, 5000, "Back from " + menu[i].action + " must return to Credits");
+        }
+        if (main.aboutScreen !== null)
+            compare(main.aboutScreen.openedFromCredits, false, "returning to Credits resets the About dual-source flag");
     }
 
     // ── ArtCade fork: kiosk-lockdown hide_* flags are wired ──────────────

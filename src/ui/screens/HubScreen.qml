@@ -587,7 +587,9 @@ Item {
         return entry;
     }
 
-    readonly property var _builtInActionIds: ["resume", "favorites", "recents", "update", "settings"]
+    // Mirrors zaparoo_core::hub_layout::BUILT_IN_ACTIONS (incl. the
+    // ArtCade-fork `credits` tile, seeded last) -- keep the two in sync.
+    readonly property var _builtInActionIds: ["resume", "favorites", "recents", "update", "settings", "credits"]
     readonly property int _pageSize: Sizing.hubGridColumns * Sizing.hubGridRows
 
     // Pad the end of the list up to a full page, so the *last* page's

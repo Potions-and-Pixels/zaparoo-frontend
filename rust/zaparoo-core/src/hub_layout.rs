@@ -124,7 +124,24 @@ impl HubItem {
 /// decided at render time in QML from live state (Recents/internet/build
 /// flags) — the layout just records that the tile exists and where it
 /// sits; see `docs/plans/ui-geometry-refresh.md`.
-pub const BUILT_IN_ACTIONS: &[&str] = &["resume", "favorites", "recents", "update", "settings"];
+///
+/// `resume` MUST stay first: `reconcile`/`reset` seed `BUILT_IN_ACTIONS[0]`
+/// ahead of every category and the rest after them.
+///
+/// `ArtCade` fork: `credits` (Hub → Credits menu → Sponsors / Dev Team /
+/// Artists / Potions & Pixels / About-License) is a built-in action seeded
+/// LAST, so a fresh layout and a pre-existing layout migrated by
+/// `reconcile` (which appends it at the end) agree on where it lands. It
+/// carries no `hide_*` gate on the QML side — it is the only kiosk path to
+/// the About/License texts once `hide_settings` drops the Settings tile.
+pub const BUILT_IN_ACTIONS: &[&str] = &[
+    "resume",
+    "favorites",
+    "recents",
+    "update",
+    "settings",
+    "credits",
+];
 
 /// The persisted Hub layout.
 ///
@@ -185,7 +202,14 @@ impl HubLayout {
     ///   until it returns `true`.
     /// - **Already seeded**: append any detected category whose
     ///   `"category:<id>"` key isn't in `known` yet — same "lands at the
-    ///   end" rule, new items only.
+    ///   end" rule, new items only. Then append any built-in action whose
+    ///   `"action:<id>"` key isn't in `known` yet (a layout saved by a
+    ///   build that predates that action — e.g. the `ArtCade` fork's
+    ///   `credits`), recording it in `known` so it is appended exactly
+    ///   once. Like categories, an action the user removed stays in
+    ///   `known` and never comes back on its own. Runs even when
+    ///   `detected_categories` is empty: built-in actions don't depend on
+    ///   Core, and the step is additive-only.
     pub fn reconcile(
         &mut self,
         detected_categories: &[String],
@@ -225,6 +249,15 @@ impl HubLayout {
             }
             self.known.push(key);
             self.items.push(HubItem::category(id));
+            changed = true;
+        }
+        for id in BUILT_IN_ACTIONS {
+            let key = format!("action:{id}");
+            if self.known.iter().any(|k| k == &key) {
+                continue;
+            }
+            self.known.push(key);
+            self.items.push(HubItem::action(id));
             changed = true;
         }
         changed
@@ -590,7 +623,9 @@ mod tests {
         reason = "tests should fail-fast on unexpected errors"
     )]
 
-    use super::{load_hub_layout, save_hub_layout, HubItem, HubItemKind, HubLayout};
+    use super::{
+        load_hub_layout, save_hub_layout, HubItem, HubItemKind, HubLayout, BUILT_IN_ACTIONS,
+    };
     use std::io::Write;
 
     fn write_tmp(contents: &str) -> tempfile::NamedTempFile {
@@ -693,6 +728,7 @@ type = "blank"
                 "action:recents",
                 "action:update",
                 "action:settings",
+                "action:credits",
             ]
         );
         let ids: Vec<&str> = layout.items.iter().map(|i| i.id.as_str()).collect();
@@ -705,7 +741,8 @@ type = "blank"
                 "favorites",
                 "recents",
                 "update",
-                "settings"
+                "settings",
+                "credits"
             ]
         );
     }
@@ -766,11 +803,162 @@ type = "blank"
         assert!(!layout.items.iter().any(|i| i.id == "Arcade"));
     }
 
+    // ── ArtCade fork: the `credits` built-in action ─────────────────────
+
+    #[test]
+    fn built_in_actions_keep_resume_first_and_credits_last() {
+        // `reconcile`/`reset` seed `BUILT_IN_ACTIONS[0]` ahead of every
+        // category; the fork's Credits tile seeds last so a fresh seed and
+        // a migrated legacy layout agree on where it lands.
+        assert_eq!(BUILT_IN_ACTIONS.first(), Some(&"resume"));
+        assert_eq!(BUILT_IN_ACTIONS.last(), Some(&"credits"));
+    }
+
+    #[test]
+    fn reconcile_seeds_credits_into_a_fresh_layout() {
+        let mut layout = HubLayout::default();
+        assert!(layout.reconcile(&["Arcade".to_string()], &[]));
+        assert!(layout.known.contains(&"action:credits".to_string()));
+        let last = layout.items.last().expect("seeded layout has items");
+        assert_eq!(last.kind(), HubItemKind::Action);
+        assert_eq!(last.id, "credits");
+        assert_eq!(layout.visible().filter(|i| i.id == "credits").count(), 1);
+    }
+
+    /// A layout saved by a build whose `BUILT_IN_ACTIONS` had no
+    /// `credits` (upstream v1.3.1, i.e. every `ArtCade` cabinet that booted
+    /// the 2026-09-30 merge build).
+    fn legacy_layout_without_credits() -> HubLayout {
+        let mut layout = HubLayout {
+            known: vec![
+                "action:resume".to_string(),
+                "category:Arcade".to_string(),
+                "action:favorites".to_string(),
+                "action:recents".to_string(),
+                "action:update".to_string(),
+                "action:settings".to_string(),
+            ],
+            items: Vec::new(),
+        };
+        for (kind, id) in [
+            ("action", "resume"),
+            ("category", "Arcade"),
+            ("action", "favorites"),
+            ("action", "recents"),
+            ("action", "update"),
+            ("action", "settings"),
+        ] {
+            layout.items.push(if kind == "action" {
+                HubItem::action(id)
+            } else {
+                HubItem::category(id)
+            });
+        }
+        layout
+    }
+
+    #[test]
+    fn reconcile_appends_credits_to_a_legacy_layout_exactly_once() {
+        let mut layout = legacy_layout_without_credits();
+        let before: Vec<HubItem> = layout.items.clone();
+
+        assert!(layout.reconcile(&["Arcade".to_string()], &[]));
+        // Appended at the end; nothing the user arranged moves.
+        assert_eq!(layout.items.len(), before.len() + 1);
+        assert_eq!(&layout.items[..before.len()], &before[..]);
+        let last = layout.items.last().unwrap();
+        assert_eq!(last.kind(), HubItemKind::Action);
+        assert_eq!(last.id, "credits");
+        // Recorded in `known`, exactly once.
+        assert_eq!(
+            layout
+                .known
+                .iter()
+                .filter(|k| k.as_str() == "action:credits")
+                .count(),
+            1
+        );
+
+        // A second reconcile is a no-op — no duplicate tile.
+        assert!(!layout.reconcile(&["Arcade".to_string()], &[]));
+        assert_eq!(layout.items.iter().filter(|i| i.id == "credits").count(), 1);
+    }
+
+    #[test]
+    fn reconcile_migrates_credits_even_while_core_reports_zero_categories() {
+        // Built-in actions don't depend on Core; an already-seeded layout
+        // gets the tile on the first reconcile call, whatever Core said.
+        let mut layout = legacy_layout_without_credits();
+        assert!(layout.reconcile(&[], &[]));
+        assert_eq!(layout.items.last().unwrap().id, "credits");
+        // Still never seeds an UNSEEDED layout from nothing.
+        let mut fresh = HubLayout::default();
+        assert!(!fresh.reconcile(&[], &[]));
+        assert!(fresh.is_unseeded());
+    }
+
+    #[test]
+    fn reconcile_appends_credits_after_a_new_category_in_the_same_pass() {
+        let mut layout = legacy_layout_without_credits();
+        assert!(layout.reconcile(&["Arcade".to_string(), "Console".to_string()], &[]));
+        let tail: Vec<&str> = layout.items[layout.items.len() - 2..]
+            .iter()
+            .map(|i| i.id.as_str())
+            .collect();
+        assert_eq!(tail, vec!["Console", "credits"]);
+    }
+
+    #[test]
+    fn reconcile_does_not_bring_back_credits_the_user_removed() {
+        // Upstream semantics: `known` remembers it, so a removal sticks.
+        let mut layout = HubLayout::default();
+        layout.reconcile(&["Arcade".to_string()], &[]);
+        let credits_visible = layout
+            .visible()
+            .position(|i| i.id == "credits")
+            .expect("seeded credits");
+        assert!(layout.remove_visible_item(credits_visible));
+        assert!(!layout.items.iter().any(|i| i.id == "credits"));
+        assert!(layout.known.contains(&"action:credits".to_string()));
+
+        assert!(!layout.reconcile(&["Arcade".to_string()], &[]));
+        assert!(!layout.items.iter().any(|i| i.id == "credits"));
+        // ...but it stays re-addable from View -> Add item….
+        assert!(layout
+            .available_known()
+            .contains(&"action:credits".to_string()));
+        assert!(layout.add_item("action", "credits", usize::MAX));
+        assert_eq!(layout.items.iter().filter(|i| i.id == "credits").count(), 1);
+    }
+
+    #[test]
+    fn reset_reseeds_credits() {
+        let mut layout = legacy_layout_without_credits();
+        layout.reset(&["Arcade".to_string()]);
+        assert_eq!(layout.items.last().unwrap().id, "credits");
+        assert!(layout.known.contains(&"action:credits".to_string()));
+    }
+
+    #[test]
+    fn credits_round_trips_through_save_and_load() {
+        let f = write_tmp("");
+        let mut layout = legacy_layout_without_credits();
+        layout.reconcile(&["Arcade".to_string()], &[]);
+        save_hub_layout(f.path(), &layout).expect("save");
+        let reloaded = load_hub_layout(f.path());
+        assert_eq!(reloaded, layout);
+        let mut again = reloaded;
+        assert!(
+            !again.reconcile(&["Arcade".to_string()], &[]),
+            "a migrated layout must not re-migrate after a save/load cycle"
+        );
+    }
+
     #[test]
     fn place_visible_item_swaps_the_two_cells_only() {
         let mut layout = HubLayout::default();
         layout.reconcile(&["A".to_string(), "B".to_string(), "C".to_string()], &[]);
-        // resume, A, B, C, favorites, recents, update, settings
+        // resume, A, B, C, favorites, recents, update, settings, credits
         assert!(layout.place_visible_item(1, 3));
         let ids: Vec<&str> = layout.items.iter().map(|i| i.id.as_str()).collect();
         // A and C trade places; nothing else moves.
@@ -784,7 +972,8 @@ type = "blank"
                 "favorites",
                 "recents",
                 "update",
-                "settings"
+                "settings",
+                "credits"
             ]
         );
     }
@@ -832,14 +1021,14 @@ type = "blank"
             kind_raw: "blank".to_string(),
             ..HubItem::default()
         });
-        // resume, A, B, favorites, recents, update, settings, blank
-        assert!(layout.place_visible_item(1, 7));
+        // resume, A, B, favorites, recents, update, settings, credits, blank
+        assert!(layout.place_visible_item(1, 8));
         assert_eq!(
             layout.items[1].kind(),
             HubItemKind::Blank,
             "A's old cell must become a blank, not shift anything else"
         );
-        assert_eq!(layout.items[7].id, "A");
+        assert_eq!(layout.items[8].id, "A");
     }
 
     #[test]
@@ -867,7 +1056,7 @@ type = "blank"
     fn reseat_held_item_displaces_only_the_tile_currently_under_the_press() {
         let mut base = HubLayout::default();
         base.reconcile(&["A".to_string(), "B".to_string(), "C".to_string()], &[]);
-        // resume, A, B, C, favorites, recents, update, settings
+        // resume, A, B, C, favorites, recents, update, settings, credits
         let mut layout = base.clone();
         assert!(layout.reseat_held_item(&base, 1, 2));
         let ids: Vec<&str> = layout.items.iter().map(|i| i.id.as_str()).collect();
@@ -881,7 +1070,8 @@ type = "blank"
                 "favorites",
                 "recents",
                 "update",
-                "settings"
+                "settings",
+                "credits"
             ],
             "one step: A and B trade places"
         );
@@ -901,7 +1091,8 @@ type = "blank"
                 "favorites",
                 "recents",
                 "update",
-                "settings"
+                "settings",
+                "credits"
             ],
             "B must return home; only C (currently under the press) is displaced"
         );
@@ -1024,9 +1215,9 @@ type = "blank"
         let mut layout = HubLayout::default();
         layout.reconcile(&["Arcade".to_string()], &[]);
         let last = layout.items.len() - 1;
-        assert_eq!(layout.items[last].id, "settings");
+        assert_eq!(layout.items[last].id, "credits");
         assert!(layout.remove_visible_item(last));
-        assert_eq!(layout.items.last().unwrap().id, "update");
+        assert_eq!(layout.items.last().unwrap().id, "settings");
     }
 
     #[test]
@@ -1237,7 +1428,8 @@ type = "blank"
                 "favorites",
                 "recents",
                 "update",
-                "settings"
+                "settings",
+                "credits"
             ]
         );
         assert!(!layout.items.iter().any(|i| i.kind() == HubItemKind::Blank));
@@ -1249,7 +1441,8 @@ type = "blank"
                 "action:favorites",
                 "action:recents",
                 "action:update",
-                "action:settings"
+                "action:settings",
+                "action:credits"
             ]
         );
     }

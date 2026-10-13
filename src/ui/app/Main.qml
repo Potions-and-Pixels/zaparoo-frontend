@@ -1954,6 +1954,13 @@ MainLayout {
                     root._navigateToUpdate();
                 } else if (id === "settings") {
                     root._navigateToSettings();
+                } else if (id === "credits") {
+                    // ArtCade-fork: Hub -> Credits menu (Sponsors / Dev
+                    // Team / Artists / Potions & Pixels / About-License).
+                    // HubScreen emits this as requestAccept("action",
+                    // "credits", "") -- there is no dedicated Hub-side
+                    // Credits signal since the v1.3.1 layout merge.
+                    root._navigateToCredits();
                 }
                 return;
             }
@@ -2031,9 +2038,6 @@ MainLayout {
         }
         function onRequestSettingsScreen(): void {
             root._navigateToSettings();
-        }
-        function onRequestCreditsScreen(): void {
-            root._navigateToCredits();
         }
         function onRequestPageMenu(): void {
             root.openHubPageMenu();
