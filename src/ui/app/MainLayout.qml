@@ -120,6 +120,13 @@ ApplicationWindow {
     property bool devTeamScreenRequested: false
     property bool artistsScreenRequested: false
     property bool potionsPixelsScreenRequested: false
+    // ArtCade-fork kiosk flag `[settings] lock_hub` (frontend.toml) —
+    // freezes the Hub layout from the UI: no Hub View (Y) / Options (X)
+    // menus or hints, no "Add to Hub" anywhere, and every layout-mutating
+    // handler in Main.qml / HubScreen.qml no-ops. Bound (not readonly) to
+    // the CONSTANT Rust qproperty so the UI suite can flip it; nothing in
+    // the app ever writes it.
+    property bool hubLocked: Browse.Settings.current_lock_hub
     property bool cardWriteModalRequested: false
     property bool settingNeedsRestartModalRequested: false
     property bool contextMenuRequested: false
@@ -765,6 +772,7 @@ ApplicationWindow {
                     visible: root.activeScreen === root.screenHub
                     transitioning: root.transitionCueVisible
                     resumeModelEnabled: root._firstFrameSeen
+                    layoutLocked: root.hubLocked
                     onVisibleChanged: {
                         if (!visible || !root._startupTraceActive)
                             return;
@@ -1604,11 +1612,14 @@ ApplicationWindow {
                         // below is gated on the `hide_exit` kiosk flag so
                         // the help bar doesn't advertise a no-op button.
                         // HubScreen.qml gates the actual cancel handler
-                        // on the same flag — keep the two in sync.
+                        // on the same flag — keep the two in sync. Same
+                        // for `lock_hub` (`root.hubLocked`): no X/Options
+                        // and no Y/View hint while HubScreen.qml ignores
+                        // both buttons.
                         const hubEntry = root.hubScreen !== null ? root.hubScreen.items[root.hubScreen.currentIndex] : null;
                         const onCategoryTile = hubEntry != null && hubEntry.kind === "category";
                         const categoryErrorFocused = onCategoryTile && (Browse.CategoriesModel.error_message ?? "") !== "";
-                        const hubOptionsAvailable = hubEntry != null && hubEntry.kind !== "empty" && !categoryErrorFocused && hubEntry.hubIndex >= 0;
+                        const hubOptionsAvailable = !root.hubLocked && hubEntry != null && hubEntry.kind !== "empty" && !categoryErrorFocused && hubEntry.hubIndex >= 0;
                         // D-pad moves; L/R shoulders page-jump, shown only
                         // when there's a second page to jump to — same
                         // "Move" fold Systems already uses.
@@ -1628,10 +1639,11 @@ ApplicationWindow {
                                 button: "ButtonX",
                                 label: qsTr("Options")
                             });
-                        row.push({
-                            button: "ButtonY",
-                            label: qsTr("View")
-                        });
+                        if (!root.hubLocked)
+                            row.push({
+                                button: "ButtonY",
+                                label: qsTr("View")
+                            });
                         // ArtCade-fork: kiosk `hide_exit` flag drops the
                         // ButtonB/Quit affordance. HubScreen.qml gates the
                         // matching cancel handler on the same setting.

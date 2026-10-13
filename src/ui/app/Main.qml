@@ -1042,7 +1042,8 @@ MainLayout {
     // match what the tile actually shows once added (see
     // HubScreen.qml's `buildAddEntries`).
     function openHubAddMenu(): void {
-        if (root.hubScreen === null)
+        // ArtCade-fork `lock_hub`: the layout is frozen from the UI.
+        if (root.hubScreen === null || root.hubLocked)
             return;
         const entries = root.hubScreen.buildAddEntries();
         if (entries.length === 0) {
@@ -1072,6 +1073,9 @@ MainLayout {
     // categories plus the built-in actions — see
     // zaparoo_core::hub_layout::HubLayout::reset's doc comment.
     function resetHubLayout(): void {
+        // ArtCade-fork `lock_hub`: the layout is frozen from the UI.
+        if (root.hubLocked)
+            return;
         Browse.HubLayout.reset_layout(root._currentCategoryIds());
     }
 
@@ -1082,6 +1086,10 @@ MainLayout {
     // navigational shortcuts, not layout-editing actions like the two
     // entries above them, but View is the Hub's only page-scoped menu.
     function openHubPageMenu(): void {
+        // ArtCade-fork `lock_hub`: no View menu at all (HubScreen already
+        // swallows West/Y; this guards any other caller).
+        if (root.hubLocked)
+            return;
         const entries = [
             {
                 id: "hub_add",
@@ -2024,6 +2032,9 @@ MainLayout {
         // openContextMenu/buildContextMenuEntries/handleContextMenuAccepted
         // (shared by every owner) stay untouched, still index-based.
         function onRequestContextMenu(hubIndex: int, categoryId: string, anchorRect, anchorRadius: int): void {
+            // ArtCade-fork `lock_hub`: no Options menu on Hub tiles.
+            if (root.hubLocked)
+                return;
             const index = Browse.CategoriesModel.index_for_category(categoryId);
             if (index < 0)
                 return;
@@ -2392,10 +2403,12 @@ MainLayout {
                     label: currentSystemLauncher !== "" ? qsTr("Change launcher: %1").arg(currentSystemLauncher) : qsTr("Change launcher")
                 });
             }
-            entries.push({
-                id: "add_to_hub",
-                label: qsTr("Add to Hub")
-            });
+            // ArtCade-fork `lock_hub`: no "Add to Hub" anywhere.
+            if (!root.hubLocked)
+                entries.push({
+                    id: "add_to_hub",
+                    label: qsTr("Add to Hub")
+                });
             entries.push({
                 id: "toggle_hide_system",
                 label: isHidden ? qsTr("Unhide") : qsTr("Hide")
@@ -2508,10 +2521,11 @@ MainLayout {
                     id: "discover",
                     label: qsTr("Discover alt. versions")
                 });
-            entries.push({
-                id: "add_to_hub",
-                label: qsTr("Add to Hub")
-            });
+            if (!root.hubLocked)
+                entries.push({
+                    id: "add_to_hub",
+                    label: qsTr("Add to Hub")
+                });
             // Maintenance last, per docs/content-style.md's ordering rule.
             // A coverless game is the moment a user goes looking for
             // artwork, and this is the menu they open to look -- see the
@@ -2540,7 +2554,8 @@ MainLayout {
                 // unconditional entry so a directory row on a future
                 // Favorites-like owner doesn't silently inherit a folder
                 // shortcut action.
-                return owner === "games" ? [
+                // ArtCade-fork `lock_hub`: no "Add to Hub", so no menu.
+                return owner === "games" && !root.hubLocked ? [
                     {
                         id: "add_to_hub",
                         label: qsTr("Add to Hub")
@@ -2586,10 +2601,11 @@ MainLayout {
                     id: "discover",
                     label: qsTr("Discover alt. versions")
                 });
-            entries.push({
-                id: "add_to_hub",
-                label: qsTr("Add to Hub")
-            });
+            if (!root.hubLocked)
+                entries.push({
+                    id: "add_to_hub",
+                    label: qsTr("Add to Hub")
+                });
             // See the "recents" branch above.
             if (!(Browse.MediaStatus.indexing || Browse.MediaStatus.optimizing || Browse.MediaStatus.scraping))
                 entries.push({
@@ -2717,6 +2733,9 @@ MainLayout {
     }
 
     function openHubActionContextMenu(hubIndex: int, actionId: string, anchorRect): void {
+        // ArtCade-fork `lock_hub`: no Options menu on Hub tiles.
+        if (root.hubLocked)
+            return;
         const owner = actionId === "favorites" ? "hub_favorites" : "hub_action";
         const entries = root.buildContextMenuEntries(owner, "", false, false, false, "", false, "").concat(root._hubMoveRemoveEntries(hubIndex, "action"));
         if (entries.length === 0)
@@ -2741,7 +2760,8 @@ MainLayout {
     // detail, not something to open Options on — but guard it here too
     // rather than trust a single call site.
     function openHubItemContextMenu(hubIndex: int, kind: string, anchorRect, anchorRadius: int): void {
-        if (kind === "empty")
+        // ArtCade-fork `lock_hub`: no Options menu on Hub tiles.
+        if (kind === "empty" || root.hubLocked)
             return;
         const entries = root._hubMoveRemoveEntries(hubIndex, kind);
         if (entries.length === 0)
@@ -2887,13 +2907,13 @@ MainLayout {
             return;
         if (id === "hub_move") {
             root.closeContextMenu();
-            if (hubItemIndex >= 0 && root.hubScreen !== null)
+            if (hubItemIndex >= 0 && root.hubScreen !== null && !root.hubLocked)
                 root.hubScreen.beginMove(hubItemIndex);
             return;
         }
         if (id === "hub_remove") {
             root.closeContextMenu();
-            if (hubItemIndex >= 0)
+            if (hubItemIndex >= 0 && !root.hubLocked)
                 Browse.HubLayout.remove_item(hubItemIndex);
             return;
         }
@@ -3036,7 +3056,8 @@ MainLayout {
         } else if (id === "discover_unavailable" || id === "discover_loading") {
             return;
         } else if (id === "add_to_hub") {
-            root._addToHub(owner, targetIndex);
+            if (!root.hubLocked)
+                root._addToHub(owner, targetIndex);
         }
     }
 
@@ -3056,6 +3077,10 @@ MainLayout {
     // tile has a real title without needing Core reachable to render, and
     // doubles as a rename hook (edit `name` in frontend.toml).
     function _addToHub(owner: string, index: int): void {
+        // ArtCade-fork `lock_hub`: defence in depth -- the entry is never
+        // offered while locked (see buildContextMenuEntries).
+        if (root.hubLocked)
+            return;
         if (owner === "systems") {
             const systemId = Browse.SystemsModel.system_id_at(index);
             if (systemId !== "")
@@ -3463,7 +3488,7 @@ MainLayout {
         // it after the other four properties are set.
         function onHub_target_sequenceChanged(): void {
             const script = Browse.GamesModel.hub_target_script;
-            if (script === "")
+            if (script === "" || root.hubLocked)
                 return;
             Browse.HubLayout.add_target_item("zapscript", "", Browse.GamesModel.hub_target_path, script, Browse.GamesModel.hub_target_name, "", Browse.GamesModel.hub_target_system);
         }
@@ -4139,6 +4164,8 @@ MainLayout {
         }
         if (fieldId === "page_menu_hub") {
             root.closeListPickerModal();
+            // openHubAddMenu/resetHubLayout no-op themselves under the
+            // ArtCade-fork `lock_hub` flag.
             if (selectedId === "hub_add")
                 root.openHubAddMenu();
             else if (selectedId === "hub_reset")
@@ -4170,7 +4197,7 @@ MainLayout {
             // first-class choice), so a branch for it was unreachable.
             let added = false;
             const sep = selectedId.indexOf(":");
-            if (sep > 0)
+            if (sep > 0 && !root.hubLocked)
                 added = Browse.HubLayout.add_item(selectedId.slice(0, sep), selectedId.slice(sep + 1), target);
             // Hand the newly placed item straight to Move so it can be
             // positioned immediately instead of just sitting wherever

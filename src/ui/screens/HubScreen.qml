@@ -171,6 +171,13 @@ Item {
     // without touching RecentsModel. MainLayout flips this after the
     // first frame, then Resume can hide/update from Core history.
     property bool resumeModelEnabled: false
+    // ArtCade-fork kiosk lock (`[settings] lock_hub`), fed from
+    // MainLayout's `hubLocked`. When true the layout is frozen from the UI:
+    // `handleAction` ignores West/Y ("page_menu", the View menu) and
+    // North/X ("context_menu", Options -> Move/Remove), right-click opens
+    // nothing, and `beginMove`/`armMoveForHubIndex` refuse to arm. Accept,
+    // D-pad, paging and Back are unaffected.
+    property bool layoutLocked: false
     // Incremented on each Accept so the focused tile plays its push-in
     // animation. Forwarded to the grid, which forwards it to every tile;
     // only the focused+selected Tile fires its animation.
@@ -1143,7 +1150,7 @@ Item {
     property int _moveArmedTotalPages: 0
 
     function beginMove(hubIndex: int): void {
-        if (hubIndex < 0)
+        if (hubIndex < 0 || hub.layoutLocked)
             return;
         // The tile Options was opened on is always still under the cursor
         // (menus don't let focus move while open) — reject rather than
@@ -1178,7 +1185,7 @@ Item {
     // only this committed selection survives, not the tile's held
     // position.
     function armMoveForHubIndex(hubIndex: int): void {
-        if (hubIndex < 0)
+        if (hubIndex < 0 || hub.layoutLocked)
             return;
         const flat = hub.items.findIndex(entry => entry && entry.hubIndex === hubIndex);
         if (flat < 0)
@@ -1437,6 +1444,9 @@ Item {
             if (!Browse.Settings.current_hide_exit)
                 hub.requestQuit();
         } else if (action === "context_menu") {
+            // ArtCade-fork `lock_hub`: no Options (Move/Remove) on any tile.
+            if (hub.layoutLocked)
+                return;
             const entry = hub.items[hub.currentIndex];
             if (!entry)
                 return;
@@ -1459,7 +1469,10 @@ Item {
                 hub.requestItemContextMenu(entry.hubIndex, entry.kind, pagedGrid.currentCellRectIn(hub), pagedGrid.currentCellRadius);
             }
         } else if (action === "page_menu") {
-            hub.requestPageMenu();
+            // ArtCade-fork `lock_hub`: no View menu (Add item… / Reset
+            // layout / Settings / Quit).
+            if (!hub.layoutLocked)
+                hub.requestPageMenu();
         }
     }
 
@@ -1555,6 +1568,8 @@ Item {
         onItemRightClicked: index => {
             hub._focusArmed = true;
             hub._commitCurrent();
+            if (hub.layoutLocked)
+                return;
             const entry = hub.items[index];
             if (!entry)
                 return;

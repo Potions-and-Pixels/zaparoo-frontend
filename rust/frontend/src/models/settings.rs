@@ -310,6 +310,10 @@ pub struct SettingsRust {
     current_hide_resume: bool,
     current_hide_exit: bool,
     current_hide_empty_categories: bool,
+    // ArtCade fork: `[settings] lock_hub` — freezes the Hub layout from
+    // the UI (no View/Options menus on the Hub, no "Add to Hub"). Same
+    // READ + CONSTANT, config-only posture as the `hide_*` flags above.
+    current_lock_hub: bool,
     /// Flips once, never resets — see `output_resolution_stale`'s
     /// qproperty doc comment.
     output_resolution_stale: bool,
@@ -373,6 +377,7 @@ pub mod ffi {
         #[qproperty(bool, current_hide_resume, READ, CONSTANT)]
         #[qproperty(bool, current_hide_exit, READ, CONSTANT)]
         #[qproperty(bool, current_hide_empty_categories, READ, CONSTANT)]
+        #[qproperty(bool, current_lock_hub, READ, CONSTANT)]
         // No WRITE — Rust-owned, QML-observed only. `false` for the whole
         // session until a background poll (see
         // `mister_runtime::watch_for_output_change`) confirms the live
@@ -547,6 +552,7 @@ impl Initialize for ffi::Settings {
         self.as_mut().rust_mut().current_hide_exit = config.settings.hide_exit.unwrap_or(false);
         self.as_mut().rust_mut().current_hide_empty_categories =
             config.settings.hide_empty_categories.unwrap_or(false);
+        self.as_mut().rust_mut().current_lock_hub = config.settings.lock_hub.unwrap_or(false);
         // Explicit runtime guard, not just the async fn's own internal
         // cfg gate: keeps a desktop build from ever spawning this task at
         // all, regardless of what `watch_for_output_change`'s body does
