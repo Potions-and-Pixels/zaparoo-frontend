@@ -113,13 +113,13 @@ pub struct SettingsConfig {
     /// Kiosk lockdown — disable the Hub's "Quit" / Exit action (B-button
     /// cancel + the corresponding help-bar entry in `MainLayout.qml`).
     /// When `true` the cancel handler is a no-op and the operator
-    /// cannot leave the Zaparoo frontend back to the MiSTer main menu.
+    /// cannot leave the Zaparoo frontend back to the `MiSTer` main menu.
     /// Same opt-in posture as the other `hide_*` flags — default
     /// `None`/`false` keeps the existing behavior; the installer
     /// flips it on as part of the kiosk-lockdown `frontend.toml`.
     pub hide_exit: Option<bool>,
     /// Auto-hide category tiles on the Hub that would show zero
-    /// systems on the SystemsScreen after the SystemsModel filter
+    /// systems on the `SystemsScreen` after the `SystemsModel` filter
     /// (`hidden_system_ids` + `show_hidden`) is applied. `None` /
     /// `Some(false)` preserves upstream behavior (every category Core
     /// reports is rendered, even if empty for this cabinet).
@@ -136,8 +136,8 @@ pub struct SettingsConfig {
     /// whether *this* cabinet has any launchers for those systems.
     /// Kiosk deployments with a curated small game set surface tiles
     /// like "Computer" / "Software" that go nowhere when clicked.
-    /// This flag makes the CategoriesModel apply the same filter
-    /// SystemsModel would use to render tiles, and drops categories
+    /// This flag makes the `CategoriesModel` apply the same filter
+    /// `SystemsModel` would use to render tiles, and drops categories
     /// where the count is zero.
     pub hide_empty_categories: Option<bool>,
 }

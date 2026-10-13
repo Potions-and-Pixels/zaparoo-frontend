@@ -118,7 +118,7 @@ pub struct SystemsModelRust {
     /// System IDs that have at least one indexed media entry on THIS
     /// cabinet, from `MediaPresenceEndpoint`. Fork-only:
     /// `hide_empty_categories` uses this to drop system tiles that
-    /// would open an empty GamesScreen — same posture as the Hub-level
+    /// would open an empty `GamesScreen` — same posture as the Hub-level
     /// filter in `CategoriesModel`. Case-preserved as Core reports;
     /// `rows_for_category` compares case-sensitively against
     /// `SystemInfo.id` (matches the artwork qrc lookup contract).
@@ -291,11 +291,11 @@ pub mod ffi {
 
 /// Hand-written `Initialize` — replaces the `bind_to_endpoint!` macro
 /// so this model can subscribe to TWO endpoints (Catalog + fork-only
-/// MediaPresence) instead of the macro's one. Same sync-seed + Qt-thread
+/// `MediaPresence`) instead of the macro's one. Same sync-seed + Qt-thread
 /// dispatch contract; see `bind.rs` for the invariants.
 ///
 /// Two separate tokio watchers so each endpoint's changes are applied
-/// independently: a catalog update won't stall waiting for MediaPresence
+/// independently: a catalog update won't stall waiting for `MediaPresence`
 /// and vice versa. Both apply paths eventually re-run the category
 /// filter so the visible-systems list reflects the freshest of both
 /// streams (`apply_media_state` calls the same `reproject_inner`
@@ -305,16 +305,14 @@ impl Initialize for ffi::SystemsModel {
         let started = std::time::Instant::now();
         crate::startup_trace("rust:model SystemsModel init start");
 
-        let mut rx_catalog = global_store()
-            .subscribe::<CatalogEndpoint>(())
-            .subscribe();
-        let projected = project(&*rx_catalog.borrow_and_update());
+        let mut rx_catalog = global_store().subscribe::<CatalogEndpoint>(()).subscribe();
+        let projected = project(&rx_catalog.borrow_and_update());
         apply_state(self.as_mut(), projected);
 
         let mut rx_media = global_store()
             .subscribe::<MediaPresenceEndpoint>(())
             .subscribe();
-        let media_snap = project_media(&*rx_media.borrow_and_update());
+        let media_snap = project_media(&rx_media.borrow_and_update());
         apply_media_state(self.as_mut(), media_snap);
 
         crate::startup_trace(format!(
@@ -327,13 +325,13 @@ impl Initialize for ffi::SystemsModel {
 
         global_handle().spawn(async move {
             while rx_catalog.changed().await.is_ok() {
-                let projected = project(&*rx_catalog.borrow_and_update());
+                let projected = project(&rx_catalog.borrow_and_update());
                 let _ = qt_thread_catalog.queue(move |m| apply_state(m, projected));
             }
         });
         global_handle().spawn(async move {
             while rx_media.changed().await.is_ok() {
-                let snap = project_media(&*rx_media.borrow_and_update());
+                let snap = project_media(&rx_media.borrow_and_update());
                 let _ = qt_thread_media.queue(move |m| apply_media_state(m, snap));
             }
         });
@@ -556,18 +554,12 @@ fn apply_state(mut model: Pin<&mut ffi::SystemsModel>, (data, err): (Option<Cata
 /// known good set survives while a refetch is in-flight; on success,
 /// stashes the set and re-runs the current category filter so the
 /// visible tiles pick up the new presence data.
-fn apply_media_state(
-    mut model: Pin<&mut ffi::SystemsModel>,
-    snap: Option<HashSet<String>>,
-) {
+fn apply_media_state(mut model: Pin<&mut ffi::SystemsModel>, snap: Option<HashSet<String>>) {
     let Some(new) = snap else { return };
     if new == model.rust().media_system_ids {
         return;
     }
-    debug!(
-        count = new.len(),
-        "systems: media_system_ids update"
-    );
+    debug!(count = new.len(), "systems: media_system_ids update");
     model.as_mut().rust_mut().media_system_ids = new;
     // Re-run the current category filter with the new presence set.
     // No-op when `current_category` is empty (initial boot, before any
@@ -1245,7 +1237,7 @@ mod tests {
             sys("InternalFirst", "Zulu", "Consoles"),
             sys("InternalLast", "alpha", "Consoles"),
         ]);
-        let rows = rows_for_category(Some(&catalog), "Consoles", &[], false, Region::Us);
+        let rows = rfc(Some(&catalog), "Consoles", &[], false, Region::Us);
         assert_eq!(
             rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
             ["alpha", "Zulu"]

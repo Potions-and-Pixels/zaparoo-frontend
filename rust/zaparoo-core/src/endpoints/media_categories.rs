@@ -39,7 +39,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 /// Backstop: absolute maximum media rows we'll page through before
-/// bailing out. Even a fully-loaded MiSTer library (~10K games) fits
+/// bailing out. Even a fully-loaded `MiSTer` library (~10K games) fits
 /// well under this; the ceiling exists so a Core bug returning
 /// `has_next_page = true` forever can't lock the endpoint's fetch.
 const MAX_PAGES: usize = 200;
@@ -100,11 +100,15 @@ impl Endpoint for MediaPresenceEndpoint {
                         presence.categories.insert(cat.to_string());
                     }
                 }
-                let Some(p) = res.pagination.as_ref() else { break };
+                let Some(p) = res.pagination.as_ref() else {
+                    break;
+                };
                 if !p.has_next_page {
                     break;
                 }
-                let Some(next) = p.next_cursor.clone() else { break };
+                let Some(next) = p.next_cursor.clone() else {
+                    break;
+                };
                 cursor = Some(next);
             }
             Ok(presence)
