@@ -81,7 +81,7 @@ Item {
         // Match the rest of the Credits stack for visual continuity.
         width: Math.min(parent.width - Sizing.pctW(10), Sizing.pctW(50))
         color: Theme.surfaceCard
-        radius: Sizing.cornerRadius
+        radius: Sizing.radiusMd
         border.color: Theme.borderMid
         border.width: Sizing.stroke(1)
 
@@ -108,7 +108,9 @@ Item {
                     width: body.width
                     height: Sizing.pctH(7)
                     color: Theme.surfaceCard
-                    radius: Sizing.cornerRadius
+                    // Menu row nested in the card: docs/style.md's nested
+                    // control radius (Settings/menu/picker rows).
+                    radius: Sizing.radiusSm
                     border.color: credits.focusIndex === menuRow.index ? Theme.accent : Theme.borderMid
                     border.width: credits.focusIndex === menuRow.index ? Sizing.stroke(2) : Sizing.stroke(1)
 

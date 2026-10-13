@@ -2376,6 +2376,39 @@ TestCase {
             compare(main.aboutScreen.openedFromCredits, false, "returning to Credits resets the About dual-source flag");
     }
 
+    // Every bordered card/row on the Credits-stack screens must be rounded.
+    // The v1.3.1 merge removed `Sizing.cornerRadius`; these five screens
+    // kept reading it, the binding evaluated to undefined and every card
+    // silently fell back to radius 0 (square). scripts/check-theme-members.sh
+    // catches the undeclared read statically; this pins the rendered result.
+    function _borderedRects(item: var, out: var): var {
+        if (!item)
+            return out;
+        if (item.border !== undefined && item.radius !== undefined && item.border.width > 0)
+            out.push(item);
+        const kids = item.children ?? [];
+        for (let i = 0; i < kids.length; ++i)
+            testCase._borderedRects(kids[i], out);
+        return out;
+    }
+
+    function test_credits_stack_cards_are_rounded(): void {
+        const screens = [[() => main._navigateToCredits(), main.screenCredits, "creditsScreen"], [() => main._navigateToSponsors(), main.screenSponsors, "sponsorsScreen"], [() => main._navigateToDevTeam(), main.screenDevTeam, "devTeamScreen"], [() => main._navigateToArtists(), main.screenArtists, "artistsScreen"], [() => main._navigateToPotionsPixels(), main.screenPotionsPixels, "potionsPixelsScreen"]];
+        for (let i = 0; i < screens.length; ++i) {
+            const s = screens[i];
+            s[0]();
+            tryCompare(main, "activeScreen", s[1]);
+            tryVerify(function () {
+                return main[s[2]] !== null;
+            }, 5000);
+            const rects = testCase._borderedRects(main[s[2]], []);
+            verify(rects.length > 0, s[2] + " must draw at least its bordered panel");
+            for (let j = 0; j < rects.length; ++j)
+                verify(rects[j].radius >= Sizing.radiusSm, s[2] + " bordered rect " + j + " has radius " + rects[j].radius + " (expected a Sizing radius token, not square)");
+        }
+        main._goto(main.screenHub);
+    }
+
     // ── ArtCade fork: kiosk-lockdown hide_* flags are wired ──────────────
     // The six hide_* settings are exposed as READ-only qproperties on
     // Browse.Settings (see rust/frontend/src/models/settings.rs). They are
