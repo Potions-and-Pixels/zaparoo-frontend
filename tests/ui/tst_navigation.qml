@@ -127,6 +127,9 @@ TestCase {
 
     function cleanup(): void {
         Motion.enabled = true;
+        // ArtCade fork: lock_hub tests flip the MainLayout seam; restore it
+        // to the (CONSTANT, false in the test env) Rust value.
+        main.hubLocked = Browse.Settings.current_lock_hub;
         // A modal left open swallows every routed action, so the next test
         // would fail for a reason that has nothing to do with what it tests.
         main._actionErrorQueue = [];
@@ -2264,7 +2267,7 @@ TestCase {
         main.creditsScreen.handleAction("accept");
         tryCompare(main, "activeScreen", main.screenAbout);
         tryVerify(function () { return main.aboutScreen !== null; }, 5000, "aboutScreen Loader must materialize even on first entry from Credits");
-        tryCompare(main.aboutScreen, "openedFromCredits", true, "deferred-set path must land the flag on the Loader-materialized item");
+        tryCompare(main.aboutScreen, "openedFromCredits", true, 5000, "deferred-set path must land the flag on the Loader-materialized item");
         // Reset for downstream tests -- cleanup() doesn't touch this
         // property and a leaked `true` would misroute a subsequent
         // Settings → About cancel.
@@ -2291,7 +2294,119 @@ TestCase {
         // resets the flag before navigating.
         main.aboutScreen.handleAction("cancel");
         tryCompare(main, "activeScreen", main.screenCredits);
-        tryCompare(main.aboutScreen, "openedFromCredits", false, "flag must reset so a subsequent Settings → About cancel returns to Settings");
+        tryCompare(main.aboutScreen, "openedFromCredits", false, 5000, "flag must reset so a subsequent Settings → About cancel returns to Settings");
+    }
+
+    // ── ArtCade fork: Hub → Credits tile routing ─────────────────────────
+    // The 2026-09-30 upstream v1.3.1 merge collapsed the Hub's per-action
+    // signals into `requestAccept(kind, id, system)`; HubScreen kept
+    // resolving a Credits tile, but Main.qml's router never got an
+    // `id === "credits"` arm (and Rust never seeded the action), so the
+    // Credits menu became unreachable from the Hub. These lock both halves.
+    function test_hub_accept_signal_for_credits_routes_to_credits(): void {
+        main.hubScreen.requestAccept("action", "credits", "");
+        tryCompare(main, "activeScreen", main.screenCredits);
+        tryVerify(function () {
+            return main.creditsScreen !== null;
+        }, 5000);
+    }
+
+    function test_hub_enter_on_credits_tile_opens_credits(): void {
+        const idx = main.hubScreen._actionIndexForId("credits");
+        compare(main.hubScreen.items[idx].id, "credits", "the Hub must carry a Credits tile to focus");
+        compare(main.hubScreen.items[idx].coverKey, "icons/Heart", "Credits draws the filled Heart (Favorites keeps HeartOutline)");
+        main.hubScreen.currentIndex = idx;
+        main.handleKey(Qt.Key_Return);
+        tryCompare(main, "activeScreen", main.screenCredits);
+    }
+
+    function test_credits_tile_survives_every_hub_kiosk_gate(): void {
+        // Credits has no hide_* gate and no live-data gate -- it is the
+        // only kiosk path to About/License once hide_settings is on.
+        const entry = main.hubScreen._resolveActionEntry("credits");
+        verify(entry !== null, "Credits must always resolve to a tile");
+        compare(entry.name, qsTr("Credits"));
+        compare(entry.disabled, false);
+        compare(main.hubScreen._builtInActionIds[main.hubScreen._builtInActionIds.length - 1], "credits", "credits seeds last, mirroring hub_layout::BUILT_IN_ACTIONS");
+        compare(main.hubScreen._builtInActionIds[0], "resume", "resume must stay first (seed-order contract)");
+    }
+
+    function test_credits_cancel_returns_to_hub(): void {
+        main._navigateToCredits();
+        tryCompare(main, "activeScreen", main.screenCredits);
+        tryVerify(function () {
+            return main.creditsScreen !== null;
+        }, 5000);
+        main.handleAction("cancel");
+        tryCompare(main, "activeScreen", main.screenHub);
+    }
+
+    // Every Credits row opens its own screen, and Back from that screen
+    // lands on Credits again -- driven through Main.qml's real dispatcher
+    // (`handleAction`) so the per-screen routing table is covered too.
+    function test_every_credits_row_opens_its_screen_and_back_returns_to_credits(): void {
+        const targets = {
+            sponsors: [main.screenSponsors, "sponsorsScreen"],
+            devTeam: [main.screenDevTeam, "devTeamScreen"],
+            artists: [main.screenArtists, "artistsScreen"],
+            potionsPixels: [main.screenPotionsPixels, "potionsPixelsScreen"],
+            aboutLicense: [main.screenAbout, "aboutScreen"]
+        };
+        main._navigateToCredits();
+        tryVerify(function () {
+            return main.creditsScreen !== null;
+        }, 5000);
+        const menu = main.creditsScreen._menu;
+        verify(menu.length > 0);
+        for (let i = 0; i < menu.length; ++i) {
+            const target = targets[menu[i].action];
+            verify(target !== undefined, "test bug: no expected screen for Credits row " + menu[i].action);
+            main._navigateToCredits();
+            tryCompare(main, "activeScreen", main.screenCredits);
+            main.creditsScreen.focusIndex = i;
+            main.handleAction("accept");
+            tryCompare(main, "activeScreen", target[0], 5000, menu[i].action + " must open its screen");
+            tryVerify(function () {
+                return main[target[1]] !== null;
+            }, 5000);
+            main.handleAction("cancel");
+            tryCompare(main, "activeScreen", main.screenCredits, 5000, "Back from " + menu[i].action + " must return to Credits");
+        }
+        if (main.aboutScreen !== null)
+            compare(main.aboutScreen.openedFromCredits, false, "returning to Credits resets the About dual-source flag");
+    }
+
+    // Every bordered card/row on the Credits-stack screens must be rounded.
+    // The v1.3.1 merge removed `Sizing.cornerRadius`; these five screens
+    // kept reading it, the binding evaluated to undefined and every card
+    // silently fell back to radius 0 (square). scripts/check-theme-members.sh
+    // catches the undeclared read statically; this pins the rendered result.
+    function _borderedRects(item: var, out: var): var {
+        if (!item)
+            return out;
+        if (item.border !== undefined && item.radius !== undefined && item.border.width > 0)
+            out.push(item);
+        const kids = item.children ?? [];
+        for (let i = 0; i < kids.length; ++i)
+            testCase._borderedRects(kids[i], out);
+        return out;
+    }
+
+    function test_credits_stack_cards_are_rounded(): void {
+        const screens = [[() => main._navigateToCredits(), main.screenCredits, "creditsScreen"], [() => main._navigateToSponsors(), main.screenSponsors, "sponsorsScreen"], [() => main._navigateToDevTeam(), main.screenDevTeam, "devTeamScreen"], [() => main._navigateToArtists(), main.screenArtists, "artistsScreen"], [() => main._navigateToPotionsPixels(), main.screenPotionsPixels, "potionsPixelsScreen"]];
+        for (let i = 0; i < screens.length; ++i) {
+            const s = screens[i];
+            s[0]();
+            tryCompare(main, "activeScreen", s[1]);
+            tryVerify(function () {
+                return main[s[2]] !== null;
+            }, 5000);
+            const rects = testCase._borderedRects(main[s[2]], []);
+            verify(rects.length > 0, s[2] + " must draw at least its bordered panel");
+            for (let j = 0; j < rects.length; ++j)
+                verify(rects[j].radius >= Sizing.radiusSm, s[2] + " bordered rect " + j + " has radius " + rects[j].radius + " (expected a Sizing radius token, not square)");
+        }
+        main._goto(main.screenHub);
     }
 
     // ── ArtCade fork: kiosk-lockdown hide_* flags are wired ──────────────
@@ -2317,7 +2432,8 @@ TestCase {
             "current_hide_recents",
             "current_hide_resume",
             "current_hide_exit",
-            "current_hide_empty_categories"
+            "current_hide_empty_categories",
+            "current_lock_hub"
         ];
         for (let i = 0; i < flags.length; ++i) {
             const val = Browse.Settings[flags[i]];
@@ -2328,5 +2444,113 @@ TestCase {
             // default flipped (needs installer sync).
             compare(val, false, flags[i] + " must default to false in the test env");
         }
+    }
+
+    // ── ArtCade fork: `[settings] lock_hub` freezes the Hub layout ──────
+    // `main.hubLocked` is MainLayout's seam over the CONSTANT
+    // Browse.Settings.current_lock_hub (false in the test env); cleanup()
+    // restores it.
+    function _hubHelpButtons(): var {
+        const out = [];
+        const entries = main.helpEntries;
+        for (let i = 0; i < entries.length; ++i) {
+            if (entries[i].button)
+                out.push(entries[i].button);
+            if (entries[i].buttons)
+                for (let j = 0; j < entries[i].buttons.length; ++j)
+                    out.push(entries[i].buttons[j]);
+        }
+        return out;
+    }
+
+    // try/finally: see test_hub_system_shortcut_accept_navigates_to_games
+    // for why a leaked Hub item corrupts every later test.
+    function test_locked_hub_help_bar_drops_view_and_options(): void {
+        verify(Browse.HubLayout.add_target_item("system", "NES", "", "", "", "", ""));
+        const idx = main.hubScreen._itemIndexForId("system", "NES");
+        const hubIndex = idx >= 0 ? main.hubScreen.items[idx].hubIndex : -1;
+        try {
+            verify(idx >= 0 && hubIndex >= 0, "need a real Hub tile so Options is otherwise offered");
+            main.activeScreen = main.screenHub;
+            main.hubScreen.currentIndex = idx;
+            let buttons = testCase._hubHelpButtons();
+            verify(buttons.includes("ButtonX"), "precondition: unlocked Hub offers Options on a real tile");
+            verify(buttons.includes("ButtonY"), "precondition: unlocked Hub offers View");
+            main.hubLocked = true;
+            buttons = testCase._hubHelpButtons();
+            verify(!buttons.includes("ButtonX"), "locked Hub must not advertise Options");
+            verify(!buttons.includes("ButtonY"), "locked Hub must not advertise View");
+            verify(buttons.includes("ButtonA"), "Open stays");
+            compare(main.hubScreen.layoutLocked, true, "the lock must reach HubScreen");
+        } finally {
+            main.hubLocked = false;
+            if (hubIndex >= 0)
+                Browse.HubLayout.remove_item(hubIndex);
+        }
+    }
+
+    function test_locked_hub_ignores_view_options_and_every_layout_edit(): void {
+        verify(Browse.HubLayout.add_target_item("system", "NES", "", "", "", "", ""));
+        const idx = main.hubScreen._itemIndexForId("system", "NES");
+        const hubIndex = idx >= 0 ? main.hubScreen.items[idx].hubIndex : -1;
+        try {
+            verify(idx >= 0 && hubIndex >= 0);
+            main.activeScreen = main.screenHub;
+            main.hubScreen.currentIndex = idx;
+            main.hubLocked = true;
+            const before = Browse.HubLayout.items_snapshot();
+
+            // West/Y and North/X do nothing.
+            main.hubScreen.handleAction("page_menu");
+            compare(main.listPickerModalVisible, false, "Y/View must not open the View menu");
+            main.hubScreen.handleAction("context_menu");
+            compare(main.contextMenuVisible, false, "X/Options must not open a menu on a Hub tile");
+
+            // Defensive: every entry point that edits the layout no-ops.
+            main.openHubPageMenu();
+            compare(main.listPickerModalVisible, false);
+            main.openHubAddMenu();
+            compare(main.listPickerModalVisible, false);
+            compare(main.actionErrorModalVisible, false);
+            main.openHubActionContextMenu(hubIndex, "settings", Qt.rect(0, 0, 1, 1));
+            compare(main.contextMenuVisible, false);
+            main.openHubItemContextMenu(hubIndex, "system", Qt.rect(0, 0, 1, 1), 0);
+            compare(main.contextMenuVisible, false);
+            main.hubScreen.beginMove(hubIndex);
+            compare(main.hubScreen.moveArmed, false, "Move must not arm while locked");
+            main.hubScreen.armMoveForHubIndex(hubIndex);
+            compare(main.hubScreen.moveArmed, false);
+            main.resetHubLayout();
+            main._addToHub("systems", 0);
+            compare(Browse.HubLayout.items_snapshot(), before, "the layout must not change while locked");
+
+            // Accept still opens the tile.
+            main.handleKey(Qt.Key_Return);
+            compare(Browse.SystemsState.system_id, "NES", "A/Open is unaffected by the lock");
+        } finally {
+            main.hubLocked = false;
+            if (hubIndex >= 0)
+                Browse.HubLayout.remove_item(hubIndex);
+        }
+    }
+
+    function test_locked_hub_removes_add_to_hub_from_every_options_menu(): void {
+        const menus = [["systems", "", false, false, false, "SNES", false, ""], ["games", "directory", false, true, false, "SNES", false, ""], ["games", "root", false, true, false, "SNES", false, "", true], ["games", "media", true, true, false, "SNES", false, ""], ["favorites", "media", true, true, true, "SNES", false, ""], ["recents", "", false, false, false, "SNES", false, ""]];
+        for (let i = 0; i < menus.length; ++i) {
+            const m = menus[i];
+            const unlocked = main.buildContextMenuEntries(m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8] === true);
+            verify(_idsOf(unlocked).includes("add_to_hub"), "precondition: " + m[0] + "/" + m[1] + " offers Add to Hub while unlocked");
+        }
+        main.hubLocked = true;
+        for (let i = 0; i < menus.length; ++i) {
+            const m = menus[i];
+            const locked = main.buildContextMenuEntries(m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8] === true);
+            verify(!_idsOf(locked).includes("add_to_hub"), m[0] + "/" + m[1] + " must not offer Add to Hub while locked");
+        }
+        // Everything else on a game row stays.
+        const game = main.buildContextMenuEntries("games", "media", true, false, false, "", false, "");
+        compare(_idsOf(game), ["more_info", "toggle_favorite", "qr_code", "scrape_game"]);
+        // Systems keep Hide/Unhide (not gated by lock_hub).
+        verify(_idsOf(main.buildContextMenuEntries("systems", "", false, false, false, "SNES", false, "")).includes("toggle_hide_system"));
     }
 }

@@ -34,7 +34,7 @@ pub struct CategoriesModelRust {
     raw: Vec<String>,
     /// Category names with at least one indexed media entry on THIS
     /// cabinet, from `MediaCategoriesEndpoint`. Fork-only:
-    /// `hide_empty_categories` uses this set (not the CatalogEndpoint's
+    /// `hide_empty_categories` uses this set (not the `CatalogEndpoint`'s
     /// systems-per-category count) so a category is dropped iff no game
     /// on THIS SD card belongs to it. Case-preserved as Core reports;
     /// `visible_categories` compares case-insensitively.
@@ -134,11 +134,11 @@ pub mod ffi {
 
 /// Hand-written `Initialize` — replaces the `bind_to_endpoint!` macro
 /// so this model can subscribe to TWO endpoints (Catalog + fork-only
-/// MediaCategories) instead of the macro's one. Same sync-seed + Qt-thread
+/// `MediaCategories`) instead of the macro's one. Same sync-seed + Qt-thread
 /// dispatch contract as the macro; see `bind.rs` for the invariants.
 ///
 /// Two separate tokio watchers so each endpoint's changes are applied
-/// independently: a catalog update won't stall waiting for MediaCategories
+/// independently: a catalog update won't stall waiting for `MediaCategories`
 /// to refetch and vice versa. Both apply paths funnel through
 /// `reproject_inner` so the final visible-categories list always reflects
 /// the freshest of both streams.
@@ -147,16 +147,14 @@ impl Initialize for ffi::CategoriesModel {
         let started = std::time::Instant::now();
         crate::startup_trace("rust:model CategoriesModel init start");
 
-        let mut rx_catalog = global_store()
-            .subscribe::<CatalogEndpoint>(())
-            .subscribe();
-        let projected = project(&*rx_catalog.borrow_and_update());
+        let mut rx_catalog = global_store().subscribe::<CatalogEndpoint>(()).subscribe();
+        let projected = project(&rx_catalog.borrow_and_update());
         apply_state(self.as_mut(), projected);
 
         let mut rx_media = global_store()
             .subscribe::<MediaPresenceEndpoint>(())
             .subscribe();
-        let media_snap = project_media(&*rx_media.borrow_and_update());
+        let media_snap = project_media(&rx_media.borrow_and_update());
         apply_media_state(self.as_mut(), media_snap);
 
         crate::startup_trace(format!(
@@ -169,13 +167,13 @@ impl Initialize for ffi::CategoriesModel {
 
         global_handle().spawn(async move {
             while rx_catalog.changed().await.is_ok() {
-                let projected = project(&*rx_catalog.borrow_and_update());
+                let projected = project(&rx_catalog.borrow_and_update());
                 let _ = qt_thread_catalog.queue(move |m| apply_state(m, projected));
             }
         });
         global_handle().spawn(async move {
             while rx_media.changed().await.is_ok() {
-                let snap = project_media(&*rx_media.borrow_and_update());
+                let snap = project_media(&rx_media.borrow_and_update());
                 let _ = qt_thread_media.queue(move |m| apply_media_state(m, snap));
             }
         });
@@ -192,9 +190,7 @@ impl Initialize for ffi::CategoriesModel {
 /// and the surfaced error message (empty unless `Errored`). Filtering
 /// is deferred to `apply_state` / `reproject_inner` so `reproject()`
 /// can re-filter in-place without waiting for a catalog refetch.
-fn project(
-    status: &ResourceStatus<CatalogData>,
-) -> (Option<(Vec<String>, i32)>, String) {
+fn project(status: &ResourceStatus<CatalogData>) -> (Option<(Vec<String>, i32)>, String) {
     match status {
         ResourceStatus::Ready(data) => (
             Some((data.categories.clone(), data.indexed_count() as i32)),
@@ -255,7 +251,7 @@ fn position_of(haystack: &[String], needle: &str) -> i32 {
 /// system's category on the media entry.
 ///
 /// If `media_categories` is empty AND `hide_empty` is true, the filter
-/// is a no-op — an empty set means MediaCategoriesEndpoint hasn't
+/// is a no-op — an empty set means `MediaCategoriesEndpoint` hasn't
 /// resolved yet (initial boot before `media.search` returns) and
 /// dropping every category would flash an empty Hub while the async
 /// fetch is in-flight.
@@ -282,11 +278,7 @@ fn visible_categories(
         if is_user_hidden && !show_hidden {
             continue;
         }
-        if apply_empty_filter
-            && !media_categories
-                .iter()
-                .any(|m| m.eq_ignore_ascii_case(c))
-        {
+        if apply_empty_filter && !media_categories.iter().any(|m| m.eq_ignore_ascii_case(c)) {
             continue;
         }
         names.push(c.clone());
@@ -352,10 +344,7 @@ fn apply_state(
 /// side. `None` (fetch still Loading / Errored) is a no-op so the last
 /// known good set survives while a refetch is in-flight; on success,
 /// stashes the set and reprojects so the Hub picks up the new filter.
-fn apply_media_state(
-    mut model: Pin<&mut ffi::CategoriesModel>,
-    snap: Option<HashSet<String>>,
-) {
+fn apply_media_state(mut model: Pin<&mut ffi::CategoriesModel>, snap: Option<HashSet<String>>) {
     let Some(new) = snap else { return };
     if new == model.rust().media_categories {
         return;
@@ -451,11 +440,7 @@ mod tests {
     // Shorthand: existing tests don't exercise the empty-category
     // filter, so pass an empty media set + `hide_empty = false` and
     // pre-flag behavior is unchanged.
-    fn vc(
-        raw: &[String],
-        user_hidden: &[String],
-        show_hidden: bool,
-    ) -> (Vec<String>, Vec<bool>) {
+    fn vc(raw: &[String], user_hidden: &[String], show_hidden: bool) -> (Vec<String>, Vec<bool>) {
         visible_categories(raw, &HashSet::new(), user_hidden, show_hidden, false)
     }
 

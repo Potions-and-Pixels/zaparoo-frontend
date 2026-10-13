@@ -95,7 +95,7 @@ Item {
         // widescreen.
         width: Math.min(parent.width - Sizing.pctW(10), Sizing.pctW(50))
         color: Theme.surfaceCard
-        radius: Sizing.cornerRadius
+        radius: Sizing.radiusMd
         border.color: Theme.borderMid
         border.width: Sizing.stroke(1)
 
@@ -161,7 +161,7 @@ Item {
                         width: body.width
                         height: sponsorColumn.implicitHeight + Sizing.pctH(3) * 2
                         color: Theme.surfaceCard
-                        radius: Sizing.cornerRadius
+                        radius: Sizing.radiusMd
                         border.color: Theme.borderMid
                         border.width: Sizing.stroke(1)
 

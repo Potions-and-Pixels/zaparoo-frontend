@@ -113,13 +113,13 @@ pub struct SettingsConfig {
     /// Kiosk lockdown — disable the Hub's "Quit" / Exit action (B-button
     /// cancel + the corresponding help-bar entry in `MainLayout.qml`).
     /// When `true` the cancel handler is a no-op and the operator
-    /// cannot leave the Zaparoo frontend back to the MiSTer main menu.
+    /// cannot leave the Zaparoo frontend back to the `MiSTer` main menu.
     /// Same opt-in posture as the other `hide_*` flags — default
     /// `None`/`false` keeps the existing behavior; the installer
     /// flips it on as part of the kiosk-lockdown `frontend.toml`.
     pub hide_exit: Option<bool>,
     /// Auto-hide category tiles on the Hub that would show zero
-    /// systems on the SystemsScreen after the SystemsModel filter
+    /// systems on the `SystemsScreen` after the `SystemsModel` filter
     /// (`hidden_system_ids` + `show_hidden`) is applied. `None` /
     /// `Some(false)` preserves upstream behavior (every category Core
     /// reports is rendered, even if empty for this cabinet).
@@ -136,10 +136,29 @@ pub struct SettingsConfig {
     /// whether *this* cabinet has any launchers for those systems.
     /// Kiosk deployments with a curated small game set surface tiles
     /// like "Computer" / "Software" that go nowhere when clicked.
-    /// This flag makes the CategoriesModel apply the same filter
-    /// SystemsModel would use to render tiles, and drops categories
+    /// This flag makes the `CategoriesModel` apply the same filter
+    /// `SystemsModel` would use to render tiles, and drops categories
     /// where the count is zero.
     pub hide_empty_categories: Option<bool>,
+    /// `ArtCade` fork kiosk lockdown — freeze the Hub layout from the UI.
+    /// Set via `[settings] lock_hub = true` in `frontend.toml`. When
+    /// `Some(true)`:
+    ///   - the Hub's West/Y "View" page menu (Add item…, Reset layout,
+    ///     Settings, Quit) and its help-bar hint are gone;
+    ///   - the Hub's North/X "Options" menu (Move / Hide-or-Remove, plus
+    ///     the tile-specific entries) and its help-bar hint are gone, on
+    ///     every Hub tile;
+    ///   - "Add to Hub" is dropped from every Options menu on the browse
+    ///     screens (Systems, Games, Favorites, Recents, folders);
+    ///   - every layout-mutating handler (add / reset / move / remove /
+    ///     add-to-hub) is a no-op as defence in depth.
+    ///
+    /// The persisted `[hub]` layout itself is still read and reconciled
+    /// (new categories / built-in actions are still appended on boot) —
+    /// only the player-facing edit affordances are locked. Accept/Open,
+    /// Back and every non-layout Options entry are unaffected. `None` /
+    /// `Some(false)` keeps upstream behaviour. Fork-only.
+    pub lock_hub: Option<bool>,
 }
 
 #[allow(
@@ -289,6 +308,7 @@ struct RawSettings {
     hide_resume: Option<bool>,
     hide_exit: Option<bool>,
     hide_empty_categories: Option<bool>,
+    lock_hub: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -439,6 +459,7 @@ fn settings_config_from_raw(raw: RawSettings) -> SettingsConfig {
         hide_resume: raw.hide_resume,
         hide_exit: raw.hide_exit,
         hide_empty_categories: raw.hide_empty_categories,
+        lock_hub: raw.lock_hub,
     }
 }
 
@@ -1021,6 +1042,39 @@ mod tests {
         let f = write_tmp("[settings]\nregion = \"jp\"\n");
         let cfg = load_config(f.path());
         assert_eq!(cfg.settings.region.as_deref(), Some("jp"));
+    }
+
+    #[test]
+    fn lock_hub_round_trips() {
+        let f = write_tmp("[settings]\nlock_hub = true\n");
+        let cfg = load_config(f.path());
+        assert_eq!(cfg.settings.lock_hub, Some(true));
+    }
+
+    #[test]
+    fn lock_hub_absent_is_none() {
+        let f = write_tmp("[settings]\nhide_exit = true\n");
+        let cfg = load_config(f.path());
+        assert_eq!(cfg.settings.lock_hub, None);
+    }
+
+    #[test]
+    fn lock_hub_explicit_false_round_trips() {
+        let f = write_tmp("[settings]\nlock_hub = false\n");
+        let cfg = load_config(f.path());
+        assert_eq!(cfg.settings.lock_hub, Some(false));
+    }
+
+    #[test]
+    fn lock_hub_coexists_with_the_other_kiosk_flags() {
+        let f = write_tmp(
+            "[settings]\nhide_settings = true\nhide_exit = true\nhide_empty_categories = true\nlock_hub = true\n",
+        );
+        let cfg = load_config(f.path());
+        assert_eq!(cfg.settings.lock_hub, Some(true));
+        assert_eq!(cfg.settings.hide_settings, Some(true));
+        assert_eq!(cfg.settings.hide_exit, Some(true));
+        assert_eq!(cfg.settings.hide_empty_categories, Some(true));
     }
 
     #[test]

@@ -160,6 +160,13 @@ _lint-rust-internal:
 _lint-baked-internal:
     bash scripts/check-baked-icons.sh
 
+# Container-internal: fail if QML reads a Sizing/Theme/Motion member the
+# singleton doesn't declare (qmllint only warns; the binding silently yields
+# undefined). Also part of the cmake `lint` aggregate (so `just lint` and CI's
+# `cmake --build build --target lint` both run it); this recipe runs it alone.
+_lint-theme-members-internal:
+    bash scripts/check-theme-members.sh
+
 _lint-all-internal: _lint-rust-internal _lint-cpp-target _lint-translations-internal _lint-baked-internal
 
 # Container-internal: format-and-autofix surface. xargs -r skips the
@@ -197,6 +204,9 @@ lint-translations:
 
 lint-baked:
     just _lint just _lint-baked-internal
+
+lint-theme-members:
+    just _lint just _lint-theme-members-internal
 
 fmt:
     just _lint just _fmt-internal

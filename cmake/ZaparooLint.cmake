@@ -8,7 +8,8 @@
 # Targets:
 #   format-check  — clang-format dry-run on all first-party C++
 #   tidy          — clang-tidy static analysis (requires compile_commands.json)
-#   lint          — aggregate: format-check + tidy + all_qmllint
+#   theme-members — fail on QML reads of undeclared Sizing/Theme/Motion members
+#   lint          — aggregate: format-check + tidy + theme-members + all_qmllint
 
 include_guard(GLOBAL)
 
@@ -84,10 +85,30 @@ else()
     add_custom_target(tidy COMMAND ${CMAKE_COMMAND} -E echo "clang-tidy not found; skipping")
 endif()
 
+# ── theme-singleton members ─────────────────────────────────────────────────── qmllint only
+# *warns* (missing-property) when QML reads e.g. `Sizing.cornerRadius` after it was renamed, and the
+# binding then silently evaluates to undefined. See scripts/check-theme-members.sh.
+
+find_program(BASH_EXE NAMES bash)
+
+if(BASH_EXE)
+    add_custom_target(
+        theme-members
+        COMMAND ${BASH_EXE} "${CMAKE_SOURCE_DIR}/scripts/check-theme-members.sh"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        COMMENT "theme-members: checking Sizing/Theme/Motion member reads"
+        VERBATIM
+    )
+else()
+    add_custom_target(theme-members COMMAND ${CMAKE_COMMAND} -E echo "bash not found; skipping")
+endif()
+
 # ── lint aggregate ────────────────────────────────────────────────────────────
 
-add_custom_target(lint COMMENT "Running all linters (format-check + tidy + qmllint)")
-add_dependencies(lint format-check tidy)
+add_custom_target(
+    lint COMMENT "Running all linters (format-check + tidy + theme-members + qmllint)"
+)
+add_dependencies(lint format-check tidy theme-members)
 
 if(TARGET all_qmllint)
     add_dependencies(lint all_qmllint)
