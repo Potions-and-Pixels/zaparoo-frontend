@@ -311,8 +311,10 @@ pub struct SettingsRust {
     current_hide_exit: bool,
     current_hide_empty_categories: bool,
     // ArtCade fork: `[settings] lock_hub` — freezes the Hub layout from
-    // the UI (no View/Options menus on the Hub, no "Add to Hub"). Same
-    // READ + CONSTANT, config-only posture as the `hide_*` flags above.
+    // the UI (no Hub View menu, no "Add to Hub") and opens no Options
+    // (context) menu anywhere (Hub, Systems, Games, Favorites, Favorite
+    // Systems, Recents); View menus outside the Hub stay. Same READ +
+    // CONSTANT, config-only posture as the `hide_*` flags above.
     current_lock_hub: bool,
     /// Flips once, never resets — see `output_resolution_stale`'s
     /// qproperty doc comment.

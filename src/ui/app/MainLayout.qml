@@ -123,9 +123,13 @@ ApplicationWindow {
     // ArtCade-fork kiosk flag `[settings] lock_hub` (frontend.toml) —
     // freezes the Hub layout from the UI: no Hub View (Y) / Options (X)
     // menus or hints, no "Add to Hub" anywhere, and every layout-mutating
-    // handler in Main.qml / HubScreen.qml no-ops. Bound (not readonly) to
-    // the CONSTANT Rust qproperty so the UI suite can flip it; nothing in
-    // the app ever writes it.
+    // handler in Main.qml / HubScreen.qml no-ops. It also means no Options
+    // (X) menu opens anywhere: every browse screen (Systems, Games,
+    // Favorites, Favorite Systems, Recents) gets `contextMenuLocked` and
+    // drops its X hint, and Main.qml's `openContextMenu` and every
+    // screen's requestContextMenu handler no-op. View (Y) menus outside
+    // the Hub stay. Bound (not readonly) to the CONSTANT Rust qproperty
+    // so the UI suite can flip it; nothing in the app ever writes it.
     property bool hubLocked: Browse.Settings.current_lock_hub
     property bool cardWriteModalRequested: false
     property bool settingNeedsRestartModalRequested: false
@@ -794,6 +798,7 @@ ApplicationWindow {
                             preparingTransition: root.pendingTransition === "systems"
                             active: root.activeScreen === root.screenSystems
                             optimisticLoading: root.activeScreen === root.screenSystems && root.catalogStillBooting
+                            contextMenuLocked: root.hubLocked
                         }
                     }
                 }
@@ -808,6 +813,7 @@ ApplicationWindow {
                             anchors.fill: parent
                             transitioning: root.transitionCueVisible
                             active: root.activeScreen === root.screenGames
+                            contextMenuLocked: root.hubLocked
                             coverRevealReady: root.gamesCoverRevealReady
                             optimisticLoading: root.activeScreen === root.screenGames && (root.catalogStillBooting || root.gamesSelectionRestorePending)
                         }
@@ -824,6 +830,7 @@ ApplicationWindow {
                             anchors.fill: parent
                             transitioning: root.transitionCueVisible
                             optimisticLoading: root.activeScreen === root.screenFavorites && root.catalogStillBooting
+                            contextMenuLocked: root.hubLocked
                             selectedSystemId: root.favoritesSystemId
                         }
                     }
@@ -839,6 +846,7 @@ ApplicationWindow {
                             anchors.fill: parent
                             transitioning: root.transitionCueVisible
                             optimisticLoading: root.activeScreen === root.screenFavoriteSystems && root.catalogStillBooting
+                            contextMenuLocked: root.hubLocked
                         }
                     }
                 }
@@ -853,6 +861,7 @@ ApplicationWindow {
                             anchors.fill: parent
                             transitioning: root.transitionCueVisible
                             optimisticLoading: root.activeScreen === root.screenRecents && root.catalogStillBooting
+                            contextMenuLocked: root.hubLocked
                         }
                     }
                 }
@@ -1679,10 +1688,15 @@ ApplicationWindow {
                             row.push({
                                 button: "ButtonA",
                                 label: qsTr("Open")
-                            }, {
-                                button: "ButtonX",
-                                label: qsTr("Options")
-                            }, {
+                            });
+                            // ArtCade fork: no Options hint while
+                            // `contextMenuLocked` (`lock_hub`) swallows X.
+                            if (!root.systemsScreen.contextMenuLocked)
+                                row.push({
+                                    button: "ButtonX",
+                                    label: qsTr("Options")
+                                });
+                            row.push({
                                 button: "ButtonB",
                                 label: qsTr("Back")
                             });
@@ -1729,7 +1743,9 @@ ApplicationWindow {
                                 button: "ButtonA",
                                 label: qsTr("Open")
                             });
-                            if (isFavorites || isFavoriteSystems)
+                            // ArtCade fork: no Options hint while
+                            // `contextMenuLocked` (`lock_hub`) swallows X.
+                            if ((isFavorites || isFavoriteSystems) && !screen.contextMenuLocked)
                                 row.push({
                                     button: "ButtonX",
                                     label: qsTr("Options")
@@ -1867,8 +1883,10 @@ ApplicationWindow {
                         // -- this used to test media capability alone, which
                         // left every folder row with a working Options button
                         // and no cue saying so. Keep the two in step.
+                        // ArtCade fork: no Options hint while
+                        // `contextMenuLocked` (`lock_hub`) swallows X.
                         const idx = root.gamesScreen.gamesGrid.currentIndex;
-                        const hasContextMenu = Browse.GamesModel.is_media_capable_at(idx) || Browse.GamesModel.entry_type_at(idx) === "directory" || Browse.GamesModel.is_filesystem_root_at(idx);
+                        const hasContextMenu = !root.gamesScreen.contextMenuLocked && (Browse.GamesModel.is_media_capable_at(idx) || Browse.GamesModel.entry_type_at(idx) === "directory" || Browse.GamesModel.is_filesystem_root_at(idx));
                         // D-pad moves; L/R shoulders page-jump. Folded into one
                         // "Move" cue; shoulder glyphs appear only with a second
                         // page.

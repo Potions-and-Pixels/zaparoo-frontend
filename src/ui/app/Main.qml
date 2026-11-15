@@ -2063,6 +2063,9 @@ MainLayout {
                 root._navigateBackToScreen(root.screenHub);
         }
         function onRequestContextMenu(index: int, anchorRect, anchorRadius: int): void {
+            // ArtCade-fork `lock_hub`: no Options menu anywhere.
+            if (root.hubLocked)
+                return;
             root.openContextMenu("favorites", index, anchorRect, anchorRadius);
         }
         function onRequestPageMenu(): void {
@@ -2079,6 +2082,9 @@ MainLayout {
             root._navigateBackToScreen(root.screenHub);
         }
         function onRequestContextMenu(index: int, anchorRect, anchorRadius: int): void {
+            // ArtCade-fork `lock_hub`: no Options menu anywhere.
+            if (root.hubLocked)
+                return;
             root.openContextMenu("favorite_systems", index, anchorRect, anchorRadius);
         }
         function onRequestPageMenu(): void {
@@ -2091,6 +2097,9 @@ MainLayout {
             root._navigateBackToScreen(root.screenHub);
         }
         function onRequestContextMenu(index: int, anchorRect, anchorRadius: int): void {
+            // ArtCade-fork `lock_hub`: no Options menu anywhere.
+            if (root.hubLocked)
+                return;
             root.openContextMenu("recents", index, anchorRect, anchorRadius);
         }
     }
@@ -2234,6 +2243,9 @@ MainLayout {
             root._navigateBackToScreen(root.screenHub);
         }
         function onRequestContextMenu(index: int, anchorRect, anchorRadius: int): void {
+            // ArtCade-fork `lock_hub`: no Options menu anywhere.
+            if (root.hubLocked)
+                return;
             root.openContextMenu("systems", index, anchorRect, anchorRadius);
         }
     }
@@ -2299,6 +2311,11 @@ MainLayout {
             root._navigateOutOfFolder();
         }
         function onRequestContextMenu(index: int, anchorRect, anchorRadius: int): void {
+            // ArtCade-fork `lock_hub`: no Options menu anywhere (the
+            // screen's `contextMenuLocked` already swallows X and
+            // right-click; this guards any other caller).
+            if (root.hubLocked)
+                return;
             root.openContextMenu("games", index, anchorRect, anchorRadius);
         }
         function onRequestPageMenu(): void {
@@ -2780,7 +2797,12 @@ MainLayout {
     }
 
     function openContextMenu(owner: string, index: int, anchorRect, anchorRadius: int): void {
-        if (index < 0)
+        // ArtCade-fork `lock_hub`: no Options menu opens anywhere. This is
+        // the one opener every browse owner (systems, categories, games,
+        // favorites, favorite_systems, recents) goes through; the Hub's
+        // own openers (openHubActionContextMenu / openHubItemContextMenu)
+        // carry the same guard.
+        if (index < 0 || root.hubLocked)
             return;
         let entryType = "";
         let isFavorite = false;

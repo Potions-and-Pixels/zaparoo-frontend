@@ -49,6 +49,13 @@ Item {
     // times. The ring restores automatically when the modal pops.
     property bool gridFocused: true
     property bool optimisticLoading: false
+    // ArtCade-fork kiosk lock. When true no system's Options (North/X)
+    // menu opens: `handleAction("context_menu")` -- reached from the
+    // controller button, the keyboard key and a right-click on a grid
+    // tile or list row -- returns before doing anything. Accept, Back and
+    // navigation are unaffected. Default false (upstream behavior);
+    // MainLayout binds it to `hubLocked` (`lock_hub`).
+    property bool contextMenuLocked: false
     // False until the user takes control of focus (first input). Combined
     // with `_restoreDone` into `_focusReady`, which gates whether the grid
     // tiles render focus at all.
@@ -183,7 +190,7 @@ Item {
     function handleAction(action: string): void {
         if ((action === "left" || action === "right" || action === "up" || action === "down" || action === "page_prev" || action === "page_next") && systems._overlayLoadingVisible)
             return;
-        if (action === "context_menu" && systems._gateHide)
+        if (action === "context_menu" && (systems._gateHide || systems.contextMenuLocked))
             return;
         systems._focusArmed = true;
 

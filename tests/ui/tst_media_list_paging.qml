@@ -39,6 +39,13 @@ TestCase {
         signalName: "requestPageMenu"
     }
 
+    SignalSpy {
+        id: contextMenuSpy
+
+        target: screen
+        signalName: "requestContextMenu"
+    }
+
     MediaListScreen {
         id: screen
 
@@ -84,6 +91,7 @@ TestCase {
     function cleanup(): void {
         Browse.Settings.current_games_browse_layout = _originalBrowseLayout;
         screen.optimisticLoading = false;
+        screen.contextMenuLocked = false;
         Sizing.screenWidth = testCase.width;
         Sizing.screenHeight = testCase.height;
     }
@@ -125,6 +133,65 @@ TestCase {
         screen.handleAction("page_menu");
         compare(spy.count, 1, "opted-in screen can still open its View menu");
         screen.pageMenuEnabledWhenEmpty = false;
+    }
+
+    // ── ArtCade fork: `contextMenuLocked` (every MediaListScreen under
+    // `lock_hub`: Games, Favorites, Favorite Systems, Recents) ──────────
+    // Every way to open the per-row Options menu funnels into
+    // handleAction("context_menu"): North/X and the keyboard Tab go
+    // through Main.qml's key map (the "swap options/view" setting only
+    // rewrites which button produces it), and a right-click on a grid
+    // tile or a list row calls it directly. Locked, none of them may
+    // emit requestContextMenu, and X does nothing else either (it
+    // returns before arming the focus ring, like a gated press).
+    function test_unlocked_options_and_right_click_request_the_context_menu(): void {
+        contextMenuSpy.clear();
+        screen.handleAction("context_menu");
+        compare(contextMenuSpy.count, 1, "unlocked: X/Options opens the row menu (upstream behavior)");
+        screen.mediaGrid.itemRightClicked(1);
+        compare(contextMenuSpy.count, 2, "unlocked: right-click on a grid tile opens it");
+        compare(contextMenuSpy.signalArguments[1][0], 1, "for the right-clicked tile");
+
+        // Same paths in list layout, so the locked list-layout assertions
+        // below can't pass just because the list wiring never fires.
+        Browse.Settings.current_games_browse_layout = "list";
+        verify(screen._listLayout, "fixture must really be in list layout");
+        screen.handleAction("context_menu");
+        compare(contextMenuSpy.count, 3, "unlocked: X/Options opens the row menu in list layout");
+        screen.listCard.itemRightClicked(2);
+        compare(contextMenuSpy.count, 4, "unlocked: right-click on a list row opens it");
+        compare(contextMenuSpy.signalArguments[3][0], 2, "for the right-clicked row");
+    }
+
+    function test_locked_context_menu_ignores_options_and_right_click(): void {
+        screen.contextMenuLocked = true;
+        contextMenuSpy.clear();
+
+        screen._focusArmed = false;
+        screen.handleAction("context_menu");
+        compare(contextMenuSpy.count, 0, "locked: X/Options must open nothing");
+        compare(screen._focusArmed, false, "locked: X must do nothing at all");
+        screen.mediaGrid.itemRightClicked(1);
+        compare(contextMenuSpy.count, 0, "locked: right-click on a grid tile must open nothing");
+
+        Browse.Settings.current_games_browse_layout = "list";
+        verify(screen._listLayout, "fixture must really be in list layout");
+        screen._focusArmed = false;
+        screen.handleAction("context_menu");
+        compare(contextMenuSpy.count, 0, "locked: X/Options in list layout must open nothing");
+        compare(screen._focusArmed, false, "locked: X in list layout must do nothing at all");
+        screen.listCard.itemRightClicked(2);
+        compare(contextMenuSpy.count, 0, "locked: right-click on a list row must open nothing");
+    }
+
+    function test_locked_context_menu_leaves_view_and_navigation_alone(): void {
+        screen.contextMenuLocked = true;
+        pageMenuSpy.clear();
+        screen.handleAction("page_menu");
+        compare(pageMenuSpy.count, 1, "West/Y View (Go to…, Random game, Show, Back to Hub) stays");
+        screen.mediaGrid.setCurrentIndexImmediate(0);
+        screen.handleAction("right");
+        compare(screen.mediaGrid.currentIndex, 1, "D-pad still moves");
     }
 
     // Round 11 regression: list-layout paging used to move by

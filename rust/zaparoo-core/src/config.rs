@@ -140,24 +140,32 @@ pub struct SettingsConfig {
     /// `SystemsModel` would use to render tiles, and drops categories
     /// where the count is zero.
     pub hide_empty_categories: Option<bool>,
-    /// `ArtCade` fork kiosk lockdown — freeze the Hub layout from the UI.
-    /// Set via `[settings] lock_hub = true` in `frontend.toml`. When
-    /// `Some(true)`:
+    /// `ArtCade` fork kiosk lockdown — freeze the Hub layout from the UI
+    /// and open no North/X "Options" menu anywhere. Set via
+    /// `[settings] lock_hub = true` in `frontend.toml`. When `Some(true)`:
     ///   - the Hub's West/Y "View" page menu (Add item…, Reset layout,
     ///     Settings, Quit) and its help-bar hint are gone;
-    ///   - the Hub's North/X "Options" menu (Move / Hide-or-Remove, plus
-    ///     the tile-specific entries) and its help-bar hint are gone, on
-    ///     every Hub tile;
-    ///   - "Add to Hub" is dropped from every Options menu on the browse
-    ///     screens (Systems, Games, Favorites, Recents, folders);
-    ///   - every layout-mutating handler (add / reset / move / remove /
-    ///     add-to-hub) is a no-op as defence in depth.
+    ///   - no North/X "Options" (context) menu opens anywhere in the
+    ///     frontend, and no help bar advertises one: not on any Hub tile
+    ///     (Move / Hide-or-Remove, Random game, …), the Systems grid
+    ///     (Launch system, Random game, Change launcher, Hide/Unhide,
+    ///     Update media database, Update metadata — a player's Hide is
+    ///     unrecoverable on a kiosk), the Games list (Details, favorites,
+    ///     Change launcher, NFC / app write, Discover alt. versions,
+    ///     Update metadata, Add to Hub), Favorites, Favorite Systems or
+    ///     Recently Played. The controller button, the keyboard key and a
+    ///     right-click all do nothing;
+    ///   - so "Add to Hub" is unreachable too, and every layout-mutating
+    ///     handler (add / reset / move / remove / add-to-hub) is a no-op
+    ///     as defence in depth.
     ///
-    /// The persisted `[hub]` layout itself is still read and reconciled
-    /// (new categories / built-in actions are still appended on boot) —
-    /// only the player-facing edit affordances are locked. Accept/Open,
-    /// Back and every non-layout Options entry are unaffected. `None` /
-    /// `Some(false)` keeps upstream behaviour. Fork-only.
+    /// West/Y "View" menus outside the Hub (Games: Go to…, Random game,
+    /// Show, Back to Hub; Favorites; Favorite Systems) stay, as do
+    /// Accept/Open, D-pad, paging and Back. The persisted `[hub]` layout
+    /// itself is still read and reconciled (new categories / built-in
+    /// actions are still appended on boot) — only the player-facing edit
+    /// affordances are locked. `None` / `Some(false)` keeps upstream
+    /// behaviour. Fork-only.
     pub lock_hub: Option<bool>,
 }
 
