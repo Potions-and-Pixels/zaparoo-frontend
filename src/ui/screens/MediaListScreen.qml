@@ -59,6 +59,16 @@ Item {
     property var listLeftAction: null
     property var listRightAction: null
     property var contextMenuEnabledAt: null
+    // ArtCade-fork kiosk lock. When true no row's Options (North/X) menu
+    // opens: `handleAction("context_menu")` -- reached from the controller
+    // button, the keyboard key (with or without the "swap options/view"
+    // setting) and a right-click on a grid tile or list row -- returns
+    // before doing anything (no focus arm, no `requestContextMenu`). View
+    // (West/Y), Accept, Back and navigation are unaffected. Default false
+    // (upstream behavior); MainLayout binds it to `hubLocked` (`lock_hub`)
+    // on every screen built on this shell (Games, Favorites, Favorite
+    // Systems, Recents).
+    property bool contextMenuLocked: false
     property var restoreSelectionPath: null
     property var persistSelectionPath: null
     // Counterpart to `persistSelectionPath` for screens that debounce their
@@ -496,6 +506,9 @@ Item {
 
     function handleAction(action: string): void {
         if ((action === "left" || action === "right" || action === "up" || action === "down" || action === "context_menu") && root._gateHide)
+            return;
+        // ArtCade-fork kiosk lock: no Options menu at all.
+        if (action === "context_menu" && root.contextMenuLocked)
             return;
 
         root._focusArmed = true;

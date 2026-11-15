@@ -2550,7 +2550,177 @@ TestCase {
         // Everything else on a game row stays.
         const game = main.buildContextMenuEntries("games", "media", true, false, false, "", false, "");
         compare(_idsOf(game), ["more_info", "toggle_favorite", "qr_code", "scrape_game"]);
-        // Systems keep Hide/Unhide (not gated by lock_hub).
+        // The pure entry builder still lists Systems' Hide/Unhide; what
+        // `lock_hub` takes away is the menu itself (no Options menu opens
+        // anywhere while locked -- see the tests below).
         verify(_idsOf(main.buildContextMenuEntries("systems", "", false, false, false, "SNES", false, "")).includes("toggle_hide_system"));
+    }
+
+    // ── `lock_hub` = no Options (X) menu anywhere ──────────────────────
+    // MainLayout feeds `hubLocked` into every browse screen's
+    // `contextMenuLocked` (the Hub has its own `layoutLocked`).
+    // MediaListScreen's gate (Games, Favorites, Favorite Systems, Recents)
+    // is pinned against a populated list in tst_media_list_paging.qml; the
+    // Core-less models here have no rows, so for those four screens this
+    // file checks the wiring, the router guards and the help-bar inputs
+    // only.
+    function _optionsLockScreens(): var {
+        return [
+            {
+                name: "Systems",
+                screen: main.systemsScreen
+            },
+            {
+                name: "Games",
+                screen: main.gamesScreen
+            },
+            {
+                name: "Favorites",
+                screen: main.favoritesScreen
+            },
+            {
+                name: "Favorite Systems",
+                screen: main.favoriteSystemsScreen
+            },
+            {
+                name: "Recents",
+                screen: main.recentsScreen
+            }
+        ];
+    }
+
+    function test_locked_hub_locks_options_on_every_browse_screen(): void {
+        const screens = testCase._optionsLockScreens();
+        for (let i = 0; i < screens.length; ++i) {
+            verify(screens[i].screen !== null, screens[i].name + " must be loaded");
+            compare(screens[i].screen.contextMenuLocked, false, "unlocked: " + screens[i].name + " Options is upstream behavior");
+        }
+        compare(main.hubScreen.layoutLocked, false);
+        main.hubLocked = true;
+        for (let i = 0; i < screens.length; ++i)
+            compare(screens[i].screen.contextMenuLocked, true, "lock_hub must reach " + screens[i].name);
+        compare(main.hubScreen.layoutLocked, true, "lock_hub must reach the Hub");
+        main.hubLocked = false;
+        for (let i = 0; i < screens.length; ++i)
+            compare(screens[i].screen.contextMenuLocked, false, "unlocking restores upstream behavior on " + screens[i].name);
+    }
+
+    // The Systems grid's Options holds Launch system, Random game, Change
+    // launcher, Hide/Unhide, Update media database and Update metadata --
+    // a player's Hide is unrecoverable on a kiosk. Core-less there are no
+    // system rows, so no menu could open either way; `_focusArmed` (set
+    // only once handleAction gets past its gates) is what tells "X was
+    // handled" from "X was swallowed". Systems has no View (Y) menu.
+    function test_locked_hub_systems_options_x_and_right_click_do_nothing(): void {
+        const originalLoading = Browse.SystemsModel.loading;
+        const originalError = Browse.SystemsModel.error_message;
+        const originalCatalogLoaded = Browse.CategoriesModel.loaded;
+        Browse.CategoriesModel.loaded = true;
+        Browse.SystemsModel.loading = false;
+        Browse.SystemsModel.error_message = "";
+        try {
+            main.activeScreen = main.screenSystems;
+            const systems = main.systemsScreen;
+            tryCompare(systems, "_gateHide", false);
+
+            systems._focusArmed = false;
+            systems.handleAction("context_menu");
+            compare(systems._focusArmed, true, "precondition: unlocked X reaches the Options branch");
+            systems._focusArmed = false;
+            systems.systemsGrid.itemRightClicked(0);
+            compare(systems._focusArmed, true, "precondition: unlocked right-click reaches the Options branch");
+
+            main.hubLocked = true;
+            systems._focusArmed = false;
+            systems.handleAction("context_menu");
+            compare(systems._focusArmed, false, "locked: X/Options must do nothing");
+            systems.systemsGrid.itemRightClicked(0);
+            compare(systems._focusArmed, false, "locked: right-click on a grid tile must do nothing");
+            systems.listCard.itemRightClicked(0);
+            compare(systems._focusArmed, false, "locked: right-click on a list row must do nothing");
+            compare(main.contextMenuVisible, false);
+
+            // D-pad still handled.
+            systems.handleAction("right");
+            compare(systems._focusArmed, true, "navigation is unaffected by the lock");
+        } finally {
+            Browse.SystemsModel.error_message = originalError;
+            Browse.SystemsModel.loading = originalLoading;
+            Browse.CategoriesModel.loaded = originalCatalogLoaded;
+        }
+    }
+
+    // `openContextMenu` is the one opener every browse owner goes
+    // through, and each screen's Connections handler guards it too.
+    // "hub_favorites" needs no model rows, so it proves the choke point
+    // really opens a menu while unlocked; the per-owner rows below are
+    // vacuous Core-less except for that choke point (each owner's own
+    // index check would bail on an empty model anyway).
+    function test_locked_hub_opens_no_options_menu_for_any_owner(): void {
+        const rect = Qt.rect(0, 0, 1, 1);
+        try {
+            main.openContextMenu("hub_favorites", 0, rect, 0);
+            compare(main.contextMenuVisible, true, "precondition: the choke point opens a menu while unlocked");
+        } finally {
+            if (main.contextMenuVisible)
+                main.closeContextMenu();
+        }
+
+        main.hubLocked = true;
+        try {
+            const owners = ["hub_favorites", "systems", "categories", "games", "favorites", "favorite_systems", "recents", "hub_action", "hub_item"];
+            for (let i = 0; i < owners.length; ++i) {
+                main.openContextMenu(owners[i], 0, rect, 0);
+                compare(main.contextMenuVisible, false, "locked: no Options menu for owner " + owners[i]);
+            }
+            const screens = testCase._optionsLockScreens();
+            for (let i = 0; i < screens.length; ++i) {
+                screens[i].screen.requestContextMenu(0, rect, 0);
+                compare(main.contextMenuVisible, false, "locked: the router must ignore " + screens[i].name + "'s requestContextMenu");
+            }
+            main.hubScreen.requestContextMenu(0, "", rect, 0);
+            compare(main.contextMenuVisible, false, "locked: no Options on a Hub category tile");
+            main.openHubActionContextMenu(0, "favorites", rect);
+            compare(main.contextMenuVisible, false, "locked: no Options on the Hub Favorites tile");
+            main.openHubItemContextMenu(0, "system", rect, 0);
+            compare(main.contextMenuVisible, false, "locked: no Options on a Hub shortcut tile");
+            compare(ScreenManager.modalCount, 0);
+        } finally {
+            if (main.contextMenuVisible)
+                main.closeContextMenu();
+        }
+    }
+
+    // View (Y) is not an Options menu: it stays on every screen that has
+    // one (Games, Favorites, Favorite Systems; the Hub's View is locked by
+    // its own layout lock). Emitted from each screen so the Main.qml
+    // router (not just the opener) is on the path; the screens' own
+    // page_menu gate under the lock is pinned in tst_media_list_paging.qml.
+    function test_locked_hub_keeps_view_menus(): void {
+        main.hubLocked = true;
+        const openers = [
+            {
+                name: "Games",
+                open: () => main.gamesScreen.requestPageMenu()
+            },
+            {
+                name: "Favorites",
+                open: () => main.favoritesScreen.requestPageMenu()
+            },
+            {
+                name: "Favorite Systems",
+                open: () => main.favoriteSystemsScreen.requestPageMenu()
+            }
+        ];
+        for (let i = 0; i < openers.length; ++i) {
+            try {
+                openers[i].open();
+                tryCompare(main, "listPickerModalVisible", true, 1000, "locked: " + openers[i].name + " View must still open");
+                compare(main.contextMenuVisible, false);
+            } finally {
+                if (main.listPickerModalVisible)
+                    main.closeListPickerModal();
+            }
+        }
     }
 }
