@@ -220,18 +220,18 @@ Français - Wilfried</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../screens/CreditsScreen.qml" line="38"/>
-        <source>Dev Team</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
         <location filename="../screens/CreditsScreen.qml" line="39"/>
         <source>Artists</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
+        <location filename="../screens/CreditsScreen.qml" line="38"/>
+        <source>Our Team</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
         <location filename="../screens/CreditsScreen.qml" line="40"/>
-        <source>Potions &amp; Pixels</source>
+        <source>POTIONS &amp; PIXELS</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
@@ -267,7 +267,7 @@ Français - Wilfried</source>
     <name>DevTeamScreen</name>
     <message>
         <location filename="../screens/DevTeamScreen.qml" line="55"/>
-        <source>Dev Team</source>
+        <source>Our Team</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
@@ -1606,7 +1606,7 @@ Français - Wilfried</source>
     <name>PotionsPixelsScreen</name>
     <message>
         <location filename="../screens/PotionsPixelsScreen.qml" line="56"/>
-        <source>Potions &amp; Pixels</source>
+        <source>POTIONS &amp; PIXELS</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
