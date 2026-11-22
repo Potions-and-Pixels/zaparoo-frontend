@@ -13,7 +13,7 @@ import Zaparoo.Browse as Browse
 // fields trip qmllint's "Member can be shadowed" check.
 // qmllint disable compiler
 
-// Dev Team credits screen — reached from Credits → "Dev Team".
+// Dev Team credits screen — reached from Credits → "Our Team".
 // Same column-stacked card layout as SponsorsScreen / ArtistsScreen.
 // Reads from /media/fat/zaparoo/devteam/<slug>/ via `Browse.DevTeam`
 // (cxx-qt model reuses the same zaparoo_core::credits::load_credits
@@ -52,7 +52,7 @@ Item {
         anchors.top: parent.top
         anchors.topMargin: Sizing.headerBottom
         height: Sizing.pctH(7)
-        title: qsTr("Dev Team")
+        title: qsTr("Our Team")
         currentPage: 0
         totalPages: 0
         totalText: ""

@@ -35,7 +35,7 @@ Item {
     // needed. Order in this list is the display order.
     readonly property var _menu: [
         { label: qsTr("Sponsors"), action: "sponsors" },
-        { label: qsTr("Dev Team"), action: "devTeam" },
+        { label: qsTr("Our Team"), action: "devTeam" },
         { label: qsTr("Artists"), action: "artists" },
         { label: qsTr("POTIONS & PIXELS"), action: "potionsPixels" },
         { label: qsTr("About/License"), action: "aboutLicense" }
