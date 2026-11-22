@@ -14,7 +14,7 @@ import Zaparoo.Ui
 //   1. "Sponsors"          → SponsorsScreen — dynamic, per-sponsor folders
 //   2. "Dev Team"          → DevTeamScreen — static ArtCade dev attribution
 //   3. "Artists"           → ArtistsScreen — dynamic, per-artist folders
-//   4. "Potions & Pixels"  → PotionsPixelsScreen — static client mission
+//   4. "POTIONS & PIXELS"  → PotionsPixelsScreen — static client mission
 //   5. "About/License"     → AboutScreen — Zaparoo dev attribution + license
 //
 // Pure input dispatcher: emits `requestAccept(actionId)` with the
@@ -37,7 +37,7 @@ Item {
         { label: qsTr("Sponsors"), action: "sponsors" },
         { label: qsTr("Dev Team"), action: "devTeam" },
         { label: qsTr("Artists"), action: "artists" },
-        { label: qsTr("Potions & Pixels"), action: "potionsPixels" },
+        { label: qsTr("POTIONS & PIXELS"), action: "potionsPixels" },
         { label: qsTr("About/License"), action: "aboutLicense" }
     ]
 

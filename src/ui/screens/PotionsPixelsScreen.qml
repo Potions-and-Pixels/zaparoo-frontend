@@ -14,7 +14,7 @@ import Zaparoo.Browse as Browse
 // qmllint disable compiler
 
 // Potions & Pixels credits screen — reached from Credits →
-// "Potions & Pixels". Same column-stacked card layout as the other
+// "POTIONS & PIXELS". Same column-stacked card layout as the other
 // dynamic credits screens. Reads from /media/fat/zaparoo/about/<slug>/
 // via `Browse.About` (cxx-qt model reuses the same
 // zaparoo_core::credits::load_credits loader). Each folder is one
@@ -53,7 +53,7 @@ Item {
         anchors.top: parent.top
         anchors.topMargin: Sizing.headerBottom
         height: Sizing.pctH(7)
-        title: qsTr("Potions & Pixels")
+        title: qsTr("POTIONS & PIXELS")
         currentPage: 0
         totalPages: 0
         totalText: ""
